@@ -1,3 +1,4 @@
+import html
 import os
 import shutil
 import struct
@@ -10,6 +11,7 @@ from sqlite3 import Cursor
 from typing import List, Tuple, Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
+from acd.l5x.catalog_numbers import CATALOG_NUMBERS
 
 
 @dataclass
@@ -24,6 +26,7 @@ _LIST_SECTION_NAMES = {
     "tags": "Tags",
     "data_types": "DataTypes",
     "members": "Members",
+    "modules": "Modules",
     "programs": "Programs",
     "routines": "Routines",
     "aois": "AddOnInstructionDefinitions",
@@ -71,7 +74,7 @@ class L5xElement:
                     _overrides = getattr(self, "_xml_attr_overrides", {})
                     xml_attr_name = _overrides.get(attribute, attribute.title().replace("_", ""))
                     attribute_list.append(
-                        f'{xml_attr_name}="{attribute_value}"'
+                        f'{xml_attr_name}="{html.escape(str(attribute_value), quote=True)}"'
                     )
 
         _export_name = (
@@ -123,14 +126,53 @@ class Tag(L5xElement):
 
 
 @dataclass
-class MapDevice(L5xElement):
-    module_id: int
-    parent_module: int
-    slot_no: int
-    vendor_id: int
+class Module(L5xElement):
+    """Represents a Logix hardware module (<Module> in L5X)."""
+    name: str
+    catalog_number: str
+    vendor: int
     product_type: int
     product_code: int
-    comments: List[Tuple[str, str]]
+    major: int
+    minor: int
+    parent_module: str
+    parent_mod_port_id: int
+    inhibited: str
+    major_fault: str
+    # Private fields (not serialised as XML attributes)
+    _ekey_state: str = field(default="CompatibleModule")
+    _slot: int = field(default=0)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "Module"
+
+    def to_xml(self) -> str:
+        attrs = (
+            f'Name="{self.name}" '
+            f'CatalogNumber="{self.catalog_number}" '
+            f'Vendor="{self.vendor}" '
+            f'ProductType="{self.product_type}" '
+            f'ProductCode="{self.product_code}" '
+            f'Major="{self.major}" '
+            f'Minor="{self.minor}" '
+            f'ParentModule="{self.parent_module}" '
+            f'ParentModPortId="{self.parent_mod_port_id}" '
+            f'Inhibited="{self.inhibited}" '
+            f'MajorFault="{self.major_fault}"'
+        )
+        ekey = f'<EKey State="{self._ekey_state}"/>'
+        if self._slot > 0:
+            ports = (
+                f'<Ports>'
+                f'<Port Id="1" Address="{self._slot}" Type="ICP" Upstream="false">'
+                f'<Bus/>'
+                f'</Port>'
+                f'</Ports>'
+            )
+        else:
+            ports = '<Ports/>'
+        return f'<Module {attrs}>{ekey}{ports}</Module>'
 
 
 @dataclass
@@ -231,11 +273,11 @@ class Controller(L5xElement):
     auto_diags_enabled: str
     web_server_enabled: str
     data_types: List[DataType]
+    modules: List[Module]
     tags: List[Tag]
     programs: List[Program]
     tasks: List[Task]
     aois: List[AOI]
-    map_devices: List[MapDevice]
 
     def __post_init__(self):
         super().__post_init__()
@@ -431,57 +473,69 @@ class DataTypeBuilder(L5xElementBuilder):
 
 
 @dataclass
-class MapDeviceBuilder(L5xElementBuilder):
-    def build(self) -> MapDevice:
+class ModuleBuilder(L5xElementBuilder):
+    # Map from modid (u32) → module name, built by ControllerBuilder and passed in.
+    _modid_to_name: Dict[int, str] = field(default_factory=dict)
+
+    def build(self) -> Module:
         self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
-            + str(self._object_id)
+            "SELECT comp_name, object_id, record FROM comps WHERE object_id=" + str(self._object_id)
         )
-        results = self._cur.fetchall()
+        row = self._cur.fetchone()
+        db_name = row[0]
+        raw_rec = bytes(row[2])
+
+        # Hex-encoded names like $02cc5e9d$ are unnamed peripheral modules (drive expansion
+        # cards, etc.).  Logix Designer exports these with Name="?".
+        name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
+
         try:
-            r = RxGeneric.from_bytes(results[0][3])
-        except Exception as e:
-            return MapDevice(results[0][0], 0, 0, 0, 0, 0, 0, [])
+            r = RxGeneric.from_bytes(raw_rec)
+        except Exception:
+            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false")
 
         if r.cip_type != 0x69:
-            return MapDevice(results[0][0], 0, 0, 0, 0, 0, 0, [])
+            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false")
 
-        self._cur.execute(
-            "SELECT tag_reference, record_string FROM comments WHERE parent="
-            + str((r.comment_id * 0x10000) + r.cip_type)
-        )
-        comment_results = self._cur.fetchall()
+        exts: Dict[int, bytes] = {er.attribute_id: bytes(er.value) for er in r.extended_records}
+        e1 = exts.get(0x001, b"")
+        if len(e1) < 0x30:
+            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false")
 
-        extended_records: Dict[int, bytes] = {}
-        for extended_record in r.extended_records:
-            extended_records[extended_record.attribute_id] = bytes(
-                extended_record.value
-            )
+        vendor        = struct.unpack("<H", e1[0x02:0x04])[0]
+        product_type  = struct.unpack("<H", e1[0x04:0x06])[0]
+        product_code  = struct.unpack("<H", e1[0x06:0x08])[0]
+        # bit 7 of the major byte is a flag; strip it to get the firmware revision.
+        major         = e1[0x08] & 0x7F
+        minor         = e1[0x09]
+        parent_modid  = struct.unpack("<I", e1[0x16:0x1A])[0]
+        parent_port   = struct.unpack("<H", e1[0x1A:0x1C])[0]
+        slot          = struct.unpack("<I", e1[0x1C:0x20])[0]
 
-        name = results[0][0]
-        if 0x01 not in extended_records or len(extended_records[0x01]) < 0x30:
-            return MapDevice(name, 0, 0, 0, 0, 0, 0, comment_results)
+        # Resolve parent module name from the modid→name map built by ControllerBuilder.
+        parent_name = self._modid_to_name.get(parent_modid, "Local")
 
-        try:
-            raw = extended_records[0x01]
-            vendor_id = struct.unpack("<H", raw[2:4])[0]
-            product_type = struct.unpack("<H", raw[4:6])[0]
-            product_code = struct.unpack("<H", raw[6:8])[0]
-            parent_module = struct.unpack("<I", raw[0x16:0x1A])[0]
-            slot_no = struct.unpack("<I", raw[0x1C:0x20])[0]
-            module_id = struct.unpack("<I", raw[0x2C:0x30])[0]
-        except Exception:
-            return MapDevice(name, 0, 0, 0, 0, 0, 0, comment_results)
+        own_modid   = struct.unpack("<I", e1[0x2C:0x30])[0]
+        # MajorFault=true only for the root controller module (self-referential parent).
+        major_fault = "true" if parent_modid == own_modid else "false"
+        # bit 2 (0x04) of e1[0] → EKey Disabled (Local=0x06→Disabled, EN2T=0x11→CompatibleModule).
+        ekey_state  = "Disabled" if (e1[0] & 0x04) else "CompatibleModule"
 
-        return MapDevice(
-            name,
-            module_id,
-            parent_module,
-            slot_no,
-            vendor_id,
+        return Module(
+            name,           # L5xElement._name (private)
+            name,           # Module.name
+            CATALOG_NUMBERS.get((vendor, product_type, product_code), ""),
+            vendor,
             product_type,
             product_code,
-            comment_results,
+            major,
+            minor,
+            parent_name,
+            parent_port,
+            "false",        # Inhibited: always false in practice; no known bit
+            major_fault,
+            _ekey_state=ekey_state,
+            _slot=slot,
         )
 
 
@@ -1080,27 +1134,46 @@ class ControllerBuilder(L5xElementBuilder):
             _aoi_object_id = result[1]
             aois.append(AoiBuilder(self._cur, _aoi_object_id).build())
 
-        # Get the Map Device (IO) Collection and get the MapDevices
+        # Get the Module (IO) Collection and build all Module elements.
         self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
+            "SELECT object_id FROM comps WHERE parent_id="
             + str(self._object_id)
             + " AND comp_name='RxMapDeviceCollection'"
         )
-        results = self._cur.fetchall()
-        if len(results) > 1:
-            raise Exception("Contains more than one Map Device collection")
-        _map_device_collection_object_id = results[0][1]
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
-            + str(_map_device_collection_object_id)
-        )
-        results = self._cur.fetchall()
-        map_devices: List[MapDevice] = []
-        for result in results:
-            _map_device_object_id = result[1]
-            map_devices.append(
-                MapDeviceBuilder(self._cur, _map_device_object_id).build()
+        row = self._cur.fetchone()
+        if row is None:
+            modules: List[Module] = []
+        else:
+            coll_oid = row[0]
+            self._cur.execute(
+                "SELECT comp_name, object_id, record FROM comps WHERE parent_id="
+                + str(coll_oid)
+                + " ORDER BY seq_number"
             )
+            mod_rows = self._cur.fetchall()
+
+            # First pass: build modid→name map so child modules can resolve their parent name.
+            from acd.generated.comps.rx_generic import RxGeneric as _RxG
+            modid_to_name: Dict[int, str] = {}
+            for db_name, mod_oid, mod_rec in mod_rows:
+                display_name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
+                try:
+                    r = _RxG.from_bytes(bytes(mod_rec))
+                    if r.cip_type == 0x69:
+                        exts = {er.attribute_id: bytes(er.value) for er in r.extended_records}
+                        e1 = exts.get(0x001, b"")
+                        if len(e1) >= 0x30:
+                            modid = struct.unpack("<I", e1[0x2C:0x30])[0]
+                            modid_to_name[modid] = display_name
+                except Exception:
+                    pass
+
+            # Second pass: build Module objects.
+            modules = []
+            for _, mod_oid, _ in mod_rows:
+                modules.append(
+                    ModuleBuilder(self._cur, mod_oid, modid_to_name).build()
+                )
 
         return Controller(
             controller_name,
@@ -1126,11 +1199,11 @@ class ControllerBuilder(L5xElementBuilder):
             "false",        # AutoDiagsEnabled
             "false",        # WebServerEnabled
             data_types,
+            modules,
             tags,
             programs,
             tasks,
             aois,
-            map_devices,
         )
 
 

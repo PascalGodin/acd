@@ -91,6 +91,8 @@ class Member(L5xElement):
     dimension: int
     radix: str
     hidden: bool
+    target: Union[str, None]      # BIT members only; None omits the attribute
+    bit_number: Union[int, None]  # BIT members only; None omits the attribute
     external_access: str
 
 
@@ -115,8 +117,9 @@ class Tag(L5xElement):
     name: str
     tag_type: str
     data_type: str
-    radix: str
+    radix: Union[str, None]
     external_access: str
+    constant: str
     dimensions: Union[str, None]
     _data_table_instance: int
     _comments: List[Tuple[str, str]]
@@ -468,6 +471,9 @@ def external_access_enum(i: int) -> str:
 @dataclass
 class MemberBuilder(L5xElementBuilder):
     record: bytes = field(default_factory=bytes)
+    # Map from offset-0x60 value to backing member name, used to resolve BIT Target.
+    # Built by DataTypeBuilder before iterating children and passed in here.
+    _offset60_to_name: Dict[int, str] = field(default_factory=dict)
 
     def build(self) -> Member:
         self._cur.execute(
@@ -481,7 +487,7 @@ class MemberBuilder(L5xElementBuilder):
         try:
             r = RxGeneric.from_bytes(results[0][3])
         except Exception as e:
-            return Member(name, name, "", 0, "Decimal", False, "Read/Write")
+            return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
 
         extended_records: Dict[int, List[int]] = {}
         for extended_record in r.extended_records:
@@ -503,7 +509,18 @@ class MemberBuilder(L5xElementBuilder):
         data_type_results = self._cur.fetchall()
         data_type = data_type_results[0][0]
 
-        return Member(name, name, data_type, dimension, radix, hidden, external_access)
+        # BIT members: data_type resolves to BOOL but 0x6c holds the offset-0x60 of the
+        # backing field (not 0xFFFFFFFF as for standalone BOOL/other members).
+        target: Union[str, None] = None
+        bit_number: Union[int, None] = None
+        if data_type == "BOOL":
+            target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
+            if target_key != 0xFFFFFFFF:
+                data_type = "BIT"
+                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+                target = self._offset60_to_name.get(target_key)
+
+        return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access)
 
 
 @dataclass
@@ -558,6 +575,22 @@ class DataTypeBuilder(L5xElementBuilder):
             )
             children_results = self._cur.fetchall()
 
+            # Build offset60→name map so BIT members can resolve their Target name.
+            # Each member's extended record stores the byte offset of that member's data
+            # within the UDT at [0x60]; BIT members reference their backing field's
+            # offset via [0x6c].  Non-BIT members have [0x6c]=0xFFFFFFFF.
+            offset60_to_name: Dict[int, str] = {}
+            for idx2, child2 in enumerate(children_results):
+                key2 = 0x6E + idx2
+                if key2 not in extended_records:
+                    break
+                rec2 = bytes(extended_records[key2])
+                if len(rec2) >= 0x70:
+                    target_key2 = struct.unpack_from("<I", rec2, 0x6C)[0]
+                    if target_key2 == 0xFFFFFFFF:
+                        val_60 = struct.unpack_from("<I", rec2, 0x60)[0]
+                        offset60_to_name[val_60] = child2[0]
+
             # Some ACD files have mismatched member_count vs children list — iterate what we have
             for idx, child in enumerate(children_results):
                 key = 0x6E + idx
@@ -566,7 +599,8 @@ class DataTypeBuilder(L5xElementBuilder):
                 try:
                     children.append(
                         MemberBuilder(
-                            self._cur, child[1], bytes(extended_records[key])
+                            self._cur, child[1], bytes(extended_records[key]),
+                            offset60_to_name,
                         ).build()
                     )
                 except Exception:
@@ -720,16 +754,27 @@ class TagBuilder(L5xElementBuilder):
         )
         results = self._cur.fetchall()
 
+        # Extract ExternalAccess and Constant from the raw record at fixed offsets:
+        #   raw[0x278]: ExternalAccess enum (0=Read/Write, 2=Read Only, 3=None)
+        #   raw[0x279]: Constant flag (0=false, 1=true)
+        raw_rec = bytes(results[0][3])
+        if len(raw_rec) > 0x279:
+            external_access = external_access_enum(raw_rec[0x278])
+            constant = "true" if raw_rec[0x279] else "false"
+        else:
+            external_access = "Read/Write"
+            constant = "false"
+
         try:
-            r = RxGeneric.from_bytes(results[0][3])
+            r = RxGeneric.from_bytes(raw_rec)
         except Exception as e:
             return Tag(
-                results[0][0], results[0][0], "Base", "", "Decimal", "None", None, 0, []
+                results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
             )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
             return Tag(
-                results[0][0], results[0][0], "Base", "", "Decimal", "None", None, 0, []
+                results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
             )
         if r.main_record.data_type == 0xFFFFFFFF:
             data_type = ""
@@ -754,16 +799,28 @@ class TagBuilder(L5xElementBuilder):
             )
 
         if 0x01 not in extended_records:
-            return Tag(results[0][0], results[0][0], "Base", data_type, "Decimal", "None", None, 0, comment_results)
+            # Name comes from comp_name in the database; radix from main_record
+            raw_radix = r.main_record.radix
+            radix = radix_enum(raw_radix) if raw_radix != 0 else None
+            dim_parts = []
+            if r.main_record.dimension_1 != 0:
+                dim_parts.append(str(r.main_record.dimension_1))
+            if r.main_record.dimension_2 != 0:
+                dim_parts.append(str(r.main_record.dimension_2))
+            if r.main_record.dimension_3 != 0:
+                dim_parts.append(str(r.main_record.dimension_3))
+            dimensions = ",".join(dim_parts) if dim_parts else None
+            return Tag(
+                results[0][0], results[0][0], "Base", data_type, radix,
+                external_access, constant, dimensions, r.main_record.data_table_instance,
+                comment_results,
+            )
+
         name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
         name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
 
-        radix = radix_enum(r.main_record.radix)
-        try:
-            name_length_raw = struct.unpack_from("<H", extended_records[0x01], 0x21E)[0]
-            external_access = external_access_enum(name_length_raw)
-        except Exception:
-            external_access = "None"
+        raw_radix = r.main_record.radix
+        radix = radix_enum(raw_radix) if raw_radix != 0 else None
 
         dim_parts = []
         if r.main_record.dimension_1 != 0:
@@ -780,6 +837,7 @@ class TagBuilder(L5xElementBuilder):
             data_type,
             radix,
             external_access,
+            constant,
             dimensions,
             r.main_record.data_table_instance,
             comment_results,

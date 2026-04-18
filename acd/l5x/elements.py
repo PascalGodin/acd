@@ -1911,6 +1911,16 @@ class ProgramBuilder(L5xElementBuilder):
                 row = self._cur.fetchone()
                 fault_routine_name = row[0] if row else None
 
+        # --- Disabled flag from ext[0x01] at offset 0x24 ---
+        # A u32 of 0xFFFFFFFF means the program is disabled; 0x00000000 means enabled.
+        ext01 = exts.get(0x01, b"")
+        disabled_flag = (
+            struct.unpack_from("<I", ext01, 0x24)[0] != 0
+            if len(ext01) >= 0x28
+            else False
+        )
+        disabled = "true" if disabled_flag else "false"
+
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
             + str(self._object_id)
@@ -1957,7 +1967,7 @@ class ProgramBuilder(L5xElementBuilder):
         comment_results = self._cur.fetchall()
 
         return Program(name, name, "false", main_routine_name, fault_routine_name,
-                       "false", "false", routines, tags)
+                       disabled, "false", routines, tags)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}

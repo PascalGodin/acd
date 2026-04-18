@@ -392,7 +392,7 @@ class Tag(L5xElement):
     data_type: str
     radix: Union[str, None]
     external_access: str
-    constant: str
+    constant: Union[str, None]  # "true" for constants; None omits the attribute
     dimensions: Union[str, None]
     _data_table_instance: int
     _comments: List[Tuple[str, str]]

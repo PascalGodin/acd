@@ -117,13 +117,19 @@ class Tag(L5xElement):
     data_type: str
     radix: str
     external_access: str
+    dimensions: Union[str, None]
     _data_table_instance: int
     _comments: List[Tuple[str, str]]
 
     @property
     def _l5x_exclude(self) -> bool:
         """Exclude tags with empty or non-identifier names (hex-address placeholders, etc.)."""
-        return not self.name or not (self.name[0].isalpha() or self.name[0] == "_")
+        return (
+            not self.name
+            or not (self.name[0].isalpha() or self.name[0] == "_")
+            or ":" in self.name
+            or self.name.startswith("__l0")
+        )
 
 
 @dataclass
@@ -718,12 +724,12 @@ class TagBuilder(L5xElementBuilder):
             r = RxGeneric.from_bytes(results[0][3])
         except Exception as e:
             return Tag(
-                results[0][0], results[0][0], "Base", "", "Decimal", "None", 0, []
+                results[0][0], results[0][0], "Base", "", "Decimal", "None", None, 0, []
             )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
             return Tag(
-                results[0][0], results[0][0], "Base", "", "Decimal", "None", 0, []
+                results[0][0], results[0][0], "Base", "", "Decimal", "None", None, 0, []
             )
         if r.main_record.data_type == 0xFFFFFFFF:
             data_type = ""
@@ -748,7 +754,7 @@ class TagBuilder(L5xElementBuilder):
             )
 
         if 0x01 not in extended_records:
-            return Tag(results[0][0], results[0][0], "Base", data_type, "Decimal", "None", 0, comment_results)
+            return Tag(results[0][0], results[0][0], "Base", data_type, "Decimal", "None", None, 0, comment_results)
         name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
         name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
 
@@ -759,12 +765,14 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             external_access = "None"
 
+        dim_parts = []
         if r.main_record.dimension_1 != 0:
-            data_type = data_type + "[" + str(r.main_record.dimension_1) + "]"
+            dim_parts.append(str(r.main_record.dimension_1))
         if r.main_record.dimension_2 != 0:
-            data_type = data_type + "[" + str(r.main_record.dimension_2) + "]"
+            dim_parts.append(str(r.main_record.dimension_2))
         if r.main_record.dimension_3 != 0:
-            data_type = data_type + "[" + str(r.main_record.dimension_3) + "]"
+            dim_parts.append(str(r.main_record.dimension_3))
+        dimensions = ",".join(dim_parts) if dim_parts else None
         return Tag(
             name,
             name,
@@ -772,6 +780,7 @@ class TagBuilder(L5xElementBuilder):
             data_type,
             radix,
             external_access,
+            dimensions,
             r.main_record.data_table_instance,
             comment_results,
         )
@@ -1381,7 +1390,7 @@ class ControllerBuilder(L5xElementBuilder):
             "EnabledWithAppend",  # PassThroughConfiguration
             "true",         # DownloadProjectDocumentationAndExtendedProperties
             "true",         # DownloadProjectCustomProperties
-            "false",        # ReportMinorOverflow
+            "true",         # ReportMinorOverflow
             "false",        # AutoDiagsEnabled
             "false",        # WebServerEnabled
             data_types,

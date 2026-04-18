@@ -143,6 +143,7 @@ class Module(L5xElement):
     # Private fields (not serialised as XML attributes)
     _ekey_state: str = field(default="CompatibleModule")
     _slot: int = field(default=0)
+    _ip_address: str = field(default="")
     _port_child_counts: Dict[int, int] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -204,8 +205,8 @@ class Module(L5xElement):
                 addr_attr = f' Address="{self._slot}"'
             elif pd.address_mode == "zero":
                 addr_attr = ' Address="0"'
-            else:  # "empty"
-                addr_attr = ' Address=""'
+            else:  # "empty" — use IP from binary if present, else omit value
+                addr_attr = f' Address="{self._ip_address}"'
 
             # --- Bus element ---
             # Bus is only emitted on downstream (Upstream="false") ports.
@@ -613,6 +614,15 @@ class ModuleBuilder(L5xElementBuilder):
         # bit 2 (0x04) of e1[0] → EKey Disabled (Local=0x06→Disabled, EN2T=0x11→CompatibleModule).
         ekey_state  = "Disabled" if (e1[0] & 0x04) else "CompatibleModule"
 
+        # IP address: stored at e1[0x30] as a u16 length-prefixed ASCII string for modules
+        # that connect via Ethernet upstream (parent_port == 2). Local backplane modules
+        # (parent_port == 1) leave this field zero.
+        ip_address = ""
+        if len(e1) > 0x32:
+            ip_len = struct.unpack("<H", e1[0x30:0x32])[0]
+            if ip_len:
+                ip_address = e1[0x32:0x32 + ip_len].rstrip(b"\x00").decode("ascii", errors="replace")
+
         return Module(
             name,           # L5xElement._name (private)
             name,           # Module.name
@@ -628,6 +638,7 @@ class ModuleBuilder(L5xElementBuilder):
             major_fault,
             _ekey_state=ekey_state,
             _slot=slot,
+            _ip_address=ip_address,
         )
 
 

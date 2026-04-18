@@ -205,4 +205,7 @@ PORT_STRUCTURES: dict[tuple[int, int, int], List[PortDef]] = {
     (1182, 43, 4155): [PortDef(port_id=1, port_type="Ethernet", upstream_fixed=True, upstream_port=True, address_mode="empty", bus_mode="none")],  # Promass_300_500
     (1182, 43, 4156): [PortDef(port_id=1, port_type="Ethernet", upstream_fixed=True, upstream_port=True, address_mode="empty", bus_mode="none")],  # Promag_300_500
     (1182, 43, 4170): [PortDef(port_id=1, port_type="Ethernet", upstream_fixed=True, upstream_port=True, address_mode="empty", bus_mode="none")],  # Promass_100
+
+    # --- Third-party Ethernet devices (V=322, e.g. Bihl+Wiedemann ASI gateway) ---
+    (322, 12, 1422): [PortDef(port_id=2, port_type="Ethernet", upstream_fixed=True, upstream_port=True, address_mode="empty", bus_mode="none")],
 }

@@ -136,6 +136,20 @@ class Tag(L5xElement):
             or self.name.startswith("__l0")
         )
 
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        # Find tag-level description: empty tag_reference means the tag itself
+        desc = next(
+            (text for ref, text in self._comments if ref in ("", ".")),
+            None,
+        )
+        if not desc:
+            return base
+        desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
+        # Insert immediately after the opening tag (first '>')
+        idx = base.index('>')
+        return base[:idx + 1] + desc_xml + base[idx + 1:]
+
 
 @dataclass
 class LocalTag(L5xElement):
@@ -329,6 +343,23 @@ class Routine(L5xElement):
     type: str
     rungs: List[str]
     _rung_ids: List[int] = field(default_factory=list)
+
+    def to_xml(self) -> str:
+        rll_content = ""
+        if self.type == "RLL" and self.rungs:
+            rung_xmls = []
+            for i, rung_text in enumerate(self.rungs):
+                text = (rung_text or "").strip()
+                if not text:
+                    continue
+                rung_xmls.append(
+                    f'<Rung Number="{i}" Type="N">'
+                    f'<Text><![CDATA[{text}]]></Text>'
+                    f'</Rung>'
+                )
+            if rung_xmls:
+                rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
+        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{rll_content}</Routine>'
 
 
 @dataclass

@@ -1197,6 +1197,29 @@ class RoutineBuilder(L5xElementBuilder):
         rows = [(row[0], row[1]) for row in self._cur.fetchall() if row[1] is not None]
         rung_ids = [row[0] for row in rows]
         rungs = [row[1] for row in rows]
+
+        # Resolve &hexid: placeholders (object ID references) to comp names.
+        # The ACD binary stores tag references as &XXXXXXXX: where XXXXXXXX is the
+        # object_id in hex. Batch-resolve all unique IDs to avoid per-rung queries.
+        import re as _re
+        all_hex = set(_re.findall(r'&([0-9a-f]{8}):', " ".join(r for r in rungs if r)))
+        if all_hex:
+            id_to_name: Dict[int, str] = {}
+            for hex_id in all_hex:
+                oid = int(hex_id, 16)
+                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (oid,))
+                row2 = self._cur.fetchone()
+                if row2:
+                    id_to_name[hex_id] = row2[0]
+            if id_to_name:
+                def _resolve(rung: str) -> str:
+                    return _re.sub(
+                        r'&([0-9a-f]{8}):',
+                        lambda m: (id_to_name[m.group(1)] + ":") if m.group(1) in id_to_name else m.group(0),
+                        rung,
+                    )
+                rungs = [_resolve(r) if r else r for r in rungs]
+
         return Routine(name, name, routine_type, rungs, rung_ids)
 
 

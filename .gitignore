@@ -5,9 +5,11 @@ test/build/*
 acd.egg-info
 .pytest_cache
 venv
+.venv
 build
 .idea
 dist
 /test/dump/
 /.mypy_cache/
 /acd_tools.egg-info/
+.vscode

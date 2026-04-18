@@ -1,21 +1,18 @@
 # This is a generated file! Please edit source .ksy file and use kaitai-struct-compiler to rebuild
+# type: ignore
 
 import kaitaistruct
 from kaitaistruct import KaitaiStruct, KaitaiStream, BytesIO
 
 
-if getattr(kaitaistruct, "API_VERSION", (0, 9)) < (0, 9):
-    raise Exception(
-        "Incompatible Kaitai Struct Python API: 0.9 or later is required, but you have %s"
-        % (kaitaistruct.__version__)
-    )
-
+if getattr(kaitaistruct, 'API_VERSION', (0, 9)) < (0, 11):
+    raise Exception("Incompatible Kaitai Struct Python API: 0.11 or later is required, but you have %s" % (kaitaistruct.__version__))
 
 class FafaComents(KaitaiStruct):
     def __init__(self, _io, _parent=None, _root=None):
-        self._io = _io
+        super(FafaComents, self).__init__(_io)
         self._parent = _parent
-        self._root = _root if _root else self
+        self._root = _root or self
         self._read()
 
     def _read(self):
@@ -24,46 +21,131 @@ class FafaComents(KaitaiStruct):
         _io__raw_header = KaitaiStream(BytesIO(self._raw_header))
         self.header = FafaComents.Header(_io__raw_header, self, self._root)
         _on = self.header.record_type
-        if _on == 14:
-            self._raw_body = self._io.read_bytes((self.record_length - 10))
-            _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
-            self.body = FafaComents.Utf16Record(12, _io__raw_body, self, self._root)
-        elif _on == 4:
-            self._raw_body = self._io.read_bytes((self.record_length - 10))
-            _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
-            self.body = FafaComents.Utf16Record(12, _io__raw_body, self, self._root)
-        elif _on == 1:
-            self._raw_body = self._io.read_bytes((self.record_length - 10))
+        if _on == 1:
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
             _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
             self.body = FafaComents.AsciiRecord(_io__raw_body, self, self._root)
         elif _on == 13:
-            self._raw_body = self._io.read_bytes((self.record_length - 10))
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
             _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
             self.body = FafaComents.Utf16Record(12, _io__raw_body, self, self._root)
-        elif _on == 3:
-            self._raw_body = self._io.read_bytes((self.record_length - 10))
+        elif _on == 14:
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
             _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
             self.body = FafaComents.Utf16Record(12, _io__raw_body, self, self._root)
-        elif _on == 23:
-            self._raw_body = self._io.read_bytes((self.record_length - 10))
-            _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
-            self.body = FafaComents.ControllerRecord(_io__raw_body, self, self._root)
         elif _on == 2:
-            self._raw_body = self._io.read_bytes((self.record_length - 10))
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
             _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
             self.body = FafaComents.AsciiRecord(_io__raw_body, self, self._root)
-        elif _on == 25:
-            self._raw_body = self._io.read_bytes((self.record_length - 10))
+        elif _on == 23:
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
             _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
             self.body = FafaComents.ControllerRecord(_io__raw_body, self, self._root)
+        elif _on == 25:
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
+            _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
+            self.body = FafaComents.ControllerRecord(_io__raw_body, self, self._root)
+        elif _on == 3:
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
+            _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
+            self.body = FafaComents.Utf16Record(12, _io__raw_body, self, self._root)
+        elif _on == 4:
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
+            _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
+            self.body = FafaComents.Utf16Record(12, _io__raw_body, self, self._root)
         else:
-            self.body = self._io.read_bytes((self.record_length - 10))
+            pass
+            self.body = self._io.read_bytes(self.record_length - 10)
+
+
+    def _fetch_instances(self):
+        pass
+        self.header._fetch_instances()
+        _on = self.header.record_type
+        if _on == 1:
+            pass
+            self.body._fetch_instances()
+        elif _on == 13:
+            pass
+            self.body._fetch_instances()
+        elif _on == 14:
+            pass
+            self.body._fetch_instances()
+        elif _on == 2:
+            pass
+            self.body._fetch_instances()
+        elif _on == 23:
+            pass
+            self.body._fetch_instances()
+        elif _on == 25:
+            pass
+            self.body._fetch_instances()
+        elif _on == 3:
+            pass
+            self.body._fetch_instances()
+        elif _on == 4:
+            pass
+            self.body._fetch_instances()
+        else:
+            pass
+        _ = self.lookup_id
+        if hasattr(self, '_m_lookup_id'):
+            pass
+
+        _ = self.sub_record_type
+        if hasattr(self, '_m_sub_record_type'):
+            pass
+
+
+    class AsciiRecord(KaitaiStruct):
+        def __init__(self, _io, _parent=None, _root=None):
+            super(FafaComents.AsciiRecord, self).__init__(_io)
+            self._parent = _parent
+            self._root = _root
+            self._read()
+
+        def _read(self):
+            self.unknown_1 = self._io.read_bytes(13)
+            self.object_id = self._io.read_u4le()
+            self.unknown_2 = self._io.read_bytes(13)
+            self.record_string = (self._io.read_bytes_term(0, False, True, True)).decode(u"UTF-8")
+
+
+        def _fetch_instances(self):
+            pass
+
+
+    class AsciiRecord4(KaitaiStruct):
+        def __init__(self, _io, _parent=None, _root=None):
+            super(FafaComents.AsciiRecord4, self).__init__(_io)
+            self._parent = _parent
+            self._root = _root
+            self._read()
+
+        def _read(self):
+            self.unknown_1 = self._io.read_bytes(8)
+            self.object_id = self._io.read_u4le()
+            self.unknown_2 = self._io.read_bytes(24)
+            self.record_string = (self._io.read_bytes_term(0, False, True, True)).decode(u"UTF-8")
+
+
+        def _fetch_instances(self):
+            pass
+
 
     class ControllerRecord(KaitaiStruct):
         def __init__(self, _io, _parent=None, _root=None):
-            self._io = _io
+            super(FafaComents.ControllerRecord, self).__init__(_io)
             self._parent = _parent
-            self._root = _root if _root else self
+            self._root = _root
             self._read()
 
         def _read(self):
@@ -72,114 +154,116 @@ class FafaComents(KaitaiStruct):
             self.unknown_2 = self._io.read_bytes(4)
             self.tag_reference = FafaComents.StrzUtf16(self._io, self, self._root)
             self.unknown_3 = self._io.read_bytes(12)
-            self.record_string = (
-                self._io.read_bytes_term(0, False, True, True)
-            ).decode("UTF-8", errors="replace")
+            self.record_string = (self._io.read_bytes_term(0, False, True, True)).decode(u"UTF-8")
 
-    class AsciiRecord(KaitaiStruct):
-        def __init__(self, _io, _parent=None, _root=None):
-            self._io = _io
-            self._parent = _parent
-            self._root = _root if _root else self
-            self._read()
 
-        def _read(self):
-            self.unknown_1 = self._io.read_bytes(13)
-            self.object_id = self._io.read_u4le()
-            self.unknown_2 = self._io.read_bytes(13)
-            self.record_string = (
-                self._io.read_bytes_term(0, False, True, True)
-            ).decode("UTF-8", errors="replace")
+        def _fetch_instances(self):
+            pass
+            self.tag_reference._fetch_instances()
 
-    class AsciiRecord4(KaitaiStruct):
-        def __init__(self, _io, _parent=None, _root=None):
-            self._io = _io
-            self._parent = _parent
-            self._root = _root if _root else self
-            self._read()
-
-        def _read(self):
-            self.unknown_1 = self._io.read_bytes(8)
-            self.object_id = self._io.read_u4le()
-            self.unknown_2 = self._io.read_bytes(24)
-            self.record_string = (
-                self._io.read_bytes_term(0, False, True, True)
-            ).decode("UTF-8", errors="replace")
 
     class Header(KaitaiStruct):
         def __init__(self, _io, _parent=None, _root=None):
-            self._io = _io
+            super(FafaComents.Header, self).__init__(_io)
             self._parent = _parent
-            self._root = _root if _root else self
+            self._root = _root
             self._read()
 
         def _read(self):
             pass
 
-        @property
-        def seq_number(self):
-            if hasattr(self, "_m_seq_number"):
-                return self._m_seq_number
 
-            _pos = self._io.pos()
-            self._io.seek(0)
-            self._m_seq_number = self._io.read_u2le()
-            self._io.seek(_pos)
-            return getattr(self, "_m_seq_number", None)
+        def _fetch_instances(self):
+            pass
+            _ = self.parent
+            if hasattr(self, '_m_parent'):
+                pass
 
-        @property
-        def record_type(self):
-            if hasattr(self, "_m_record_type"):
-                return self._m_record_type
+            _ = self.record_type
+            if hasattr(self, '_m_record_type'):
+                pass
 
-            _pos = self._io.pos()
-            self._io.seek(2)
-            self._m_record_type = self._io.read_u2le()
-            self._io.seek(_pos)
-            return getattr(self, "_m_record_type", None)
+            _ = self.seq_number
+            if hasattr(self, '_m_seq_number'):
+                pass
 
-        @property
-        def sub_record_length(self):
-            if hasattr(self, "_m_sub_record_length"):
-                return self._m_sub_record_length
+            _ = self.sub_record_length
+            if hasattr(self, '_m_sub_record_length'):
+                pass
 
-            _pos = self._io.pos()
-            self._io.seek(4)
-            self._m_sub_record_length = self._io.read_u2le()
-            self._io.seek(_pos)
-            return getattr(self, "_m_sub_record_length", None)
 
         @property
         def parent(self):
-            if hasattr(self, "_m_parent"):
+            if hasattr(self, '_m_parent'):
                 return self._m_parent
 
             _pos = self._io.pos()
             self._io.seek(6)
             self._m_parent = self._io.read_u4le()
             self._io.seek(_pos)
-            return getattr(self, "_m_parent", None)
+            return getattr(self, '_m_parent', None)
+
+        @property
+        def record_type(self):
+            if hasattr(self, '_m_record_type'):
+                return self._m_record_type
+
+            _pos = self._io.pos()
+            self._io.seek(2)
+            self._m_record_type = self._io.read_u2le()
+            self._io.seek(_pos)
+            return getattr(self, '_m_record_type', None)
+
+        @property
+        def seq_number(self):
+            if hasattr(self, '_m_seq_number'):
+                return self._m_seq_number
+
+            _pos = self._io.pos()
+            self._io.seek(0)
+            self._m_seq_number = self._io.read_u2le()
+            self._io.seek(_pos)
+            return getattr(self, '_m_seq_number', None)
+
+        @property
+        def sub_record_length(self):
+            if hasattr(self, '_m_sub_record_length'):
+                return self._m_sub_record_length
+
+            _pos = self._io.pos()
+            self._io.seek(4)
+            self._m_sub_record_length = self._io.read_u2le()
+            self._io.seek(_pos)
+            return getattr(self, '_m_sub_record_length', None)
+
 
     class StrzUtf16(KaitaiStruct):
         def __init__(self, _io, _parent=None, _root=None):
-            self._io = _io
+            super(FafaComents.StrzUtf16, self).__init__(_io)
             self._parent = _parent
-            self._root = _root if _root else self
+            self._root = _root
             self._read()
 
         def _read(self):
-            self.value = (self._io.read_bytes((2 * (len(self.code_units) - 1)))).decode(
-                "utf-16le"
-            )
+            self.value = (self._io.read_bytes(2 * (len(self.code_units) - 1))).decode(u"UTF-16LE")
             self.term = self._io.read_u2le()
             if not self.term == 0:
-                raise kaitaistruct.ValidationNotEqualError(
-                    0, self.term, self._io, "/types/strz_utf_16/seq/1"
-                )
+                raise kaitaistruct.ValidationNotEqualError(0, self.term, self._io, u"/types/strz_utf_16/seq/1")
+
+
+        def _fetch_instances(self):
+            pass
+            _ = self.code_units
+            if hasattr(self, '_m_code_units'):
+                pass
+                for i in range(len(self._m_code_units)):
+                    pass
+
+
 
         @property
         def code_units(self):
-            if hasattr(self, "_m_code_units"):
+            if hasattr(self, '_m_code_units'):
                 return self._m_code_units
 
             _pos = self._io.pos()
@@ -193,13 +277,14 @@ class FafaComents(KaitaiStruct):
                     break
                 i += 1
             self._io.seek(_pos)
-            return getattr(self, "_m_code_units", None)
+            return getattr(self, '_m_code_units', None)
+
 
     class Utf16Record(KaitaiStruct):
         def __init__(self, len_unknown_3, _io, _parent=None, _root=None):
-            self._io = _io
+            super(FafaComents.Utf16Record, self).__init__(_io)
             self._parent = _parent
-            self._root = _root if _root else self
+            self._root = _root
             self.len_unknown_3 = len_unknown_3
             self._read()
 
@@ -210,28 +295,34 @@ class FafaComents(KaitaiStruct):
             self.len_record = self._io.read_u2le()
             self.tag_reference = FafaComents.StrzUtf16(self._io, self, self._root)
             self.unknown_3 = self._io.read_bytes(self.len_unknown_3)
-            self.record_string = (
-                self._io.read_bytes_term(0, False, True, True)
-            ).decode("UTF-8", errors="replace")
+            self.record_string = (self._io.read_bytes_term(0, False, True, True)).decode(u"UTF-8")
+
+
+        def _fetch_instances(self):
+            pass
+            self.tag_reference._fetch_instances()
+
 
     @property
     def lookup_id(self):
-        if hasattr(self, "_m_lookup_id"):
+        if hasattr(self, '_m_lookup_id'):
             return self._m_lookup_id
 
         _pos = self._io.pos()
         self._io.seek(27)
         self._m_lookup_id = self._io.read_u2le()
         self._io.seek(_pos)
-        return getattr(self, "_m_lookup_id", None)
+        return getattr(self, '_m_lookup_id', None)
 
     @property
     def sub_record_type(self):
-        if hasattr(self, "_m_sub_record_type"):
+        if hasattr(self, '_m_sub_record_type'):
             return self._m_sub_record_type
 
         _pos = self._io.pos()
         self._io.seek(41)
         self._m_sub_record_type = self._io.read_u2le()
         self._io.seek(_pos)
-        return getattr(self, "_m_sub_record_type", None)
+        return getattr(self, '_m_sub_record_type', None)
+
+

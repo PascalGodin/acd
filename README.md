@@ -173,6 +173,12 @@ pytest
 
 ---
 
+### Developing
+
+Sections of the code are generated from kaitai template (.ksy) files in the resources/templates folder.
+These are generated during the install phase.
+The python scripts which are generated are located in the acd/generated folder.
+
 ### Contributing
 
 Contributions are welcome. Open an issue or pull request on GitHub.

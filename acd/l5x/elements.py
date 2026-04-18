@@ -477,11 +477,12 @@ class LocalTag(L5xElement):
 
     @property
     def _l5x_exclude(self) -> bool:
-        """Exclude hex-address placeholders, empty names, and ACD-internal clone tags."""
+        """Exclude hex-address placeholders, empty names, and ACD-internal runtime tags."""
         return (
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
-            or ":" in self.name
+            or (re.search(r':\d', self.name) is not None)
+            or self.name.startswith("__l0")
             or self.name.startswith("__CLONE")
         )
 

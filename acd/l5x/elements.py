@@ -291,16 +291,25 @@ class Controller(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        # Studio 5000 rejects the L5X without these structural sections. Tasks is
-        # omitted because we serialise real tasks via the collection loop.
-        stubs = (
-            '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" '
-            'IOMemoryPadPercentage="90" DataTablePadPercentage="50"/>'
+        # Split at the end of the opening <Controller ...> tag so we can inject
+        # structural stubs before the data sections and post-sections after them.
+        idx = base.index(">")
+        open_tag = base[: idx + 1]
+        inner = base[idx + 1 : -len("</Controller>")]
+        pre = (
+            '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false"/>'
             '<Security Code="0" ChangesToDetect="16#ffff_ffff"/>'
             '<SafetyInfo/>'
         )
-        closing = "</Controller>"
-        return base[: -len(closing)] + stubs + closing
+        post = (
+            '<CST MasterID="0"/>'
+            '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
+            '<Trends/>'
+            '<DataLogs/>'
+            '<TimeSynchronize Priority1="128" Priority2="128" PTPEnable="true"/>'
+            '<EthernetPorts><EthernetPort Port="1" Label="1" PortEnabled="true"/></EthernetPorts>'
+        )
+        return open_tag + pre + inner + post + "</Controller>"
 
 
 @dataclass
@@ -1175,11 +1184,18 @@ class ControllerBuilder(L5xElementBuilder):
                     ModuleBuilder(self._cur, mod_oid, modid_to_name).build()
                 )
 
+        # ProcessorType is the CatalogNumber of the root controller module (the one
+        # whose parent is itself, i.e. MajorFault="true").
+        processor_type = next(
+            (m.catalog_number for m in modules if m.major_fault == "true" and m.catalog_number),
+            None,
+        )
+
         return Controller(
             controller_name,
             "Target",
             controller_name,
-            None,           # ProcessorType: not found in binary (omitted from XML)
+            processor_type,
             major_rev,
             minor_rev,
             major_fault_program,

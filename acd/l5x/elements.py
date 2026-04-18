@@ -131,6 +131,258 @@ _PRIMITIVE_L5K_ZERO: Dict[str, str] = {
     "LREAL": "0.00000000e+000",
 }
 
+# Radix string used in Decorated DataValueMember for each numeric primitive.
+# BOOL and BIT use no Radix attribute; REAL/LREAL use "Float"; all integers use "Decimal".
+_PRIMITIVE_RADIX: Dict[str, str] = {
+    "SINT":  "Decimal",
+    "INT":   "Decimal",
+    "DINT":  "Decimal",
+    "LINT":  "Decimal",
+    "USINT": "Decimal",
+    "UINT":  "Decimal",
+    "UDINT": "Decimal",
+    "ULINT": "Decimal",
+    "REAL":  "Float",
+    "LREAL": "Float",
+}
+
+# Default zero value string for each primitive in Decorated output.
+_PRIMITIVE_DECORATED_ZERO: Dict[str, str] = {
+    "BOOL":  "0",
+    "BIT":   "0",
+    "SINT":  "0",
+    "INT":   "0",
+    "DINT":  "0",
+    "LINT":  "0",
+    "USINT": "0",
+    "UINT":  "0",
+    "UDINT": "0",
+    "ULINT": "0",
+    "REAL":  "0.0",
+    "LREAL": "0.0",
+}
+
+# Built-in Logix struct types that are not in the user DataType list.
+# Each entry is a list of (member_name, member_data_type) tuples.
+# Only non-hidden, visible members are listed (as they appear in Decorated output).
+_BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
+    "TIMER": [
+        ("PRE", "DINT"), ("ACC", "DINT"),
+        ("EN", "BOOL"), ("TT", "BOOL"), ("DN", "BOOL"),
+    ],
+    "COUNTER": [
+        ("PRE", "DINT"), ("ACC", "DINT"),
+        ("CU", "BOOL"), ("CD", "BOOL"), ("DN", "BOOL"), ("OV", "BOOL"), ("UN", "BOOL"),
+    ],
+    "CONTROL": [
+        ("LEN", "DINT"), ("POS", "DINT"),
+        ("EN", "BOOL"), ("EU", "BOOL"), ("DN", "BOOL"), ("EM", "BOOL"),
+        ("ER", "BOOL"), ("UL", "BOOL"), ("IN", "BOOL"), ("FD", "BOOL"),
+    ],
+}
+
+# Types for which we emit no Decorated element at all (they use other formats).
+_SKIP_DECORATED: set = {"ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED"}
+
+
+def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
+                           data_types_map: Dict[str, "DataType"]) -> str:
+    """Return the Decorated XML fragment for a single UDT member.
+
+    member_dt:  the DataType name of the member (already upper-cased by caller)
+    member_dim: array dimension (0 = scalar)
+    """
+    if member_dim > 0:
+        # Array member
+        return _array_member_xml(member_name, member_dt, member_dim, data_types_map)
+
+    if member_dt in ("BOOL", "BIT"):
+        return f'<DataValueMember Name="{member_name}" DataType="BOOL" Value="0"/>'
+
+    radix = _PRIMITIVE_RADIX.get(member_dt)
+    zero = _PRIMITIVE_DECORATED_ZERO.get(member_dt)
+    if radix is not None and zero is not None:
+        return f'<DataValueMember Name="{member_name}" DataType="{member_dt}" Radix="{radix}" Value="{zero}"/>'
+
+    # Struct member (nested UDT, TIMER, COUNTER, etc.)
+    inner = _struct_members_xml(member_dt, data_types_map)
+    if inner is None:
+        return ""  # unknown / skip
+    return f'<StructureMember Name="{member_name}" DataType="{member_dt}">{inner}</StructureMember>'
+
+
+def _array_member_xml(member_name: str, member_dt: str, dim: int,
+                      data_types_map: Dict[str, "DataType"]) -> str:
+    """Generate an <ArrayMember> element for a member that is an array."""
+    radix = _PRIMITIVE_RADIX.get(member_dt)
+    zero = _PRIMITIVE_DECORATED_ZERO.get(member_dt)
+    is_bool = member_dt in ("BOOL", "BIT")
+
+    if is_bool:
+        elems = "".join(
+            f'<Element Index="[{i}]" Value="0"/>' for i in range(dim)
+        )
+        return (
+            f'<ArrayMember Name="{member_name}" DataType="BOOL" Dimensions="{dim}" Radix="Decimal">'
+            f'{elems}'
+            f'</ArrayMember>'
+        )
+
+    if radix is not None and zero is not None:
+        elems = "".join(
+            f'<Element Index="[{i}]" Value="{zero}"/>' for i in range(dim)
+        )
+        return (
+            f'<ArrayMember Name="{member_name}" DataType="{member_dt}" Dimensions="{dim}" Radix="{radix}">'
+            f'{elems}'
+            f'</ArrayMember>'
+        )
+
+    # Array of structs
+    inner = _struct_members_xml(member_dt, data_types_map)
+    if inner is None:
+        return ""
+    struct_xml = f'<Structure DataType="{member_dt}">{inner}</Structure>'
+    elems = "".join(
+        f'<Element Index="[{i}]">{struct_xml}</Element>' for i in range(dim)
+    )
+    return (
+        f'<ArrayMember Name="{member_name}" DataType="{member_dt}" Dimensions="{dim}">'
+        f'{elems}'
+        f'</ArrayMember>'
+    )
+
+
+def _struct_members_xml(dt_name: str, data_types_map: Dict[str, "DataType"]) -> Union[str, None]:
+    """Return the inner XML for a Structure/StructureMember of the given DataType.
+
+    Returns None if the type is unknown or should be skipped.
+    The returned string does NOT include the outer <Structure> wrapper.
+    """
+    if dt_name in _SKIP_DECORATED:
+        return None
+
+    # Handle STRING as a special built-in: LEN (DINT) + DATA (STRING/ASCII)
+    if dt_name == "STRING":
+        return (
+            '<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="0"/>'
+            '<DataValueMember Name="DATA" DataType="STRING" Radix="ASCII">\n\n</DataValueMember>'
+        )
+
+    # Built-in struct types (TIMER, COUNTER, CONTROL)
+    builtin_members = _BUILTIN_STRUCT_MEMBERS.get(dt_name)
+    if builtin_members is not None:
+        parts: List[str] = []
+        for mname, mdt in builtin_members:
+            radix = _PRIMITIVE_RADIX.get(mdt)
+            zero = _PRIMITIVE_DECORATED_ZERO.get(mdt)
+            if radix is not None and zero is not None:
+                parts.append(
+                    f'<DataValueMember Name="{mname}" DataType="{mdt}" Radix="{radix}" Value="{zero}"/>'
+                )
+            else:
+                # BOOL member
+                parts.append(f'<DataValueMember Name="{mname}" DataType="{mdt}" Value="0"/>')
+        return "".join(parts)
+
+    # User-defined type: look up in data_types_map
+    dt_obj = data_types_map.get(dt_name)
+    if dt_obj is None:
+        return None
+
+    parts = []
+    for member in dt_obj.members:
+        if member.hidden:
+            continue
+        mdt = member.data_type.upper()
+        mname = member.name
+        mdim = member.dimension
+
+        fragment = _member_decorated_xml(mname, mdt, mdim, data_types_map)
+        if fragment:
+            parts.append(fragment)
+    return "".join(parts)
+
+
+def _generate_decorated(dt_base: str, dimensions: Union[str, None],
+                        data_types_map: Dict[str, "DataType"]) -> str:
+    """Generate a complete <Data Format="Decorated"> XML string for a tag.
+
+    dt_base:    the base DataType name (uppercase, array brackets already stripped)
+    dimensions: comma-separated dimension string (e.g. "100" or "4,8") or None for scalar
+    Returns "" if this type should not have a Decorated element.
+    """
+    if dt_base in _SKIP_DECORATED:
+        return ""
+
+    if dimensions is None:
+        # Scalar struct
+        inner = _struct_members_xml(dt_base, data_types_map)
+        if inner is None:
+            return ""
+        body = f'<Structure DataType="{dt_base}">{inner}</Structure>'
+    else:
+        # Array tag: parse dimensions (up to 3D, comma-separated)
+        dim_parts = [int(d) for d in dimensions.split(",") if d.strip().isdigit()]
+        if not dim_parts:
+            return ""
+
+        # For multi-dimensional arrays the total element count is the product.
+        # We generate flat [0]..[N-1] indices for 1D, and nested for multi-D.
+        # Logix displays multi-dim as [i][j] etc.
+        total = 1
+        for d in dim_parts:
+            total *= d
+
+        dim_str = ",".join(str(d) for d in dim_parts)
+
+        radix = _PRIMITIVE_RADIX.get(dt_base)
+        zero = _PRIMITIVE_DECORATED_ZERO.get(dt_base)
+        is_bool = dt_base in ("BOOL", "BIT")
+
+        if is_bool:
+            # BOOL array: flat indexed elements with Radix="Decimal"
+            def _bool_elems(parts: List[int], remaining: List[int]) -> str:
+                if not remaining:
+                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    return f'<Element Index="{idx}" Value="0"/>'
+                return "".join(
+                    _bool_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
+                )
+            elems = _bool_elems([], dim_parts)
+            body = f'<Array DataType="BOOL" Dimensions="{dim_str}" Radix="Decimal">{elems}</Array>'
+
+        elif radix is not None and zero is not None:
+            # Primitive array (DINT, REAL, etc.)
+            def _prim_elems(parts: List[int], remaining: List[int]) -> str:
+                if not remaining:
+                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    return f'<Element Index="{idx}" Value="{zero}"/>'
+                return "".join(
+                    _prim_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
+                )
+            elems = _prim_elems([], dim_parts)
+            body = f'<Array DataType="{dt_base}" Dimensions="{dim_str}" Radix="{radix}">{elems}</Array>'
+
+        else:
+            # Struct array (UDT, TIMER, COUNTER, STRING, ...)
+            inner = _struct_members_xml(dt_base, data_types_map)
+            if inner is None:
+                return ""
+            struct_xml = f'<Structure DataType="{dt_base}">{inner}</Structure>'
+
+            def _struct_elems(parts: List[int], remaining: List[int]) -> str:
+                if not remaining:
+                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    return f'<Element Index="{idx}">{struct_xml}</Element>'
+                return "".join(
+                    _struct_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
+                )
+            elems = _struct_elems([], dim_parts)
+            body = f'<Array DataType="{dt_base}" Dimensions="{dim_str}">{elems}</Array>'
+
+    return f'<Data Format="Decorated">\n{body}\n</Data>'
+
 
 @dataclass
 class Tag(L5xElement):
@@ -143,6 +395,7 @@ class Tag(L5xElement):
     dimensions: Union[str, None]
     _data_table_instance: int
     _comments: List[Tuple[str, str]]
+    _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -184,12 +437,20 @@ class Tag(L5xElement):
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
-        # --- Data Format="L5K" child element ---
-        # Only emit for scalar primitive types (no array dimensions).
-        # Complex/UDT types and arrays are skipped for now.
+        # --- Data child element(s) ---
+        # Scalar primitives get Format="L5K" only.
+        # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
+        # nothing here — Decorated is not used for scalar STRING tags).
+        # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
         l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
         data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+
+        if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
+            # Generate Decorated data for non-primitive / array types
+            decorated = _generate_decorated(dt_base, self.dimensions, self._data_types_map)
+            if decorated:
+                data_xml = decorated
 
         if not desc_xml and not data_xml:
             return base
@@ -1192,7 +1453,7 @@ class RoutineBuilder(L5xElementBuilder):
         self._cur.execute(
             "SELECT rm.object_id, r.rung FROM region_map rm "
             "LEFT JOIN rungs r ON r.object_id = rm.object_id "
-            "WHERE rm.parent_id=" + str(self._object_id) + " ORDER BY rm.seq_no"
+            "WHERE rm.parent_id=" + str(self._object_id) + " ORDER BY rm.unknown"
         )
         rows = [(row[0], row[1]) for row in self._cur.fetchall() if row[1] is not None]
         rung_ids = [row[0] for row in rows]
@@ -1409,6 +1670,8 @@ class AoiBuilder(L5xElementBuilder):
 
 @dataclass
 class ProgramBuilder(L5xElementBuilder):
+    _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+
     def build(self) -> Program:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1474,7 +1737,9 @@ class ProgramBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
         tags: List[Tag] = []
         for result in results:
-            tags.append(TagBuilder(self._cur, result[1]).build())
+            tag = TagBuilder(self._cur, result[1]).build()
+            tag._data_types_map = self._data_types_map
+            tags.append(tag)
 
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
@@ -1621,11 +1886,19 @@ class ControllerBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         data_types: List[DataType] = []
+        # all_data_types_map includes ProductDefined types (excluded from L5X output but
+        # needed for generating Decorated XML for tags that reference those types).
+        all_data_types_map: Dict[str, DataType] = {}
         for result in results:
             _data_type_object_id = result[1]
             dt = DataTypeBuilder(self._cur, _data_type_object_id).build()
+            all_data_types_map[dt.name.upper()] = dt
             if dt.cls == "User":
                 data_types.append(dt)
+
+        # data_types_map: case-insensitive name → DataType for all types (User + ProductDefined).
+        # Used by Tag.to_xml() when generating Decorated XML.
+        data_types_map: Dict[str, DataType] = all_data_types_map
 
         # Get the Controller Scoped Tags
         self._cur.execute(
@@ -1646,6 +1919,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id).build()
+            tag._data_types_map = data_types_map
             if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
                 tags.append(tag)
 
@@ -1668,7 +1942,7 @@ class ControllerBuilder(L5xElementBuilder):
         programs: List[Program] = []
         for result in results:
             _program_object_id = result[1]
-            programs.append(ProgramBuilder(self._cur, _program_object_id).build())
+            programs.append(ProgramBuilder(self._cur, _program_object_id, data_types_map).build())
 
         # Build comment_id → program name map for task scheduled-program resolution.
         # comment_id is a u16 at BLOB offset 0x0C in each program's RxGeneric record.

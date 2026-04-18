@@ -144,6 +144,8 @@ class Module(L5xElement):
     _ekey_state: str = field(default="CompatibleModule")
     _slot: int = field(default=0)
     _ip_address: str = field(default="")
+    _backplane_slot: Union[int, None] = field(default=None)
+    _chassis_size: Union[int, None] = field(default=None)
     _port_child_counts: Dict[int, int] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -202,7 +204,11 @@ class Module(L5xElement):
             if pd.address_mode == "omit":
                 addr_attr = ""
             elif pd.address_mode == "slot":
-                addr_attr = f' Address="{self._slot}"'
+                # Non-upstream ICP ports (remote chassis owner): use _backplane_slot if known.
+                if upstream_str == "false" and self._backplane_slot is not None:
+                    addr_attr = f' Address="{self._backplane_slot}"'
+                else:
+                    addr_attr = f' Address="{self._slot}"'
             elif pd.address_mode == "zero":
                 addr_attr = ' Address="0"'
             else:  # "empty" — use IP from binary if present, else omit value
@@ -244,11 +250,16 @@ class Module(L5xElement):
             return f'<Bus Size="{size}"/>'
         if mode == "children_or_none":
             child_count = self._port_child_counts.get(pd.port_id, 0)
+            if self._chassis_size is not None:
+                child_count = max(child_count, self._chassis_size)
             if child_count == 0:
                 return ""
-            return "<Bus/>"
-        # "children" mode (not currently used but kept for completeness)
+            return f'<Bus Size="{child_count}"/>'
+        # "children" mode: child count, but never less than _chassis_size when known
+        # (handles remote chassis with empty slots not represented as child modules).
         child_count = self._port_child_counts.get(pd.port_id, 0)
+        if self._chassis_size is not None:
+            child_count = max(child_count, self._chassis_size)
         return f'<Bus Size="{child_count}"/>'
 
 
@@ -623,6 +634,24 @@ class ModuleBuilder(L5xElementBuilder):
             if ip_len:
                 ip_address = e1[0x32:0x32 + ip_len].rstrip(b"\x00").decode("ascii", errors="replace")
 
+        # For modules that own a remote backplane (e.g. remote chassis EN2T), the Output
+        # connection record under RxMapConnectionCollection stores the chassis size at [0x4e]
+        # and the module's own slot in that chassis at [0x6e].
+        backplane_slot = None
+        chassis_size = None
+        self._cur.execute(
+            "SELECT o.record FROM comps coll "
+            "JOIN comps o ON o.parent_id = coll.object_id AND o.comp_name = 'Output' "
+            "WHERE coll.parent_id = ? AND coll.comp_name = 'RxMapConnectionCollection'",
+            (self._object_id,),
+        )
+        out_row = self._cur.fetchone()
+        if out_row:
+            out_rec = bytes(out_row[0])
+            if len(out_rec) > 0x70:
+                backplane_slot = struct.unpack("<H", out_rec[0x6e:0x70])[0]
+                chassis_size   = struct.unpack("<H", out_rec[0x4e:0x50])[0]
+
         return Module(
             name,           # L5xElement._name (private)
             name,           # Module.name
@@ -639,6 +668,8 @@ class ModuleBuilder(L5xElementBuilder):
             _ekey_state=ekey_state,
             _slot=slot,
             _ip_address=ip_address,
+            _backplane_slot=backplane_slot,
+            _chassis_size=chassis_size,
         )
 
 

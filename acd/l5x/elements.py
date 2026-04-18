@@ -2217,6 +2217,7 @@ class ControllerBuilder(L5xElementBuilder):
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
             + str(_aoi_collection_object_id)
+            + " AND record_type=256"
         )
         results = self._cur.fetchall()
         aois: List[AOI] = []

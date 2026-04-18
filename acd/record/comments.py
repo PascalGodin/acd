@@ -1,4 +1,5 @@
 import re
+import struct
 from dataclasses import dataclass
 from sqlite3 import Cursor
 from typing import Optional
@@ -15,7 +16,7 @@ class CommentsRecord:
     def __post_init__(self):
         entry = CommentsRecord.parse(self.dat_record)
         if entry is not None:
-            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?)", entry)
+            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?)", entry)
 
     @staticmethod
     def parse(dat_record: DatRecord) -> Optional[tuple]:
@@ -27,6 +28,13 @@ class CommentsRecord:
                 tag_ref = r.body.tag_reference.value
             else:
                 tag_ref = ""
+            # For AsciiRecord (type 1 or 2), extract bytes [4:8] of unknown_1.
+            # This value is non-zero for rung-level comments and zero for internal
+            # metadata strings (FBDRoutineDescription, MainProgramLocalTagDescription, etc.).
+            if r.header.record_type in (0x01, 0x02) and len(bytes(r.body.unknown_1)) >= 8:
+                rung_content = struct.unpack_from("<I", bytes(r.body.unknown_1), 4)[0]
+            else:
+                rung_content = 0
             return (
                 r.header.seq_number,
                 r.header.sub_record_length,
@@ -35,6 +43,7 @@ class CommentsRecord:
                 r.header.record_type,
                 r.header.parent,
                 tag_ref,
+                rung_content,
             )
         except Exception:
             return None

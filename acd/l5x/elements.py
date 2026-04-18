@@ -655,6 +655,7 @@ class Routine(L5xElement):
     type: str
     rungs: List[str]
     _rung_ids: List[int] = field(default_factory=list)
+    _rung_comments: Dict[int, str] = field(default_factory=dict)
 
     def to_xml(self) -> str:
         rll_content = ""
@@ -664,8 +665,13 @@ class Routine(L5xElement):
                 text = (rung_text or "").strip()
                 if not text:
                     continue
+                comment_xml = ""
+                if i in self._rung_comments:
+                    comment_text = self._rung_comments[i]
+                    comment_xml = f'<Comment><![CDATA[{comment_text}]]></Comment>'
                 rung_xmls.append(
                     f'<Rung Number="{i}" Type="N">'
+                    f'{comment_xml}'
                     f'<Text><![CDATA[{text}]]></Text>'
                     f'</Rung>'
                 )
@@ -1476,7 +1482,28 @@ class RoutineBuilder(L5xElementBuilder):
                     )
                 rungs = [_resolve(r) if r else r for r in rungs]
 
-        return Routine(name, name, routine_type, rungs, rung_ids)
+        # Fetch rung-level comments from the comments table.
+        # Rung comments are stored under the routine's own comment parent key
+        # (comment_id * 0x10000 + cip_type), as AsciiRecord (record_type=1) entries
+        # where rung_content != 0 (distinguishes user rung comments from internal
+        # metadata strings like FBDRoutineDescription which have rung_content=0).
+        # The object_id field is the 1-based rung index (rung 0 -> object_id=1).
+        rung_comments: Dict[int, str] = {}
+        try:
+            comment_parent = (r.comment_id * 0x10000) + r.cip_type
+            self._cur.execute(
+                "SELECT object_id, record_string FROM comments "
+                "WHERE parent=? AND record_type=1 AND rung_content!=0",
+                (comment_parent,),
+            )
+            for obj_id, rec_str in self._cur.fetchall():
+                rung_index = obj_id - 1  # convert 1-based to 0-based
+                if rung_index >= 0 and rec_str and rung_index not in rung_comments:
+                    rung_comments[rung_index] = rec_str
+        except Exception:
+            pass
+
+        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments)
 
 
 def _parse_fffeff(data: bytes, offset: int):

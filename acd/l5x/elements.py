@@ -114,6 +114,24 @@ class DataType(L5xElement):
         return self.cls == "ProductDefined"
 
 
+# Maps primitive DataType names to their L5K zero-default value string.
+# UDT, STRING, ALARM_DIGITAL, MESSAGE, and array types are intentionally omitted —
+# they require complex structured L5K encoding that is not yet implemented.
+_PRIMITIVE_L5K_ZERO: Dict[str, str] = {
+    "BOOL":  "0",
+    "SINT":  "0",
+    "INT":   "0",
+    "DINT":  "0",
+    "LINT":  "0",
+    "USINT": "0",
+    "UINT":  "0",
+    "UDINT": "0",
+    "ULINT": "0",
+    "REAL":  "0.00000000e+000",
+    "LREAL": "0.00000000e+000",
+}
+
+
 @dataclass
 class Tag(L5xElement):
     name: str
@@ -136,19 +154,49 @@ class Tag(L5xElement):
             or self.name.startswith("__l0")
         )
 
+    @staticmethod
+    def _sanitize_xml_text(text: str) -> str:
+        """Encode characters illegal in XML 1.0 as XML character references (&#xNN;).
+
+        XML 1.0 allows only #x9, #xA, #xD, and #x20–#xD7FF, #xE000–#xFFFD.
+        Control characters outside that range (e.g. #x02 STX) are emitted as
+        character references rather than stripped, matching Logix Designer output.
+        """
+        parts = []
+        for ch in text:
+            cp = ord(ch)
+            if ch in ("\t", "\n", "\r") or (0x20 <= cp <= 0xD7FF) or (0xE000 <= cp <= 0xFFFD):
+                parts.append(ch)
+            else:
+                parts.append(f"&#x{cp:04X};")
+        return "".join(parts)
+
     def to_xml(self) -> str:
         base = super().to_xml()
-        # Find tag-level description: empty tag_reference means the tag itself
-        desc = next(
-            (text for ref, text in self._comments if ref in ("", ".")),
-            None,
-        )
-        if not desc:
+
+        # --- Description child element ---
+        # Find tag-level description: empty tag_reference means the tag itself.
+        # Tags with multiple empty-ref entries (e.g. array-element bit descriptions
+        # alongside the tag description) store the real tag description as the
+        # longest entry — short entries like "Spare" or "End CIP" are element labels.
+        candidates = [text for ref, text in self._comments if ref in ("", ".") and text]
+        desc_raw = max(candidates, key=len) if candidates else None
+        desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
+        desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
+
+        # --- Data Format="L5K" child element ---
+        # Only emit for scalar primitive types (no array dimensions).
+        # Complex/UDT types and arrays are skipped for now.
+        dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
+        l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
+        data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+
+        if not desc_xml and not data_xml:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
-        # Insert immediately after the opening tag (first '>')
-        idx = base.index('>')
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+
+        # Insert Description (if any) then Data (if any) immediately after the opening tag.
+        idx = base.index(">")
+        return base[:idx + 1] + desc_xml + data_xml + base[idx + 1:]
 
 
 @dataclass

@@ -12,6 +12,7 @@ from typing import List, Tuple, Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
+from acd.l5x.port_structures import PORT_STRUCTURES
 
 
 @dataclass
@@ -142,6 +143,7 @@ class Module(L5xElement):
     # Private fields (not serialised as XML attributes)
     _ekey_state: str = field(default="CompatibleModule")
     _slot: int = field(default=0)
+    _port_child_counts: Dict[int, int] = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()
@@ -164,17 +166,89 @@ class Module(L5xElement):
             f'MajorFault="{self.major_fault}"'
         )
         ekey = f'<EKey State="{self._ekey_state}"/>'
-        if self._slot > 0:
-            ports = (
-                f'<Ports>'
-                f'<Port Id="1" Address="{self._slot}" Type="ICP" Upstream="false">'
-                f'<Bus/>'
-                f'</Port>'
-                f'</Ports>'
-            )
-        else:
-            ports = '<Ports/>'
+        ports = self._build_ports_xml()
         return f'<Module {attrs}>{ekey}{ports}</Module>'
+
+    def _build_ports_xml(self) -> str:
+        """Build the <Ports>...</Ports> XML section for this module.
+
+        Looks up the port structure from PORT_STRUCTURES by (vendor, product_type,
+        product_code). Falls back to <Ports/> if the catalog number is not in the table.
+        """
+        key = (self.vendor, self.product_type, self.product_code)
+        port_defs = PORT_STRUCTURES.get(key)
+        if port_defs is None:
+            return '<Ports/>'
+
+        is_root = (self.major_fault == "true")
+        port_parts: List[str] = []
+
+        for pd in port_defs:
+            # --- Upstream direction ---
+            # Root modules (self-parenting CPU) have all ports downstream.
+            # For other modules: if upstream_fixed=True, use the static upstream_port value.
+            # If upstream_fixed=False, determine from parent_mod_port_id (the port on the
+            # parent module that this module connects through — when that matches port_id,
+            # this port faces upstream).
+            if is_root:
+                upstream_str = "false"
+            elif pd.upstream_fixed:
+                upstream_str = "true" if pd.upstream_port else "false"
+            else:
+                upstream_str = "true" if pd.port_id == self.parent_mod_port_id else "false"
+
+            # --- Address attribute ---
+            if pd.address_mode == "omit":
+                addr_attr = ""
+            elif pd.address_mode == "slot":
+                addr_attr = f' Address="{self._slot}"'
+            elif pd.address_mode == "zero":
+                addr_attr = ' Address="0"'
+            else:  # "empty"
+                addr_attr = ' Address=""'
+
+            # --- Bus element ---
+            # Bus is only emitted on downstream (Upstream="false") ports.
+            # upstream ports never carry a Bus element.
+            is_upstream = (upstream_str == "true")
+            bus_xml = self._bus_xml(pd, is_upstream)
+
+            if bus_xml:
+                port_parts.append(
+                    f'<Port Id="{pd.port_id}"{addr_attr} Type="{pd.port_type}" Upstream="{upstream_str}">\n'
+                    f'{bus_xml}\n'
+                    f'</Port>\n'
+                )
+            else:
+                port_parts.append(
+                    f'<Port Id="{pd.port_id}"{addr_attr} Type="{pd.port_type}" Upstream="{upstream_str}"/>\n'
+                )
+
+        return f'<Ports>\n{"".join(port_parts)}</Ports>\n'
+
+    def _bus_xml(self, pd, is_upstream: bool) -> str:
+        """Return the Bus XML string for a port, or '' if no Bus element should be emitted.
+
+        Bus elements are only present on downstream (Upstream=false) ports.
+        """
+        if is_upstream:
+            return ""
+        mode = pd.bus_mode
+        if mode == "none":
+            return ""
+        if mode == "always":
+            return "<Bus/>"
+        if mode.startswith("fixed:"):
+            size = mode.split(":")[1]
+            return f'<Bus Size="{size}"/>'
+        if mode == "children_or_none":
+            child_count = self._port_child_counts.get(pd.port_id, 0)
+            if child_count == 0:
+                return ""
+            return "<Bus/>"
+        # "children" mode (not currently used but kept for completeness)
+        child_count = self._port_child_counts.get(pd.port_id, 0)
+        return f'<Bus Size="{child_count}"/>'
 
 
 @dataclass
@@ -1192,6 +1266,19 @@ class ControllerBuilder(L5xElementBuilder):
                 modules.append(
                     ModuleBuilder(self._cur, mod_oid, modid_to_name).build()
                 )
+
+            # Third pass: compute (parent_name, parent_port_id) → child count,
+            # then inject the relevant sub-dict into each Module as _port_child_counts.
+            child_counts: Dict[tuple, int] = {}
+            for m in modules:
+                k = (m.parent_module, m.parent_mod_port_id)
+                child_counts[k] = child_counts.get(k, 0) + 1
+            for m in modules:
+                m._port_child_counts = {
+                    port_id: child_counts.get((m.name, port_id), 0)
+                    for port_id in range(1, 20)
+                    if (m.name, port_id) in child_counts
+                }
 
         # ProcessorType is the CatalogNumber of the root controller module (the one
         # whose parent is itself, i.e. MajorFault="true").

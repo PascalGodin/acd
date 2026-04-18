@@ -1,5 +1,6 @@
 import html
 import os
+import re
 import shutil
 import struct
 import xml.etree.ElementTree as ET
@@ -403,8 +404,9 @@ class Tag(L5xElement):
         return (
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
-            or ":" in self.name
+            or (re.search(r':\d', self.name) is not None)
             or self.name.startswith("__l0")
+            or self.name.startswith("__CLONE")
         )
 
     @staticmethod
@@ -475,11 +477,12 @@ class LocalTag(L5xElement):
 
     @property
     def _l5x_exclude(self) -> bool:
-        """Exclude hex-address placeholders and empty names."""
+        """Exclude hex-address placeholders, empty names, and ACD-internal clone tags."""
         return (
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
             or ":" in self.name
+            or self.name.startswith("__CLONE")
         )
 
 
@@ -591,7 +594,7 @@ class Module(L5xElement):
                 if upstream_str == "false" and self._backplane_slot is not None:
                     addr_attr = f' Address="{self._backplane_slot}"'
                 else:
-                    addr_attr = f' Address="{self._slot}"'
+                    addr_attr = f' Address="{self._slot if self._slot != 0xFFFFFFFF else 0}"'
             elif pd.address_mode == "zero":
                 addr_attr = ' Address="0"'
             else:  # "empty" — use IP from binary if present, else omit value
@@ -785,20 +788,7 @@ class Controller(L5xElement):
         idx = base.index(">")
         open_tag = base[: idx + 1]
         inner = base[idx + 1 : -len("</Controller>")]
-        pre = (
-            '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false"/>'
-            '<Security Code="0" ChangesToDetect="16#ffff_ffff"/>'
-            '<SafetyInfo/>'
-        )
-        post = (
-            '<CST MasterID="0"/>'
-            '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
-            '<Trends/>'
-            '<DataLogs/>'
-            '<TimeSynchronize Priority1="128" Priority2="128" PTPEnable="true"/>'
-            '<EthernetPorts><EthernetPort Port="1" Label="1" PortEnabled="true"/></EthernetPorts>'
-        )
-        return open_tag + pre + inner + post + "</Controller>"
+        return open_tag + inner + '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" IOMemoryPadPercentage="90" DataTablePadPercentage="50"/><Security Code="0" ChangesToDetect="16#ffff_ffff"/><SafetyInfo/></Controller>'
 
 
 @dataclass
@@ -1084,7 +1074,8 @@ class ModuleBuilder(L5xElementBuilder):
         exts: Dict[int, bytes] = {er.attribute_id: bytes(er.value) for er in r.extended_records}
         e1 = exts.get(0x001, b"")
         if len(e1) < 0x30:
-            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false")
+            major_fault = "true" if name == "Local" else "false"
+            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", major_fault)
 
         vendor        = struct.unpack("<H", e1[0x02:0x04])[0]
         product_type  = struct.unpack("<H", e1[0x04:0x06])[0]
@@ -1106,9 +1097,8 @@ class ModuleBuilder(L5xElementBuilder):
         # Resolve parent module name from the modid→name map built by ControllerBuilder.
         parent_name = self._modid_to_name.get(parent_modid, "Local")
 
-        own_modid   = struct.unpack("<I", e1[0x2C:0x30])[0]
-        # MajorFault=true only for the root controller module (self-referential parent).
-        major_fault = "true" if parent_modid == own_modid else "false"
+        # MajorFault=true for the root controller module: its parent resolves to itself.
+        major_fault = "true" if parent_name == name else "false"
         # bit 2 (0x04) of e1[0] → EKey Disabled (Local=0x06→Disabled, EN2T=0x11→CompatibleModule).
         ekey_state  = "Disabled" if (e1[0] & 0x04) else "CompatibleModule"
 
@@ -1178,10 +1168,10 @@ class TagBuilder(L5xElementBuilder):
         raw_rec = bytes(results[0][3])
         if len(raw_rec) > 0x279:
             external_access = external_access_enum(raw_rec[0x278])
-            constant = "true" if raw_rec[0x279] else "false"
+            constant = "true" if raw_rec[0x279] else None
         else:
             external_access = "Read/Write"
-            constant = "false"
+            constant = None
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
@@ -1219,7 +1209,7 @@ class TagBuilder(L5xElementBuilder):
         if 0x01 not in extended_records:
             # Name comes from comp_name in the database; radix from main_record
             raw_radix = r.main_record.radix
-            radix = radix_enum(raw_radix) if raw_radix != 0 else None
+            radix = radix_enum(raw_radix)
             dim_parts = []
             if r.main_record.dimension_1 != 0:
                 dim_parts.append(str(r.main_record.dimension_1))
@@ -1238,7 +1228,7 @@ class TagBuilder(L5xElementBuilder):
         name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
 
         raw_radix = r.main_record.radix
-        radix = radix_enum(raw_radix) if raw_radix != 0 else None
+        radix = radix_enum(raw_radix)
 
         dim_parts = []
         if r.main_record.dimension_1 != 0:
@@ -2073,7 +2063,7 @@ class ControllerBuilder(L5xElementBuilder):
             "EnabledWithAppend",  # PassThroughConfiguration
             "true",         # DownloadProjectDocumentationAndExtendedProperties
             "true",         # DownloadProjectCustomProperties
-            "true",         # ReportMinorOverflow
+            "false",        # ReportMinorOverflow
             "false",        # AutoDiagsEnabled
             "false",        # WebServerEnabled
             data_types,

@@ -533,6 +533,12 @@ class Module(L5xElement):
     _backplane_slot: Union[int, None] = field(default=None)
     _chassis_size: Union[int, None] = field(default=None)
     _port_child_counts: Dict[int, int] = field(default_factory=dict)
+    # Communications / ExtendedProperties / Description (optional)
+    _description: str = field(default="")
+    _comm_method: Union[str, None] = field(default=None)
+    # Each entry: (name, rpi_str, conn_type_str)
+    _connections: List[Tuple[str, str, str]] = field(default_factory=list)
+    _extended_properties: str = field(default="")
 
     def __post_init__(self):
         super().__post_init__()
@@ -554,9 +560,58 @@ class Module(L5xElement):
             f'Inhibited="{self.inhibited}" '
             f'MajorFault="{self.major_fault}"'
         )
+
+        # Optional <Description>
+        desc_xml = ""
+        if self._description:
+            desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+
         ekey = f'<EKey State="{self._ekey_state}"/>'
         ports = self._build_ports_xml()
-        return f'<Module {attrs}>{ekey}{ports}</Module>'
+
+        # <Communications> section — only emitted when a CommMethod is known.
+        comm_xml = ""
+        if self._comm_method is not None:
+            conn_parts: List[str] = []
+            for (conn_name, rpi_str, conn_type) in self._connections:
+                safe_name = html.escape(conn_name, quote=True)
+                # Derive InputTag / OutputTag stubs based on connection type.
+                if conn_type == "Output":
+                    tag_stubs = (
+                        '<OutputTag ExternalAccess="Read/Write">'
+                        '<Comments/>'
+                        '</OutputTag>'
+                    )
+                else:
+                    # Input or InputOutput: include both stubs.
+                    tag_stubs = (
+                        '<InputTag ExternalAccess="Read Only">'
+                        '<Comments/>'
+                        '</InputTag>'
+                        '<OutputTag ExternalAccess="Read/Write">'
+                        '<Comments/>'
+                        '</OutputTag>'
+                    )
+                conn_parts.append(
+                    f'<Connection Name="{safe_name}" RPI="{rpi_str}" Type="{conn_type}"'
+                    f' EventID="0" ProgrammaticallySendEventTrigger="false" Unicast="false">'
+                    f'{tag_stubs}'
+                    f'</Connection>'
+                )
+            joined = "".join(conn_parts)
+            connections_xml = f'<Connections>{joined}</Connections>' if joined else '<Connections/>'
+            comm_xml = (
+                f'<Communications CommMethod="{self._comm_method}">'
+                f'{connections_xml}'
+                f'</Communications>'
+            )
+
+        # <ExtendedProperties> section — only emitted when public data is known.
+        ext_xml = ""
+        if self._extended_properties:
+            ext_xml = f'<ExtendedProperties><public>{self._extended_properties}</public></ExtendedProperties>'
+
+        return f'<Module {attrs}>{desc_xml}{ekey}{ports}{comm_xml}{ext_xml}</Module>'
 
     def _build_ports_xml(self) -> str:
         """Build the <Ports>...</Ports> XML section for this module.
@@ -1062,6 +1117,80 @@ class ModuleBuilder(L5xElementBuilder):
             return m.group(1).decode("ascii", errors="replace") if m else ""
         return ""
 
+    def _comms_from_data_collection(
+        self, icp_slot: int, ip_address: str = ""
+    ) -> "Tuple[Union[str, None], str]":
+        """Extract CommMethod and ExtendedProperties public data for a module.
+
+        Searches RxDataCollection for the hash-named child whose <in> block contains
+        a Port with Type="ICP" Addr="{icp_slot}".  For Ethernet-connected modules
+        (icp_slot == 0 or not found by ICP slot) a second pass matches by the
+        module's IP address instead.
+
+        Returns a 2-tuple:
+          (comm_method_str_or_None, public_content_str)
+
+        comm_method_str: the numeric string from <CF>...</CF>, or None if absent.
+        public_content_str: inner content of <public>...</public>, or "" if absent.
+
+        The record XML is often stored without the closing </public> tag (it is
+        truncated in the ACD binary). We reconstruct the content by extracting
+        everything after <public>.
+        """
+        import re as _re
+
+        def _extract(raw: bytes) -> "Tuple[Union[str, None], str]":
+            xml_start = raw.find(b'<')
+            if xml_start < 0:
+                return (None, "")
+            xml_text = raw[xml_start:].decode("latin-1", errors="replace")
+            comm_method: Union[str, None] = None
+            cf_m = _re.search(r'<CF>(\d+)</CF>', xml_text)
+            if cf_m:
+                comm_method = cf_m.group(1)
+            pub_content = ""
+            pub_start = xml_text.find("<public>")
+            if pub_start >= 0:
+                after_pub = xml_text[pub_start + len("<public>"):]
+                end_tag_m = _re.search(r'</pub', after_pub)
+                if end_tag_m:
+                    pub_content = after_pub[:end_tag_m.start()]
+                else:
+                    pub_content = after_pub.rstrip("\x00 \r\n")
+            return (comm_method, pub_content)
+
+        self._cur.execute(
+            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1"
+        )
+        row = self._cur.fetchone()
+        if not row:
+            return (None, "")
+        coll_oid = row[0]
+        self._cur.execute(
+            "SELECT record FROM comps WHERE parent_id=?", (coll_oid,)
+        )
+        all_recs = [(bytes(raw),) for (raw,) in self._cur.fetchall()]
+
+        # First pass: match by ICP slot.
+        if icp_slot:
+            needle = f'Type="ICP" Addr="{icp_slot}"'.encode()
+            for (raw,) in all_recs:
+                if needle in raw:
+                    result = _extract(raw)
+                    if result[0] is not None or result[1]:
+                        return result
+
+        # Second pass: match by IP address (for EN-connected modules).
+        if ip_address:
+            ip_needle = f'Addr="{ip_address}"'.encode()
+            for (raw,) in all_recs:
+                if ip_needle in raw:
+                    result = _extract(raw)
+                    if result[0] is not None or result[1]:
+                        return result
+
+        return (None, "")
+
     def build(self) -> Module:
         self._cur.execute(
             "SELECT comp_name, object_id, record FROM comps WHERE object_id=" + str(self._object_id)
@@ -1143,6 +1272,53 @@ class ModuleBuilder(L5xElementBuilder):
                 backplane_slot = struct.unpack("<H", out_rec[0x6e:0x70])[0]
                 chassis_size   = struct.unpack("<H", out_rec[0x4e:0x50])[0]
 
+        # --- Description ---
+        # Module descriptions are stored in the comments table keyed by
+        # (comment_id * 0x10000 + cip_type), same as for tags.
+        description = ""
+        self._cur.execute(
+            "SELECT record_string FROM comments WHERE parent=? AND (tag_reference='' OR tag_reference IS NULL) LIMIT 1",
+            ((r.comment_id * 0x10000) + r.cip_type,),
+        )
+        desc_row = self._cur.fetchone()
+        if desc_row:
+            description = desc_row[0] or ""
+
+        # --- Communications and ExtendedProperties ---
+        # Both are extracted from the hash-named child of RxDataCollection that
+        # corresponds to this module's ICP backplane slot (primary) or its IP
+        # address (secondary, for EN-connected modules).
+        comm_method: Union[str, None] = None
+        connections: List[Tuple[str, str, str]] = []
+        extended_properties = ""
+        if slot or ip_address:
+            comm_method, extended_properties = self._comms_from_data_collection(
+                slot, ip_address
+            )
+
+        # Read individual connection records from RxMapConnectionCollection children.
+        # Each child's comp_name is the connection Name in the L5X output.
+        # Connection Type is inferred from the name (heuristic):
+        #   names containing "output" or equal to "config" -> "Output"
+        #   all others -> "Input"
+        # RPI: we do not have a reliable binary decoder for the short connection
+        # records seen in the test data, so we default to "0.0" (acceptable for import).
+        self._cur.execute(
+            "SELECT c2.comp_name FROM comps c1 "
+            "JOIN comps c2 ON c2.parent_id = c1.object_id "
+            "WHERE c1.parent_id = ? AND c1.comp_name = 'RxMapConnectionCollection' "
+            "AND c2.comp_name NOT IN ('Output') "
+            "ORDER BY c2.seq_number",
+            (self._object_id,),
+        )
+        for (conn_name,) in self._cur.fetchall():
+            name_lower = conn_name.lower()
+            if "output" in name_lower or name_lower == "config":
+                conn_type = "Output"
+            else:
+                conn_type = "Input"
+            connections.append((conn_name, "0.0", conn_type))
+
         return Module(
             name,           # L5xElement._name (private)
             name,           # Module.name
@@ -1161,6 +1337,10 @@ class ModuleBuilder(L5xElementBuilder):
             _ip_address=ip_address,
             _backplane_slot=backplane_slot,
             _chassis_size=chassis_size,
+            _description=description,
+            _comm_method=comm_method,
+            _connections=connections,
+            _extended_properties=extended_properties,
         )
 
 

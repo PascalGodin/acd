@@ -25,6 +25,8 @@ class L5xElementBuilder:
 # Entries here also control which list attributes are serialized as child sections.
 _LIST_SECTION_NAMES = {
     "tags": "Tags",
+    "local_tags": "LocalTags",
+    "parameters": "Parameters",
     "data_types": "DataTypes",
     "members": "Members",
     "modules": "Modules",
@@ -132,6 +134,55 @@ class Tag(L5xElement):
             or not (self.name[0].isalpha() or self.name[0] == "_")
             or ":" in self.name
             or self.name.startswith("__l0")
+        )
+
+
+@dataclass
+class LocalTag(L5xElement):
+    """Represents a local (non-public) tag inside an AOI (<LocalTag> in L5X)."""
+    name: str
+    data_type: str
+    dimensions: Union[str, None]  # array size; None for scalars (omitted from XML)
+    radix: Union[str, None]   # None for complex/UDT types (omitted from XML)
+    external_access: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "LocalTag"
+
+    @property
+    def _l5x_exclude(self) -> bool:
+        """Exclude hex-address placeholders and empty names."""
+        return (
+            not self.name
+            or not (self.name[0].isalpha() or self.name[0] == "_")
+            or ":" in self.name
+        )
+
+
+@dataclass
+class Parameter(L5xElement):
+    """Represents a public parameter of an AOI (<Parameter> in L5X)."""
+    name: str
+    tag_type: str       # always "Base"
+    data_type: str
+    usage: str          # "Input", "Output", or "InOut"
+    radix: Union[str, None]   # None for complex types (omitted from XML)
+    required: str       # "true" or "false"
+    visible: str        # "true" or "false"
+    external_access: Union[str, None]  # None for InOut (omitted, replaced by Constant)
+    constant: Union[str, None]  # "false" for non-MESSAGE InOut, None otherwise (omitted)
+    dimensions: Union[str, None]  # array size; None for scalars (omitted from XML)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "Parameter"
+
+    @property
+    def _l5x_exclude(self) -> bool:
+        return (
+            not self.name
+            or not (self.name[0].isalpha() or self.name[0] == "_")
         )
 
 
@@ -294,8 +345,9 @@ class AOI(L5xElement):
     edited_date: str
     edited_by: str
     software_revision: str
+    parameters: List[Parameter]
+    local_tags: List[LocalTag]
     routines: List[Routine]
-    tags: List[Tag]
 
     def __post_init__(self):
         super().__post_init__()
@@ -474,6 +526,9 @@ class MemberBuilder(L5xElementBuilder):
     # Map from offset-0x60 value to backing member name, used to resolve BIT Target.
     # Built by DataTypeBuilder before iterating children and passed in here.
     _offset60_to_name: Dict[int, str] = field(default_factory=dict)
+    # Fallback target name for Pattern-2 BIT members (0x68==0, 0x6c==0xFFFFFFFF).
+    # Set by DataTypeBuilder to the most recent preceding hidden SINT/INT in member order.
+    _fallback_target: Union[str, None] = field(default=None)
 
     def build(self) -> Member:
         self._cur.execute(
@@ -509,16 +564,30 @@ class MemberBuilder(L5xElementBuilder):
         data_type_results = self._cur.fetchall()
         data_type = data_type_results[0][0]
 
-        # BIT members: data_type resolves to BOOL but 0x6c holds the offset-0x60 of the
-        # backing field (not 0xFFFFFFFF as for standalone BOOL/other members).
+        # BIT members: data_type resolves to BOOL but the encoding varies by sub-type.
+        #
+        # Pattern 1 (0x6c != 0xFFFFFFFF): 0x6c holds the 0x60 byte-offset of the backing
+        #   field.  Resolve target via offset60_to_name.
+        #
+        # Pattern 2 (0x6c == 0xFFFFFFFF and 0x68 == 0): BIT member where the backing field
+        #   pointer is absent.  Use _fallback_target (the most-recent preceding hidden SINT).
+        #
+        # Plain BOOL (0x6c == 0xFFFFFFFF and 0x68 == 0x800): not a BIT member; leave as BOOL.
         target: Union[str, None] = None
         bit_number: Union[int, None] = None
         if data_type == "BOOL":
             target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
+            val_68 = struct.unpack_from("<I", self.record, 0x68)[0]
             if target_key != 0xFFFFFFFF:
+                # Pattern 1: direct backing-field reference via offset-60 map
                 data_type = "BIT"
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                 target = self._offset60_to_name.get(target_key)
+            elif val_68 == 0:
+                # Pattern 2: BIT member without explicit backing-field pointer
+                data_type = "BIT"
+                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+                target = self._fallback_target
 
         return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access)
 
@@ -591,16 +660,25 @@ class DataTypeBuilder(L5xElementBuilder):
                         val_60 = struct.unpack_from("<I", rec2, 0x60)[0]
                         offset60_to_name[val_60] = child2[0]
 
-            # Some ACD files have mismatched member_count vs children list — iterate what we have
+            # Some ACD files have mismatched member_count vs children list — iterate what we have.
+            # Track the most recent preceding hidden SINT (fallback target for Pattern-2 BIT members).
+            last_hidden_backing: Union[str, None] = None
             for idx, child in enumerate(children_results):
                 key = 0x6E + idx
                 if key not in extended_records:
                     break
+                rec = bytes(extended_records[key])
+                # Update last_hidden_backing when we see a hidden member
+                if len(rec) >= 0x74:
+                    is_hidden = bool(struct.unpack_from("<I", rec, 0x70)[0])
+                    if is_hidden:
+                        last_hidden_backing = child[0]
                 try:
                     children.append(
                         MemberBuilder(
                             self._cur, child[1], bytes(extended_records[key]),
                             offset60_to_name,
+                            last_hidden_backing,
                         ).build()
                     )
                 except Exception:
@@ -844,6 +922,156 @@ class TagBuilder(L5xElementBuilder):
         )
 
 
+def _aoi_tag_usage_flags(ext01: bytes) -> int:
+    """Return the usage-flags byte from an AOI tag record's ext[0x01] blob.
+
+    Returns 0 if the record is too short.  The caller is responsible for
+    interpreting the bits (0x04=Input, 0x08=Output; both set = InOut;
+    neither set = local tag).
+    """
+    return ext01[0x20E] if len(ext01) > 0x20E else 0
+
+
+def _aoi_tag_data_type(cur, raw_rec: bytes) -> str:
+    """Look up the DataType name for an AOI tag record.
+
+    The DataType OID is stored at offset 0x2A in the raw parameter record
+    as a little-endian u32.  We look it up in the comps table by object_id.
+    """
+    if len(raw_rec) < 0x2E:
+        return ""
+    dt_oid = struct.unpack_from("<I", raw_rec, 0x2A)[0]
+    cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(dt_oid))
+    row = cur.fetchone()
+    return row[0] if row else ""
+
+
+@dataclass
+class ParameterBuilder(L5xElementBuilder):
+    """Build a Parameter from an AOI RxTagCollection child record."""
+
+    def build(self) -> Parameter:
+        self._cur.execute(
+            "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
+        )
+        row = self._cur.fetchone()
+        name = row[0]
+        raw_rec = bytes(row[1])
+
+        data_type = _aoi_tag_data_type(self._cur, raw_rec)
+
+        # Dimensions (array size) at raw record offset 0x1A as u32; 0 means scalar.
+        dimensions: Union[str, None] = None
+        if len(raw_rec) >= 0x1E:
+            dim_val = struct.unpack_from("<I", raw_rec, 0x1A)[0]
+            if dim_val:
+                dimensions = str(dim_val)
+
+        try:
+            r = RxGeneric.from_bytes(raw_rec)
+            exts: Dict[int, bytes] = {
+                er.attribute_id: bytes(er.value) for er in r.extended_records
+            }
+        except Exception:
+            return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
+
+        ext01 = exts.get(0x01, b"")
+        flags = _aoi_tag_usage_flags(ext01)
+
+        usage_bits = flags & 0x0C
+        if usage_bits == 0x04:
+            usage = "Input"
+        elif usage_bits == 0x08:
+            usage = "Output"
+        else:
+            usage = "InOut"
+
+        required = "true" if (flags & 0x20) else "false"
+        visible = "true" if (flags & 0x40) else "false"
+
+        # ExternalAccess (u16 at ext01[0x21E])
+        # MESSAGE-type InOut parameters don't carry Constant in L5X; all others do.
+        if usage == "InOut":
+            external_access = None
+            constant: Union[str, None] = None if data_type == "MESSAGE" else "false"
+        elif len(ext01) > 0x21F:
+            ea_val = struct.unpack_from("<H", ext01, 0x21E)[0]
+            external_access = external_access_enum(ea_val)
+            constant = None
+        else:
+            external_access = "Read/Write"
+            constant = None
+
+        # Radix (high nibble of ext01[0x20F]).  InOut params for complex/UDT types
+        # omit Radix; InOut params for scalar/array types (BOOL, INT, DINT, REAL, etc.)
+        # still carry Radix in the golden L5X, so include it whenever the radix index
+        # is non-zero regardless of Usage.
+        if not data_type or len(ext01) <= 0x20F:
+            radix: Union[str, None] = None
+        else:
+            radix_idx = ext01[0x20F] >> 4
+            radix = radix_enum(radix_idx) if radix_idx != 0 else None
+
+        return Parameter(
+            name,
+            name,
+            "Base",
+            data_type,
+            usage,
+            radix,
+            required,
+            visible,
+            external_access,
+            constant,
+            dimensions,
+        )
+
+
+@dataclass
+class LocalTagBuilder(L5xElementBuilder):
+    """Build a LocalTag from an AOI RxTagCollection child record."""
+
+    def build(self) -> LocalTag:
+        self._cur.execute(
+            "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
+        )
+        row = self._cur.fetchone()
+        name = row[0]
+        raw_rec = bytes(row[1])
+
+        data_type = _aoi_tag_data_type(self._cur, raw_rec)
+
+        # Dimensions at raw record offset 0x1A.
+        dimensions: Union[str, None] = None
+        if len(raw_rec) >= 0x1E:
+            dim_val = struct.unpack_from("<I", raw_rec, 0x1A)[0]
+            if dim_val:
+                dimensions = str(dim_val)
+
+        try:
+            r = RxGeneric.from_bytes(raw_rec)
+            exts: Dict[int, bytes] = {
+                er.attribute_id: bytes(er.value) for er in r.extended_records
+            }
+        except Exception:
+            return LocalTag(name, name, data_type, dimensions, None, "Read/Write")
+
+        ext01 = exts.get(0x01, b"")
+        if len(ext01) > 0x21F:
+            ea_val = struct.unpack_from("<H", ext01, 0x21E)[0]
+            external_access = external_access_enum(ea_val)
+        else:
+            external_access = "Read/Write"
+
+        if len(ext01) > 0x20F:
+            radix_idx = ext01[0x20F] >> 4
+            radix: Union[str, None] = radix_enum(radix_idx) if radix_idx != 0 else None
+        else:
+            radix = None
+
+        return LocalTag(name, name, data_type, dimensions, radix, external_access)
+
+
 def routine_type_enum(idx: int) -> str:
     if idx == 0:
         return "TypeLess"
@@ -1001,48 +1229,69 @@ class AoiBuilder(L5xElementBuilder):
             meta = {"created_by": "", "created_date": "", "edited_by": "", "edited_date": "",
                     "software_revision": "", "revision_extension": None}
 
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
-            + str(self._object_id)
-            + " AND comp_name='RxRoutineCollection'"
-        )
-        collection_results = self._cur.fetchall()
+        parameters: List[Parameter] = []
+        local_tags: List[LocalTag] = []
         routines: List[Routine] = []
-        tags: List[Tag] = []
-        if len(collection_results) != 0:
-            collection_id = collection_results[0][1]
-        else:
-            return AOI(name, name, revision, meta["revision_extension"], vendor,
-                       "false", "false", "false",
-                       meta["created_date"], meta["created_by"],
-                       meta["edited_date"], meta["edited_by"],
-                       meta["software_revision"], routines, tags)
 
+        # --- Extract Parameters and LocalTags from RxTagCollection ---
         self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
-            + str(collection_id)
-        )
-        routine_results = self._cur.fetchall()
-
-        for child in routine_results:
-            routines.append(RoutineBuilder(self._cur, child[1]).build())
-
-        # Get the AOI-Scoped Tags
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
+            "SELECT object_id FROM comps WHERE parent_id="
             + str(self._object_id)
             + " AND comp_name='RxTagCollection'"
         )
-        tag_coll = self._cur.fetchall()
-        if len(tag_coll) > 1:
-            raise Exception("Contains more than one AOI tag collection")
+        tag_coll_row = self._cur.fetchone()
+        if tag_coll_row:
+            tag_coll_oid = tag_coll_row[0]
+            self._cur.execute(
+                "SELECT object_id, record FROM comps WHERE parent_id="
+                + str(tag_coll_oid)
+                + " ORDER BY seq_number"
+            )
+            for child_oid, child_rec in self._cur.fetchall():
+                child_rec = bytes(child_rec)
+                # Determine whether this is a parameter or a local tag by inspecting
+                # ext01[0x20E]: bits 0x04 (Input) or 0x08 (Output) indicate a parameter.
+                is_param = False
+                try:
+                    r_child = RxGeneric.from_bytes(child_rec)
+                    exts_child: Dict[int, bytes] = {
+                        er.attribute_id: bytes(er.value)
+                        for er in r_child.extended_records
+                    }
+                    ext01 = exts_child.get(0x01, b"")
+                    flags = _aoi_tag_usage_flags(ext01)
+                    is_param = bool(flags & 0x0C)
+                except Exception:
+                    pass
 
+                if is_param:
+                    try:
+                        parameters.append(ParameterBuilder(self._cur, child_oid).build())
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        local_tags.append(LocalTagBuilder(self._cur, child_oid).build())
+                    except Exception:
+                        pass
+
+        # --- Extract Routines from RxRoutineCollection ---
         self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
-            + str(tag_coll[0][1])
+            "SELECT object_id FROM comps WHERE parent_id="
+            + str(self._object_id)
+            + " AND comp_name='RxRoutineCollection'"
         )
-        for result in self._cur.fetchall():
-            tags.append(TagBuilder(self._cur, result[1]).build())
+        routine_coll_row = self._cur.fetchone()
+        if routine_coll_row:
+            routine_coll_oid = routine_coll_row[0]
+            self._cur.execute(
+                "SELECT object_id FROM comps WHERE parent_id=" + str(routine_coll_oid)
+            )
+            for (child_oid,) in self._cur.fetchall():
+                try:
+                    routines.append(RoutineBuilder(self._cur, child_oid).build())
+                except Exception:
+                    pass
 
         return AOI(
             name, name, revision,
@@ -1052,7 +1301,7 @@ class AoiBuilder(L5xElementBuilder):
             meta["created_date"], meta["created_by"],
             meta["edited_date"], meta["edited_by"],
             meta["software_revision"],
-            routines, tags,
+            parameters, local_tags, routines,
         )
 
 

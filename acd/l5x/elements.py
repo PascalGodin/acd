@@ -911,11 +911,16 @@ class MemberBuilder(L5xElementBuilder):
             if target_key != 0xFFFFFFFF:
                 # Pattern 1: direct backing-field reference via offset-60 map
                 data_type = "BIT"
+                # offset 0x5C holds a bit-offset into the host register, not an array
+                # size — force dimension to 0 so _member_decorated_xml treats this as
+                # a scalar rather than emitting thousands of <Element> entries.
+                dimension = 0
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                 target = self._offset60_to_name.get(target_key)
             elif val_68 == 0:
                 # Pattern 2: BIT member without explicit backing-field pointer
                 data_type = "BIT"
+                dimension = 0  # same bit-offset field; not an array size
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                 target = self._fallback_target
 

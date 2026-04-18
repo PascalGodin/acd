@@ -856,7 +856,20 @@ class Controller(L5xElement):
         idx = base.index(">")
         open_tag = base[: idx + 1]
         inner = base[idx + 1 : -len("</Controller>")]
-        return open_tag + inner + '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" IOMemoryPadPercentage="90" DataTablePadPercentage="50"/><Security Code="0" ChangesToDetect="16#ffff_ffff"/><SafetyInfo/></Controller>'
+        return (
+            open_tag
+            + inner
+            + '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" IOMemoryPadPercentage="90" DataTablePadPercentage="50"/>'
+            + '<Security Code="0" ChangesToDetect="16#ffff_ffff"/>'
+            + '<SafetyInfo/>'
+            + '<CST MasterID="0"/>'
+            + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
+            + '<Trends/>'
+            + '<DataLogs/>'
+            + '<TimeSynchronize Priority1="128" Priority2="128" PTPEnable="true"/>'
+            + '<EthernetPorts><EthernetPort Port="1" Label="1" PortEnabled="true"/></EthernetPorts>'
+            + '</Controller>'
+        )
 
 
 @dataclass

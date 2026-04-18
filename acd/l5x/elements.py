@@ -527,6 +527,9 @@ class Module(L5xElement):
     parent_mod_port_id: int
     inhibited: str
     major_fault: str
+    safety_enabled: str = field(default="false")
+    drives_adc_mode: str = field(default="false")
+    drives_adc_enabled: str = field(default="false")
     # Private fields (not serialised as XML attributes)
     _ekey_state: str = field(default="CompatibleModule")
     _slot: int = field(default=0)
@@ -559,7 +562,10 @@ class Module(L5xElement):
             f'ParentModule="{self.parent_module}" '
             f'ParentModPortId="{self.parent_mod_port_id}" '
             f'Inhibited="{self.inhibited}" '
-            f'MajorFault="{self.major_fault}"'
+            f'MajorFault="{self.major_fault}" '
+            f'SafetyEnabled="{self.safety_enabled}" '
+            f'DrivesADCMode="{self.drives_adc_mode}" '
+            f'DrivesADCEnabled="{self.drives_adc_enabled}"'
         )
 
         # Optional <Description>

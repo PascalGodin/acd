@@ -574,6 +574,35 @@ class ModuleBuilder(L5xElementBuilder):
     # Map from modid (u32) → module name, built by ControllerBuilder and passed in.
     _modid_to_name: Dict[int, str] = field(default_factory=dict)
 
+    def _ip_from_data_collection(self, icp_slot: int) -> str:
+        """Look up the Ethernet IP for a local backplane module via RxDataCollection.
+
+        Local bridge modules (e.g. EN2T in the main chassis) store their IP as XML
+        in hash-named children of RxDataCollection. The record for a given module
+        contains its ICP slot as Type="ICP" Addr="{slot}", which uniquely identifies it.
+        """
+        import re as _re
+        needle = f'Type="ICP" Addr="{icp_slot}"'.encode()
+        # Find RxDataCollection — it is a direct child of the controller object.
+        self._cur.execute(
+            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1"
+        )
+        row = self._cur.fetchone()
+        if not row:
+            return ""
+        coll_oid = row[0]
+        # Fetch all children in batches and filter in Python (SQLite LIKE on BLOBs is unreliable).
+        self._cur.execute(
+            "SELECT record FROM comps WHERE parent_id=?", (coll_oid,)
+        )
+        for (raw,) in self._cur.fetchall():
+            raw = bytes(raw)
+            if needle not in raw:
+                continue
+            m = _re.search(rb'Type="EN" Addr="([^"]+)"', raw)
+            return m.group(1).decode("ascii", errors="replace") if m else ""
+        return ""
+
     def build(self) -> Module:
         self._cur.execute(
             "SELECT comp_name, object_id, record FROM comps WHERE object_id=" + str(self._object_id)
@@ -626,13 +655,16 @@ class ModuleBuilder(L5xElementBuilder):
         ekey_state  = "Disabled" if (e1[0] & 0x04) else "CompatibleModule"
 
         # IP address: stored at e1[0x30] as a u16 length-prefixed ASCII string for modules
-        # that connect via Ethernet upstream (parent_port == 2). Local backplane modules
-        # (parent_port == 1) leave this field zero.
+        # that connect via Ethernet upstream (parent_port == 2). Local backplane bridge
+        # modules (parent_port == 1, e.g. local EN2T) leave e1[0x32] zero — their IP is
+        # stored as XML in a child of RxDataCollection, keyed by ICP slot number.
         ip_address = ""
         if len(e1) > 0x32:
             ip_len = struct.unpack("<H", e1[0x30:0x32])[0]
             if ip_len:
                 ip_address = e1[0x32:0x32 + ip_len].rstrip(b"\x00").decode("ascii", errors="replace")
+        if not ip_address and slot:
+            ip_address = self._ip_from_data_collection(slot)
 
         # For modules that own a remote backplane (e.g. remote chassis EN2T), the Output
         # connection record under RxMapConnectionCollection stores the chassis size at [0x4e]

@@ -2378,13 +2378,36 @@ class ProjectBuilder:
         else:
             schema_revision = "1.0"
 
-        software_revision_element = element.find("DeviceIdentity")
-        if software_revision_element is not None:
-            software_revision_major = software_revision_element.attrib["MajorRevision"]
-            software_revision_minor = software_revision_element.attrib["MinorRevision"]
-            software_revision = f"{software_revision_major}.{software_revision_minor}"
+        # SWVersion reflects the Studio 5000 application version (e.g. "RSLogix 5000 v35.04"),
+        # which is what RSLogix5000Content SoftwareRevision represents.  DeviceIdentity
+        # MajorRevision/MinorRevision is the controller firmware version — a different value.
+        sw_version_element = element.find("SWVersion")
+        if sw_version_element is not None:
+            sw_version_string = sw_version_element.attrib.get("String", "")
+            # Extract the version number from the trailing "vXX.YY" portion.
+            match = re.search(r"v(\d+\.\d+)$", sw_version_string.strip())
+            if match:
+                software_revision = match.group(1)
+            else:
+                # Unexpected format — fall back to DeviceIdentity firmware version.
+                device_identity = element.find("DeviceIdentity")
+                if device_identity is not None:
+                    software_revision = (
+                        f"{device_identity.attrib['MajorRevision']}"
+                        f".{device_identity.attrib['MinorRevision']}"
+                    )
+                else:
+                    software_revision = "33.01"
         else:
-            software_revision = "33.01"
+            # No SWVersion element — fall back to DeviceIdentity firmware version.
+            device_identity = element.find("DeviceIdentity")
+            if device_identity is not None:
+                software_revision = (
+                    f"{device_identity.attrib['MajorRevision']}"
+                    f".{device_identity.attrib['MinorRevision']}"
+                )
+            else:
+                software_revision = "33.01"
 
         target_type = "Controller"
         contains_context = "false"

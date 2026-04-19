@@ -2319,7 +2319,7 @@ class ControllerBuilder(L5xElementBuilder):
         )
 
         # CommPath: combine the stored path prefix (ends with "\") with the controller
-        # module's backplane slot number (e.g. "IdahoOffice\...\Backplane\" + "4").
+        # module's backplane slot number (e.g. "EthernetModule\192.168.1.10\Backplane\4").
         comm_path: Union[str, None] = None
         if _comm_path_prefix is not None:
             _ctrl_slot = next(

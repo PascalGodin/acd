@@ -2100,7 +2100,7 @@ class ControllerBuilder(L5xElementBuilder):
 
         if 0x75 in extended_records:
             sn_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[2:].zfill(8)
-            project_sn = f"16#{sn_raw[:4].upper()}_{sn_raw[4:].upper()}"
+            project_sn = f"16#{sn_raw[:4]}_{sn_raw[4:]}"
         else:
             project_sn = "Unknown"
 

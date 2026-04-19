@@ -2414,7 +2414,7 @@ class ProjectBuilder:
         now = datetime.now()
         export_date = now.strftime("%a %b %d %H:%M:%S %Y")
         export_options = (
-            "NoRawData L5KData DecoratedData ForceProtectedEncoding AllProjDocTrans"
+            "NoRawData L5KData DecoratedData Dependencies ForceProtectedEncoding AllProjDocTrans"
         )
         return RSLogix5000Content(
             target_name,

@@ -1831,6 +1831,7 @@ class AoiBuilder(L5xElementBuilder):
             self._cur.execute(
                 "SELECT object_id, record FROM comps WHERE parent_id="
                 + str(tag_coll_oid)
+                + " AND record_type != 512"
                 + " ORDER BY seq_number"
             )
             for child_oid, child_rec in self._cur.fetchall():

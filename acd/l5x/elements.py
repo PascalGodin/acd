@@ -694,6 +694,10 @@ class Module(L5xElement):
         if mode == "always":
             return "<Bus/>"
         if mode.startswith("fixed:"):
+            # Use binary chassis size when available (read from RxDataCollection);
+            # fall back to the hardcoded port_structures value.
+            if self._chassis_size is not None:
+                return f'<Bus Size="{self._chassis_size}"/>'
             size = mode.split(":")[1]
             return f'<Bus Size="{size}"/>'
         if mode == "children_or_none":
@@ -782,9 +786,10 @@ class Program(L5xElement):
     main_routine_name: Union[str, None]  # None if absent (omitted from XML)
     fault_routine_name: Union[str, None]  # None if absent (omitted from XML)
     disabled: str
+    synchronize_redundancy_data_after_execution: Union[str, None]  # None → omit attr
     use_as_folder: str
+    tags: List[Tag]        # Tags section before Routines (matches L5X export order)
     routines: List[Routine]
-    tags: List[Tag]
 
 
 @dataclass
@@ -849,6 +854,9 @@ class Controller(L5xElement):
     programs: List[Program]
     tasks: List[Task]
     aois: List[AOI]
+    # _redundancy_enabled is NOT serialised as a regular XML attribute (underscore prefix
+    # skips it in the base to_xml()); it is used only to build the <RedundancyInfo> element.
+    _redundancy_enabled: bool = field(default=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -867,10 +875,15 @@ class Controller(L5xElement):
         idx = base.index(">")
         open_tag = base[: idx + 1]
         inner = base[idx + 1 : -len("</Controller>")]
+        # RedundancyInfo: Enabled comes from binary; no pad attributes in golden.
+        redundancy_enabled_str = "true" if self._redundancy_enabled else "false"
+        redundancy_info = (
+            f'<RedundancyInfo Enabled="{redundancy_enabled_str}" KeepTestEditsOnSwitchOver="false"/>'
+        )
         return (
             open_tag
             + inner
-            + '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" IOMemoryPadPercentage="90" DataTablePadPercentage="50"/>'
+            + redundancy_info
             + '<Security Code="0" ChangesToDetect="16#ffff_ffff"/>'
             + '<SafetyInfo/>'
             + '<CST MasterID="0"/>'
@@ -1237,6 +1250,39 @@ class ModuleBuilder(L5xElementBuilder):
 
         return (None, "")
 
+    def _chassis_size_from_data_collection(self) -> "Union[int, None]":
+        """Read the local backplane Bus Size from the RxDataCollection record for the CPU.
+
+        The root controller (Local) module stores its backplane configuration as XML in a
+        hash-named child of RxDataCollection.  The record contains:
+          <Port Id="1" Type="ICP" Addr="0" Ups="False"><Bus Max="17" Size="7"/></Port>
+        We extract the Size attribute from the Bus element on the ICP port at Addr="0".
+        """
+        import re as _re
+        self._cur.execute(
+            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1"
+        )
+        row = self._cur.fetchone()
+        if not row:
+            return None
+        coll_oid = row[0]
+        self._cur.execute(
+            "SELECT record FROM comps WHERE parent_id=?", (coll_oid,)
+        )
+        needle = b'Type="ICP" Addr="0"'
+        for (raw,) in self._cur.fetchall():
+            raw = bytes(raw)
+            if needle not in raw:
+                continue
+            text_start = raw.find(b"<")
+            if text_start < 0:
+                continue
+            text = raw[text_start:].decode("latin-1", errors="replace")
+            m = _re.search(r'<Bus\b[^>]*\bSize="(\d+)"', text)
+            if m:
+                return int(m.group(1))
+        return None
+
     def build(self) -> Module:
         self._cur.execute(
             "SELECT comp_name, object_id, record FROM comps WHERE object_id=" + str(self._object_id)
@@ -1317,6 +1363,13 @@ class ModuleBuilder(L5xElementBuilder):
             if len(out_rec) > 0x70:
                 backplane_slot = struct.unpack("<H", out_rec[0x6e:0x70])[0]
                 chassis_size   = struct.unpack("<H", out_rec[0x4e:0x50])[0]
+
+        # For the root (Local) CPU module (slot=0xFFFFFFFF, self-parenting), the Output
+        # connection record is absent.  The backplane chassis size is stored in the
+        # RxDataCollection hash child that carries the Local module's ICP port at Addr="0".
+        # Example: <Port Id="1" Type="ICP" Addr="0" Ups="False"><Bus Max="17" Size="7"/></Port>
+        if chassis_size is None and slot == 0xFFFFFFFF:
+            chassis_size = self._chassis_size_from_data_collection()
 
         # --- Description ---
         # Module descriptions are stored in the comments table keyed by
@@ -1938,6 +1991,7 @@ class AoiBuilder(L5xElementBuilder):
 @dataclass
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    _redundancy_enabled: bool = field(default=False)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -2024,8 +2078,13 @@ class ProgramBuilder(L5xElementBuilder):
         )
         comment_results = self._cur.fetchall()
 
+        # SynchronizeRedundancyDataAfterExecution: present only for redundant controllers.
+        # The binary does not expose a per-program flag for this attribute — it is implicit
+        # for all programs in a redundant controller project.
+        sync_redundancy = "true" if self._redundancy_enabled else None
+
         return Program(name, name, "false", main_routine_name, fault_routine_name,
-                       disabled, "false", routines, tags)
+                       disabled, sync_redundancy, "false", tags, routines)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
@@ -2172,6 +2231,12 @@ class ControllerBuilder(L5xElementBuilder):
                 mfp_row = self._cur.fetchone()
                 major_fault_program = mfp_row[0] if mfp_row else None
 
+        # RedundancyEnabled: controller extended record 0x001, byte offset 0x0E.
+        # This byte is 0x01 for redundant controllers (e.g. 1756-L85E in redundancy mode)
+        # and 0x00 for non-redundant controllers.
+        _ctrl_ext001 = extended_records.get(0x001, b"")
+        redundancy_enabled: bool = bool(_ctrl_ext001[0x0E]) if len(_ctrl_ext001) > 0x0E else False
+
         self._object_id = results[0][1]
         controller_name = results[0][0]
 
@@ -2249,7 +2314,9 @@ class ControllerBuilder(L5xElementBuilder):
         programs: List[Program] = []
         for result in results:
             _program_object_id = result[1]
-            programs.append(ProgramBuilder(self._cur, _program_object_id, data_types_map).build())
+            programs.append(
+                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled).build()
+            )
 
         # Build comment_id → program name map for task scheduled-program resolution.
         # comment_id is a u16 at BLOB offset 0x0C in each program's RxGeneric record.
@@ -2401,6 +2468,7 @@ class ControllerBuilder(L5xElementBuilder):
             programs,
             tasks,
             aois,
+            redundancy_enabled,
         )
 
 

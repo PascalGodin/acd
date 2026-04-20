@@ -23,7 +23,7 @@
 #                       "children_or_empty" → emit <Bus/> when no children, <Bus Size=K/> when K>0
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ class PortDef:
 # Port structure table keyed by (vendor, product_type, product_code)
 # ---------------------------------------------------------------------------
 
-PORT_STRUCTURES: dict[tuple[int, int, int], List[PortDef]] = {
+PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
 
     # --- ControlLogix CPUs with Ethernet (L83E, L84E, L85E) PT=14 ---
     #

@@ -1,6 +1,8 @@
 # Maps (vendor, product_type, product_code) → CatalogNumber string.
 # Built from Logix-exported L5X files; not stored in the ACD binary.
-CATALOG_NUMBERS: dict[tuple[int, int, int], str] = {
+from typing import Dict, Tuple
+
+CATALOG_NUMBERS: Dict[Tuple[int, int, int], str] = {
     (1, 0, 18): "ETHERNET-MODULE",
     (1, 0, 28): "RHINOBP-DRIVE-PERIPHERAL-MODULE",
     (1, 7, 11): "1756-IB16",

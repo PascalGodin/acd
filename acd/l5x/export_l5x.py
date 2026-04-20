@@ -66,7 +66,7 @@ class ExportL5x:
         )
         log.debug("Create Comments table in sqllite db")
         self._cur.execute(
-            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text)"
+            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int)"
         )
 
         log.debug("Create Nameless table in sqllite db")
@@ -91,12 +91,18 @@ class ExportL5x:
 
         log.info("Getting records from ACD Comps file and storing in sqllite database")
         comps_db = DbExtract(os.path.join(self._temp_dir, "Comps.Dat")).read()
-        # Deduplicate by object_id (last occurrence wins, matching original behavior)
+        # Deduplicate by object_id. When duplicate object_ids exist (e.g. a routine that
+        # appears twice in Comps.Dat with different record_type values), keep the entry
+        # with the largest record because the smaller/later entry is typically a truncated
+        # or partial record (e.g. record_type=271 vs 259 for routines) that fails to parse
+        # correctly with RxGeneric. The full record is always the largest one.
         comps_by_id = {}
         for record in comps_db.records.record:
             t = CompsRecord.parse(record)
             if t is not None:
-                comps_by_id[t[0]] = t
+                oid = t[0]
+                if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
+                    comps_by_id[oid] = t
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
         self._db.commit()
 
@@ -123,7 +129,7 @@ class ExportL5x:
         )
         comments_db = DbExtract(os.path.join(self._temp_dir, "Comments.Dat")).read()
         comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record)) is not None]
-        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?)", comment_tuples)
+        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
         log.info(

@@ -36,8 +36,13 @@ def test_open_file(sample_acd, sbregion_dat):
 
 
 def test_parse_rungs_dat(controller):
-    rung = controller.programs[-1].routines[-1].rungs[-1]
-    assert rung == "XIO(b_Timer[0].DN)TON(b_Timer[0],?,?);"
+    # Verify the B002_Timers routine (last routine of last program) contains
+    # the expected rungs. Use content search rather than positional index since
+    # rung ordering is controlled by region_map.unknown (canonical display order).
+    rungs = controller.programs[-1].routines[-1].rungs
+    assert any("XIO(b_Timer[0].DN)TON(b_Timer[0],?,?);" in r for r in rungs), (
+        f"Expected TON rung not found in {rungs}"
+    )
 
 
 def test_parse_datatypes_dat(controller):

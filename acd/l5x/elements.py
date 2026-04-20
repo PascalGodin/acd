@@ -759,10 +759,20 @@ class AOI(L5xElement):
     parameters: List[Parameter]
     local_tags: List[LocalTag]
     routines: List[Routine]
+    _revision_note: str = field(default="")
 
     def __post_init__(self):
         super().__post_init__()
         self._export_name = "AddOnInstructionDefinition"
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        if not self._revision_note:
+            return base
+        rn_xml = f'<RevisionNote>\n<![CDATA[{self._revision_note}]]>\n</RevisionNote>'
+        # Insert RevisionNote immediately after the opening tag (before any children).
+        idx = base.index(">")
+        return base[:idx + 1] + rn_xml + base[idx + 1:]
 
 
 @dataclass
@@ -984,6 +994,10 @@ class MemberBuilder(L5xElementBuilder):
         # Pattern 2 (0x6c == 0xFFFFFFFF and 0x68 == 0): BIT member where the backing field
         #   pointer is absent.  Use _fallback_target (the most-recent preceding hidden SINT).
         #
+        # Pattern 3 (0x6c == 0xFFFFFFFF and 0x68 == 1): BIT member where 0x60 directly
+        #   matches the backing field's 0x60 value.  Resolve target via offset60_to_name
+        #   using the member's own 0x60 value as the lookup key.
+        #
         # Plain BOOL (0x6c == 0xFFFFFFFF and 0x68 == 0x800): not a BIT member; leave as BOOL.
         target: Union[str, None] = None
         bit_number: Union[int, None] = None
@@ -1005,6 +1019,14 @@ class MemberBuilder(L5xElementBuilder):
                 dimension = 0  # same bit-offset field; not an array size
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                 target = self._fallback_target
+            elif val_68 == 1:
+                # Pattern 3: BIT member — 0x60 of this member equals 0x60 of the backing
+                # hidden field, allowing direct lookup in offset60_to_name.
+                data_type = "BIT"
+                dimension = 0
+                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+                val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
+                target = self._offset60_to_name.get(val_60)
 
         return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access)
 
@@ -1064,7 +1086,9 @@ class DataTypeBuilder(L5xElementBuilder):
             # Build offset60→name map so BIT members can resolve their Target name.
             # Each member's extended record stores the byte offset of that member's data
             # within the UDT at [0x60]; BIT members reference their backing field's
-            # offset via [0x6c].  Non-BIT members have [0x6c]=0xFFFFFFFF.
+            # offset via [0x6c].  Non-BIT members have [0x6c]=0xFFFFFFFF and 0x68=0x800.
+            # Only include non-BIT members (0x68==0x800) so that BIT members sharing the
+            # same 0x60 value as their backing field do not overwrite the backing entry.
             offset60_to_name: Dict[int, str] = {}
             for idx2, child2 in enumerate(children_results):
                 key2 = 0x6E + idx2
@@ -1073,7 +1097,8 @@ class DataTypeBuilder(L5xElementBuilder):
                 rec2 = bytes(extended_records[key2])
                 if len(rec2) >= 0x70:
                     target_key2 = struct.unpack_from("<I", rec2, 0x6C)[0]
-                    if target_key2 == 0xFFFFFFFF:
+                    val_68_2 = struct.unpack_from("<I", rec2, 0x68)[0]
+                    if target_key2 == 0xFFFFFFFF and val_68_2 == 0x800:
                         val_60 = struct.unpack_from("<I", rec2, 0x60)[0]
                         offset60_to_name[val_60] = child2[0]
 
@@ -1880,6 +1905,23 @@ class AoiBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
+        # --- RevisionNote ---
+        # Stored in the comments table with tag_reference='__REVISION_NOTE__' and
+        # parent = comment_id * 0x10000 + cip_type (same key used for other descriptions).
+        revision_note = ""
+        try:
+            r_aoi = RxGeneric.from_bytes(aoi_record)
+            aoi_comment_parent = (r_aoi.comment_id * 0x10000) + r_aoi.cip_type
+            self._cur.execute(
+                "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' LIMIT 1",
+                (aoi_comment_parent,),
+            )
+            rn_row = self._cur.fetchone()
+            if rn_row:
+                revision_note = rn_row[0] or ""
+        except Exception:
+            pass
+
         return AOI(
             name, name, revision,
             meta["revision_extension"],
@@ -1889,6 +1931,7 @@ class AoiBuilder(L5xElementBuilder):
             meta["edited_date"], meta["edited_by"],
             meta["software_revision"],
             parameters, local_tags, routines,
+            _revision_note=revision_note,
         )
 
 

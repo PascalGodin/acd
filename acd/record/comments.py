@@ -19,11 +19,71 @@ class CommentsRecord:
             self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?)", entry)
 
     @staticmethod
+    def _parse_udi_body(body: bytes) -> Optional[tuple]:
+        """Parse a UDI (type-12) fafa record body.
+
+        UDI records store metadata like the AOI RevisionNote.  The body layout is:
+          [0:8]   8 bytes unknown
+          [8:12]  4 bytes some_id
+          [12:16] 4 bytes flags
+          [16:]   UTF-16LE null-terminated UDI-type string (e.g. "UDI_HISTORY")
+                  followed by null padding, then a null-terminated ASCII text string.
+
+        Returns (udi_type, text) or None if the structure is not recognized.
+        """
+        if len(body) < 20:
+            return None
+        try:
+            # UDI type string starts at offset 16 (after 8 unknown + 4 id + 4 flags).
+            utf16_start = 16
+            pos = utf16_start
+            code_units = []
+            while pos + 1 < len(body):
+                cu = struct.unpack_from("<H", body, pos)[0]
+                if cu == 0:
+                    break
+                code_units.append(cu)
+                pos += 2
+            udi_type = "".join(chr(cu) for cu in code_units)
+            # Skip null terminator and any subsequent null padding.
+            pos += 2
+            while pos < len(body) and body[pos] == 0:
+                pos += 1
+            # Read null-terminated ASCII text.
+            text_end = body.find(b"\x00", pos)
+            if text_end <= pos:
+                return None
+            text = body[pos:text_end].decode("utf-8", errors="replace")
+            return (udi_type, text)
+        except Exception:
+            return None
+
+    @staticmethod
     def parse(dat_record: DatRecord) -> Optional[tuple]:
         if dat_record.identifier != 64250:
             return None
         try:
             r = FafaComents.from_bytes(dat_record.record.record_buffer)
+            # Type-12 (0x0C) records carry UDI metadata such as the AOI RevisionNote.
+            # The body is raw bytes; parse it to extract the text.
+            if r.header.record_type == 12:
+                parsed = CommentsRecord._parse_udi_body(bytes(r.body))
+                if parsed is None:
+                    return None
+                udi_type, text = parsed
+                # Only store UDI_HISTORY records (RevisionNote) for now.
+                if udi_type != "UDI_HISTORY":
+                    return None
+                return (
+                    r.header.seq_number,
+                    r.header.sub_record_length,
+                    1,              # object_id placeholder (not used for lookup)
+                    text,
+                    r.header.record_type,
+                    r.header.parent,
+                    "__REVISION_NOTE__",
+                    0,
+                )
             if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
                 tag_ref = r.body.tag_reference.value
             else:

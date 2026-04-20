@@ -527,9 +527,6 @@ class Module(L5xElement):
     parent_mod_port_id: int
     inhibited: str
     major_fault: str
-    safety_enabled: str = field(default="false")
-    drives_adc_mode: str = field(default="false")
-    drives_adc_enabled: str = field(default="false")
     # Private fields (not serialised as XML attributes)
     _ekey_state: str = field(default="CompatibleModule")
     _slot: int = field(default=0)
@@ -562,10 +559,7 @@ class Module(L5xElement):
             f'ParentModule="{self.parent_module}" '
             f'ParentModPortId="{self.parent_mod_port_id}" '
             f'Inhibited="{self.inhibited}" '
-            f'MajorFault="{self.major_fault}" '
-            f'SafetyEnabled="{self.safety_enabled}" '
-            f'DrivesADCMode="{self.drives_adc_mode}" '
-            f'DrivesADCEnabled="{self.drives_adc_enabled}"'
+            f'MajorFault="{self.major_fault}"'
         )
 
         # Optional <Description>
@@ -884,14 +878,13 @@ class Controller(L5xElement):
             open_tag
             + inner
             + redundancy_info
-            + '<Security Code="0" ChangesToDetect="16#ffff_ffff"/>'
+            + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
             + '<SafetyInfo/>'
             + '<CST MasterID="0"/>'
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
             + '<Trends/>'
             + '<DataLogs/>'
             + '<TimeSynchronize Priority1="128" Priority2="128" PTPEnable="true"/>'
-            + '<EthernetPorts><EthernetPort Port="1" Label="1" PortEnabled="true"/></EthernetPorts>'
             + '</Controller>'
         )
 
@@ -2217,10 +2210,7 @@ class ControllerBuilder(L5xElementBuilder):
             datetime(1601, 1, 1) + timedelta(seconds=raw_created_date)
         ).strftime("%a %b %d %H:%M:%S %Y")
 
-        # MajorRev and MinorRev from ext[0x076] bytes[3] and [2]
-        rev_bytes = extended_records.get(0x076, b"\x00\x00\x00\x00")
-        major_rev = str(rev_bytes[3]) if len(rev_bytes) >= 4 else "0"
-        minor_rev = str(rev_bytes[2]) if len(rev_bytes) >= 3 else "0"
+        # MajorRev and MinorRev: derived later from the root controller module (see below)
 
         # MajorFaultProgram from ext[0x068] OID → comp_name lookup
         major_fault_program: Union[str, None] = None
@@ -2428,6 +2418,19 @@ class ControllerBuilder(L5xElementBuilder):
             None,
         )
 
+        # MajorRev and MinorRev come from the firmware version of the Local (backplane
+        # controller) module, stored in its ext[0x01] bytes [0x08] and [0x09].
+        local_module = next(
+            (m for m in modules if m.name == "Local"),
+            next((m for m in modules if m.major_fault == "true"), None),
+        )
+        if local_module is not None:
+            major_rev = str(local_module.major)
+            minor_rev = str(local_module.minor)
+        else:
+            major_rev = "0"
+            minor_rev = "0"
+
         # CommPath: combine the stored path prefix (ends with "\") with the controller
         # module's backplane slot number (e.g. "EthernetModule\192.168.1.10\Backplane\4").
         comm_path: Union[str, None] = None
@@ -2526,7 +2529,7 @@ class ProjectBuilder:
         now = datetime.now()
         export_date = now.strftime("%a %b %d %H:%M:%S %Y")
         export_options = (
-            "NoRawData L5KData DecoratedData Dependencies ForceProtectedEncoding AllProjDocTrans"
+            "NoRawData L5KData DecoratedData ForceProtectedEncoding AllProjDocTrans"
         )
         return RSLogix5000Content(
             target_name,

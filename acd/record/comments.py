@@ -16,7 +16,7 @@ class CommentsRecord:
     def __post_init__(self):
         entry = CommentsRecord.parse(self.dat_record)
         if entry is not None:
-            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?)", entry)
+            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", entry)
 
     @staticmethod
     def _parse_udi_body(body: bytes) -> Optional[tuple]:
@@ -82,7 +82,8 @@ class CommentsRecord:
                     r.header.record_type,
                     r.header.parent,
                     "__REVISION_NOTE__",
-                    0,
+                    0,              # rung_content
+                    0,              # member_ref
                 )
             if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
                 tag_ref = r.body.tag_reference.value
@@ -95,6 +96,14 @@ class CommentsRecord:
                 rung_content = struct.unpack_from("<I", bytes(r.body.unknown_1), 4)[0]
             else:
                 rung_content = 0
+            # Extract bytes [0:4] of unknown_1 as member_ref.
+            # For the object's own description (DataType, AOI, etc.) this is zero.
+            # For sub-element descriptions (UDT members, AOI parameters/local tags)
+            # this is non-zero, enabling callers to filter to just the object-level description.
+            if r.header.record_type in (0x01, 0x02) and len(bytes(r.body.unknown_1)) >= 4:
+                member_ref = struct.unpack_from("<I", bytes(r.body.unknown_1), 0)[0]
+            else:
+                member_ref = 0
             return (
                 r.header.seq_number,
                 r.header.sub_record_length,
@@ -104,6 +113,7 @@ class CommentsRecord:
                 r.header.parent,
                 tag_ref,
                 rung_content,
+                member_ref,
             )
         except Exception:
             return None

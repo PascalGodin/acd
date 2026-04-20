@@ -97,6 +97,15 @@ class Member(L5xElement):
     target: Union[str, None]      # BIT members only; None omits the attribute
     bit_number: Union[int, None]  # BIT members only; None omits the attribute
     external_access: str
+    _description: Union[str, None] = field(default=None)
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        if not self._description:
+            return base
+        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        idx = base.index(">")
+        return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
 @dataclass
@@ -105,6 +114,7 @@ class DataType(L5xElement):
     family: str
     cls: str
     members: List[Member]
+    _description: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -112,7 +122,15 @@ class DataType(L5xElement):
 
     @property
     def _l5x_exclude(self) -> bool:
-        return self.cls == "ProductDefined"
+        return self.cls == "ProductDefined" or ":" in self.name
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        if not self._description:
+            return base
+        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        idx = base.index(">")
+        return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
 # Maps primitive DataType names to their L5K zero-default value string.
@@ -404,7 +422,7 @@ class Tag(L5xElement):
         return (
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
-            or (re.search(r':\d', self.name) is not None)
+            or ":" in self.name
             or self.name.startswith("__l0")
             or self.name.startswith("__CLONE")
         )
@@ -470,6 +488,7 @@ class LocalTag(L5xElement):
     dimensions: Union[str, None]  # array size; None for scalars (omitted from XML)
     radix: Union[str, None]   # None for complex/UDT types (omitted from XML)
     external_access: str
+    _description: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -481,10 +500,18 @@ class LocalTag(L5xElement):
         return (
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
-            or (re.search(r':\d', self.name) is not None)
+            or ":" in self.name
             or self.name.startswith("__l0")
             or self.name.startswith("__CLONE")
         )
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        if not self._description:
+            return base
+        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        idx = base.index(">")
+        return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
 @dataclass
@@ -500,6 +527,7 @@ class Parameter(L5xElement):
     external_access: Union[str, None]  # None for InOut (omitted, replaced by Constant)
     constant: Union[str, None]  # "false" for non-MESSAGE InOut, None otherwise (omitted)
     dimensions: Union[str, None]  # array size; None for scalars (omitted from XML)
+    _description: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -511,6 +539,14 @@ class Parameter(L5xElement):
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
         )
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        if not self._description:
+            return base
+        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        idx = base.index(">")
+        return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
 @dataclass
@@ -757,6 +793,7 @@ class AOI(L5xElement):
     parameters: List[Parameter]
     local_tags: List[LocalTag]
     routines: List[Routine]
+    _description: Union[str, None] = field(default=None)
     _revision_note: str = field(default="")
 
     def __post_init__(self):
@@ -765,12 +802,13 @@ class AOI(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        if not self._revision_note:
-            return base
-        rn_xml = f'<RevisionNote>\n<![CDATA[{self._revision_note}]]>\n</RevisionNote>'
-        # Insert RevisionNote immediately after the opening tag (before any children).
         idx = base.index(">")
-        return base[:idx + 1] + rn_xml + base[idx + 1:]
+        inject = ""
+        if self._description:
+            inject += f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        if self._revision_note:
+            inject += f'<RevisionNote>\n<![CDATA[{self._revision_note}]]>\n</RevisionNote>'
+        return base[:idx + 1] + inject + base[idx + 1:]
 
 
 @dataclass
@@ -1034,7 +1072,25 @@ class MemberBuilder(L5xElementBuilder):
                 val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
                 target = self._offset60_to_name.get(val_60)
 
-        return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access)
+        # --- Description ---
+        # The member's description is identified in the comments table by a
+        # member_ref value extracted from bytes [14:18] of the comps record.
+        # This value is non-zero for sub-elements (members) and zero for the
+        # owning object's own description.
+        description: Union[str, None] = None
+        raw_comps = bytes(results[0][3])
+        if len(raw_comps) >= 18:
+            member_ref = struct.unpack_from("<I", raw_comps, 14)[0]
+            if member_ref:
+                self._cur.execute(
+                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    ((r.comment_id * 0x10000) + r.cip_type, member_ref),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
+                    description = desc_row[0]
+
+        return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description)
 
 
 @dataclass
@@ -1132,7 +1188,17 @@ class DataTypeBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
-        return DataType(name, name, string_family, class_type, children)
+        # --- Description ---
+        description: Union[str, None] = None
+        self._cur.execute(
+            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+            ((r.comment_id * 0x10000) + r.cip_type,),
+        )
+        desc_row = self._cur.fetchone()
+        if desc_row and desc_row[0]:
+            description = desc_row[0]
+
+        return DataType(name, name, string_family, class_type, children, description)
 
 
 @dataclass
@@ -1369,7 +1435,7 @@ class ModuleBuilder(L5xElementBuilder):
         # (comment_id * 0x10000 + cip_type), same as for tags.
         description = ""
         self._cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND (tag_reference='' OR tag_reference IS NULL) LIMIT 1",
+            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
             ((r.comment_id * 0x10000) + r.cip_type,),
         )
         desc_row = self._cur.fetchone()
@@ -1625,6 +1691,21 @@ class ParameterBuilder(L5xElementBuilder):
             radix_idx = ext01[0x20F] >> 4
             radix = radix_enum(radix_idx) if radix_idx != 0 else None
 
+        # --- Description ---
+        # Use bytes [14:18] of the comps record as member_ref to identify the
+        # specific parameter description in the comments table.
+        description: Union[str, None] = None
+        if len(raw_rec) >= 18:
+            member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
+            if member_ref:
+                self._cur.execute(
+                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    ((r.comment_id * 0x10000) + r.cip_type, member_ref),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
+                    description = desc_row[0]
+
         return Parameter(
             name,
             name,
@@ -1637,6 +1718,7 @@ class ParameterBuilder(L5xElementBuilder):
             external_access,
             constant,
             dimensions,
+            description,
         )
 
 
@@ -1682,7 +1764,22 @@ class LocalTagBuilder(L5xElementBuilder):
         else:
             radix = None
 
-        return LocalTag(name, name, data_type, dimensions, radix, external_access)
+        # --- Description ---
+        # Use bytes [14:18] of the comps record as member_ref to identify the
+        # specific local tag description in the comments table.
+        description: Union[str, None] = None
+        if len(raw_rec) >= 18:
+            member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
+            if member_ref:
+                self._cur.execute(
+                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    ((r.comment_id * 0x10000) + r.cip_type, member_ref),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
+                    description = desc_row[0]
+
+        return LocalTag(name, name, data_type, dimensions, radix, external_access, description)
 
 
 def routine_type_enum(idx: int) -> str:
@@ -1860,8 +1957,10 @@ class AoiBuilder(L5xElementBuilder):
         name = results[0][0]
 
         # --- Revision (major.minor) from ext[0x01] ---
+        _r_aoi: Union[RxGeneric, None] = None
         try:
             r = RxGeneric.from_bytes(aoi_record)
+            _r_aoi = r
             exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
             e01 = exts.get(0x01, b"")
             rev_major = struct.unpack_from("<H", e01, 0x1A)[0] if len(e01) > 0x1B else 1
@@ -1951,22 +2050,28 @@ class AoiBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
-        # --- RevisionNote ---
-        # Stored in the comments table with tag_reference='__REVISION_NOTE__' and
-        # parent = comment_id * 0x10000 + cip_type (same key used for other descriptions).
+        # --- Description + RevisionNote ---
+        aoi_description: Union[str, None] = None
         revision_note = ""
-        try:
-            r_aoi = RxGeneric.from_bytes(aoi_record)
-            aoi_comment_parent = (r_aoi.comment_id * 0x10000) + r_aoi.cip_type
+        if _r_aoi is not None:
+            aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
             self._cur.execute(
-                "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' LIMIT 1",
+                "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
                 (aoi_comment_parent,),
             )
-            rn_row = self._cur.fetchone()
-            if rn_row:
-                revision_note = rn_row[0] or ""
-        except Exception:
-            pass
+            desc_row = self._cur.fetchone()
+            if desc_row and desc_row[0]:
+                aoi_description = desc_row[0]
+            try:
+                self._cur.execute(
+                    "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' LIMIT 1",
+                    (aoi_comment_parent,),
+                )
+                rn_row = self._cur.fetchone()
+                if rn_row:
+                    revision_note = rn_row[0] or ""
+            except Exception:
+                pass
 
         return AOI(
             name, name, revision,
@@ -1977,7 +2082,8 @@ class AoiBuilder(L5xElementBuilder):
             meta["edited_date"], meta["edited_by"],
             meta["software_revision"],
             parameters, local_tags, routines,
-            _revision_note=revision_note,
+            aoi_description,
+            revision_note,
         )
 
 

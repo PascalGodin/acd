@@ -66,7 +66,7 @@ class ExportL5x:
         )
         log.debug("Create Comments table in sqllite db")
         self._cur.execute(
-            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int)"
+            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int)"
         )
 
         log.debug("Create Nameless table in sqllite db")
@@ -129,7 +129,7 @@ class ExportL5x:
         )
         comments_db = DbExtract(os.path.join(self._temp_dir, "Comments.Dat")).read()
         comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record)) is not None]
-        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?)", comment_tuples)
+        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
         log.info(

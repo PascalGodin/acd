@@ -2,6 +2,7 @@
 ![PyPI](https://img.shields.io/pypi/v/acd-tools?label=acd-tools)
 ![PyPI - Downloads](https://img.shields.io/pypi/dm/acd-tools)
 ![ACD Tools](https://github.com/hutcheb/acd/actions/workflows/acd-tools.yml/badge.svg)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=hutcheb_acd&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=hutcheb_acd)
 
 ## Rockwell ACD Project File Tools
 

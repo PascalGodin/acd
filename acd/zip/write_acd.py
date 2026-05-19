@@ -19,20 +19,21 @@ from pathlib import Path
 from typing import Dict, List
 
 
-def write_acd(
+def build_acd_bytes(
     files: Dict[str, bytes],
-    output_path,
     file_order: List[str] = None,
     footer_unknown: int = 2,
-) -> None:
-    """Pack files into a Rockwell ACD container.
+) -> bytes:
+    """Pack files into a Rockwell ACD container, returning the bytes.
 
     Args:
         files: Mapping of filename → raw bytes.
-        output_path: Destination .ACD path.
         file_order: Filenames in desired write order.  Defaults to files.keys().
         footer_unknown: The second u32 in the ACD footer.  Preserve the value
             from the original file (accessible via Unzip.header._unknown_two).
+
+    Returns:
+        The full ACD container as a bytes object.
     """
     if file_order is None:
         file_order = list(files.keys())
@@ -58,4 +59,26 @@ def write_acd(
     # Footer
     output.extend(struct.pack("<II", len(file_records), footer_unknown))
 
-    Path(output_path).write_bytes(bytes(output))
+    return bytes(output)
+
+
+def write_acd(
+    files: Dict[str, bytes],
+    output_path,
+    file_order: List[str] = None,
+    footer_unknown: int = 2,
+) -> None:
+    """Pack files into a Rockwell ACD container and write to disk.
+
+    Thin wrapper around `build_acd_bytes`; preserved as the public API.
+
+    Args:
+        files: Mapping of filename → raw bytes.
+        output_path: Destination .ACD path.
+        file_order: Filenames in desired write order.  Defaults to files.keys().
+        footer_unknown: The second u32 in the ACD footer.  Preserve the value
+            from the original file (accessible via Unzip.header._unknown_two).
+    """
+    Path(output_path).write_bytes(
+        build_acd_bytes(files, file_order=file_order, footer_unknown=footer_unknown)
+    )

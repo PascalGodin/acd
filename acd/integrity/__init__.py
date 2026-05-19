@@ -6,6 +6,12 @@ Public API:
         verify_fileinfo(acd_bytes, fi_offset, *, key) -> bool
         find_fileinfo_offset(acd_bytes) -> int
 
+    project-level binding (high-level):
+        set_fileinfo_key(project, key) -> None
+        get_fileinfo_key(project) -> bytes | None
+        clear_fileinfo_key(project) -> None
+        verify_loaded_acd(project, acd_path) -> bool
+
     exceptions:
         IntegrityKeyRequiredError
 
@@ -22,6 +28,12 @@ from .fileinfo import (
     find_fileinfo_offset,
     verify_fileinfo,
 )
+from .project_key import (
+    clear_fileinfo_key,
+    get_fileinfo_key,
+    set_fileinfo_key,
+    verify_loaded_acd,
+)
 
 __all__ = [
     "FILEINFO_HEADER",
@@ -31,4 +43,8 @@ __all__ = [
     "compute_fileinfo",
     "verify_fileinfo",
     "find_fileinfo_offset",
+    "set_fileinfo_key",
+    "get_fileinfo_key",
+    "clear_fileinfo_key",
+    "verify_loaded_acd",
 ]

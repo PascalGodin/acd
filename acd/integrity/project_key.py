@@ -1,10 +1,16 @@
 """Project-level binding for the FileInfo.Dat HMAC key.
 
-The 32-byte HMAC-SHA-256 key is a per-Studio-version constant that
-this library does not ship. The caller extracts it once from their
-legitimate Studio 5000 install, then registers it on a loaded
-project via `set_fileinfo_key`. After that, the save pipeline picks
-it up automatically when it needs to recompute `FileInfo.Dat`.
+The HMAC-SHA-256 key is a per-Studio-version constant that this
+library does not ship. The caller extracts it once from their
+legitimate Studio 5000 install, then registers it on a loaded project
+via `set_fileinfo_key`. After that, the save pipeline picks it up
+automatically when it needs to recompute `FileInfo.Dat`.
+
+Two key lengths are accepted; the library dispatches to the matching
+algorithm by key length:
+
+- 32-byte key  -> selector `02 00` (modern Studio).
+- 126-byte key -> selector `01 00` (older Studio).
 
 Usage:
 
@@ -25,7 +31,7 @@ from __future__ import annotations
 from typing import Optional
 
 from .fileinfo import (
-    HMAC_KEY_LENGTH,
+    ACCEPTABLE_KEY_LENGTHS,
     IntegrityKeyRequiredError,
     find_fileinfo_offset,
     verify_fileinfo,
@@ -36,7 +42,12 @@ _KEY_ATTR = "_fileinfo_key"
 
 
 def set_fileinfo_key(project, key: bytes) -> None:
-    """Register the 32-byte FileInfo.Dat HMAC-SHA-256 key on a project.
+    """Register the FileInfo.Dat HMAC-SHA-256 key on a project.
+
+    The key length picks the algorithm:
+
+    - 32 bytes  -> modern Studio (`02 00` selector).
+    - 126 bytes -> older Studio (`01 00` selector).
 
     After this call, save-side machinery (and `verify_loaded_acd`)
     can recompute or verify `FileInfo.Dat` without the caller having
@@ -46,20 +57,22 @@ def set_fileinfo_key(project, key: bytes) -> None:
         project: An object returned by `acd.api.load_acd` (or any
             `RSLogix5000Content` instance). The key is attached as a
             private attribute on this object only.
-        key: The 32-byte HMAC-SHA-256 key.
+        key: The HMAC-SHA-256 key, 32 or 126 bytes.
 
     Raises:
         TypeError: if `key` is not a bytes-like object.
-        ValueError: if `key` is not exactly 32 bytes.
+        ValueError: if `key` is not an accepted length.
     """
     if not isinstance(key, (bytes, bytearray, memoryview)):
         raise TypeError(
             f"key must be bytes-like, got {type(key).__name__}"
         )
     key_bytes = bytes(key)
-    if len(key_bytes) != HMAC_KEY_LENGTH:
+    if len(key_bytes) not in ACCEPTABLE_KEY_LENGTHS:
         raise ValueError(
-            f"key must be {HMAC_KEY_LENGTH} bytes; got {len(key_bytes)}"
+            f"key must be one of {ACCEPTABLE_KEY_LENGTHS} bytes "
+            f"(32 = modern Studio, 126 = older Studio); "
+            f"got {len(key_bytes)}"
         )
     setattr(project, _KEY_ATTR, key_bytes)
 
@@ -68,8 +81,8 @@ def get_fileinfo_key(project) -> Optional[bytes]:
     """Return the key set via `set_fileinfo_key`, or None if unset.
 
     Returns:
-        The 32-byte key, or `None` if `set_fileinfo_key` was never
-        called on this project.
+        The registered key bytes, or `None` if `set_fileinfo_key`
+        was never called on this project.
     """
     return getattr(project, _KEY_ATTR, None)
 
@@ -90,7 +103,8 @@ def verify_loaded_acd(project, acd_path) -> bool:
 
     Reads the bytes at `acd_path`, locates `FileInfo.Dat` via the
     container's record table, and recomputes the HMAC under the key
-    set via `set_fileinfo_key`.
+    set via `set_fileinfo_key`. The algorithm is auto-selected by
+    key length.
 
     Arguments:
         project: A project that has had `set_fileinfo_key` called on it.

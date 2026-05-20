@@ -7,9 +7,17 @@ from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 
+from acd.integrity import (
+    FILEINFO_LENGTH,
+    compute_fileinfo,
+    detect_fileinfo_selector,
+    expected_key_length_for_selector,
+    find_fileinfo_offset,
+    get_fileinfo_key,
+)
 from acd.l5x.export_l5x import ExportL5x
 from acd.zip.unzip import Unzip
-from acd.zip.write_acd import write_acd
+from acd.zip.write_acd import build_acd_bytes, write_acd
 from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
@@ -48,16 +56,51 @@ def save_acd(project: RSLogix5000Content, output_path) -> None:
     The project must have been loaded via load_acd() or ExportL5x so that
     it carries _raw_files, _file_order, and _footer_unknown.
 
+    If the project has had `acd.integrity.set_fileinfo_key(project, key)`
+    called on it, the container's `FileInfo.Dat` is recomputed here so
+    that the Logix Designer SDK accepts the file. The algorithm is
+    auto-selected by key length (32 bytes = modern Studio, 126 bytes =
+    older Studio); the key length must match the source ACD's
+    FileInfo.Dat selector or a ValueError is raised.
+
+    Without a registered key, the container is written as-is (suitable
+    for byte-equal round-trips, but the SDK will reject any output
+    where covered streams were modified).
+
     Args:
         project: Project loaded by load_acd().
         output_path: Destination .ACD file path.
+
+    Raises:
+        ValueError: if a key is registered whose length doesn't match
+            the source ACD's FileInfo.Dat selector.
     """
-    write_acd(
+    container = build_acd_bytes(
         files=project._raw_files,
-        output_path=output_path,
         file_order=project._file_order,
         footer_unknown=project._footer_unknown,
     )
+
+    key = get_fileinfo_key(project)
+    if key is not None:
+        fi_offset = find_fileinfo_offset(container)
+        source_selector = detect_fileinfo_selector(container, fi_offset)
+        expected_key_len = expected_key_length_for_selector(source_selector)
+        if len(key) != expected_key_len:
+            raise ValueError(
+                f"ACD's FileInfo.Dat uses selector {source_selector:#06x} "
+                f"requiring a {expected_key_len}-byte key; the registered "
+                f"key is {len(key)} bytes. Register the correct key for "
+                f"this ACD's Studio version."
+            )
+        new_fi = compute_fileinfo(container, fi_offset, key=key)
+        container = (
+            container[:fi_offset]
+            + new_fi
+            + container[fi_offset + FILEINFO_LENGTH:]
+        )
+
+    Path(output_path).write_bytes(container)
 
 
 def patch_rungs(project: RSLogix5000Content, changes: dict) -> None:

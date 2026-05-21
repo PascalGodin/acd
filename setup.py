@@ -156,6 +156,7 @@ setup(
             "mock",
             "mypy",
             "pytest-cov",
+            "coverage",
         ]
     },
     cmdclass={"install": install},

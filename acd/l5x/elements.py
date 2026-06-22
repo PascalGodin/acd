@@ -16,6 +16,27 @@ from acd.l5x.catalog_numbers import CATALOG_NUMBERS
 from acd.l5x.port_structures import PORT_STRUCTURES
 
 
+# Characters that are illegal in XML 1.0: everything outside
+# #x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF.
+_XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def _escape_xml_attr(value: object) -> str:
+    """Escape a value for use inside a double-quoted XML attribute.
+
+    Beyond ``html.escape``, this strips characters that are illegal in XML 1.0
+    and encodes the legal-but-delimiting whitespace (TAB/CR/LF) as numeric
+    character references. Some binary records decode to garbage when an offset
+    drifts (e.g. an AOI ``Vendor`` field read with ``errors="replace"``); without
+    this, those raw control characters and newlines land verbatim in an
+    attribute value, producing non-well-formed L5X that breaks downstream XML
+    parsers.
+    """
+    text = _XML_ILLEGAL_RE.sub("", str(value))
+    text = html.escape(text, quote=True)
+    return text.replace("\t", "&#x9;").replace("\r", "&#xD;").replace("\n", "&#xA;")
+
+
 @dataclass
 class L5xElementBuilder:
     _cur: Cursor
@@ -78,7 +99,7 @@ class L5xElement:
                     _overrides = getattr(self, "_xml_attr_overrides", {})
                     xml_attr_name = _overrides.get(attribute, attribute.title().replace("_", ""))
                     attribute_list.append(
-                        f'{xml_attr_name}="{html.escape(str(attribute_value), quote=True)}"'
+                        f'{xml_attr_name}="{_escape_xml_attr(attribute_value)}"'
                     )
 
         _export_name = (
@@ -611,7 +632,7 @@ class Module(L5xElement):
         if self._comm_method is not None:
             conn_parts: List[str] = []
             for (conn_name, rpi_str, conn_type) in self._connections:
-                safe_name = html.escape(conn_name, quote=True)
+                safe_name = _escape_xml_attr(conn_name)
                 # Derive InputTag / OutputTag stubs based on connection type.
                 if conn_type == "Output":
                     tag_stubs = (
@@ -773,7 +794,7 @@ class Routine(L5xElement):
                 )
             if rung_xmls:
                 rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
-        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{rll_content}</Routine>'
+        return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{rll_content}</Routine>'
 
 
 @dataclass
@@ -1884,6 +1905,23 @@ def _parse_fffeff(data: bytes, offset: int):
     return s, offset + 4 + length * 2
 
 
+def _filetime_to_iso(ft: int) -> str:
+    """Convert a Windows FILETIME (100-ns units since 1601-01-01) to ISO8601.
+
+    Returns "" for an empty or out-of-range value. Some AOI nameless records
+    carry a corrupt FILETIME (the variable-length field walk can drift and read
+    8 garbage bytes), which would otherwise overflow ``datetime`` for years
+    beyond 9999 and abort the whole export with ``OverflowError``.
+    """
+    if not ft:
+        return ""
+    try:
+        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
+    except (OverflowError, OSError):
+        return ""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
 def _parse_aoi_nameless(data: bytes) -> dict:
     """Extract AOI metadata from its large nameless record."""
     result: dict = {}
@@ -1912,12 +1950,7 @@ def _parse_aoi_nameless(data: bytes) -> dict:
     _, offset = _parse_fffeff(data, offset)
 
     # CreatedDate FILETIME (8 bytes, Windows FILETIME in 100-ns units)
-    ft = struct.unpack_from("<Q", data, offset)[0]
-    if ft:
-        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
-        result["created_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
-    else:
-        result["created_date"] = ""
+    result["created_date"] = _filetime_to_iso(struct.unpack_from("<Q", data, offset)[0])
     offset += 8
 
     # EditedBy
@@ -1934,12 +1967,7 @@ def _parse_aoi_nameless(data: bytes) -> dict:
     result["revision_extension"] = rev_ext or None
 
     # EditedDate FILETIME (always last 8 bytes)
-    ft = struct.unpack_from("<Q", data, len(data) - 8)[0]
-    if ft:
-        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
-        result["edited_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
-    else:
-        result["edited_date"] = ""
+    result["edited_date"] = _filetime_to_iso(struct.unpack_from("<Q", data, len(data) - 8)[0])
 
     return result
 

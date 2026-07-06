@@ -731,6 +731,7 @@ def _decode_single_udt_element(
         mdt_upper = mdt.upper()
         off = base_offset + member.byte_offset
 
+        bn = member.bit_number if mdt_upper == "BOOL" else None
         if member.dimension > 0:
             elem_size = _get_type_size(mdt_upper, data_types_map)
             if elem_size == 0:
@@ -739,13 +740,15 @@ def _decode_single_udt_element(
             for i in range(member.dimension):
                 elem_off = off + i * elem_size
                 val = _decode_scalar_member(
-                    blob, elem_off, mdt, data_types_map, depth + 1
+                    blob, elem_off, mdt, data_types_map, depth + 1,
+                    bit_number=bn,
                 )
                 arr.append(val)
             result[mname] = arr
         else:
             val = _decode_scalar_member(
-                blob, off, mdt, data_types_map, depth + 1
+                blob, off, mdt, data_types_map, depth + 1,
+                bit_number=bn,
             )
             result[mname] = val
 
@@ -758,18 +761,26 @@ def _decode_scalar_member(
     data_type: str,
     data_types_map: Dict[str, 'DataType'],
     depth: int,
+    bit_number: Union[int, None] = None,
 ):
     """Decode a single scalar member value from *blob* at *offset*.
 
     Handles primitives, STRING, and nested UDTs.  Returns 0 for
     out-of-range reads, ``None`` for unknown types.
+
+    When *bit_number* is provided for a BOOL member, extracts that
+    specific bit from the packed byte (Logix packs 8 BOOLs per byte
+    in UDT data tables).
     """
     mdt_upper = data_type.upper()
     prim = _PRIM.get(mdt_upper)
     if prim is not None:
         fmt, sz = prim
         if offset + sz <= len(blob):
-            return struct.unpack_from(fmt, blob, offset)[0]
+            val = struct.unpack_from(fmt, blob, offset)[0]
+            if bit_number is not None and mdt_upper == "BOOL":
+                val = (val >> bit_number) & 1
+            return val
         return 0
 
     if mdt_upper == "STRING":
@@ -1557,6 +1568,10 @@ class MemberBuilder(L5xElementBuilder):
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                 val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
                 target = self._offset60_to_name.get(val_60)
+            else:
+                # Plain BOOL (not a BIT sub-element) — bit_number is at 0x64 for data
+                # table bit-packing extraction.
+                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
 
         # --- Description ---
         # The member's description is identified in the comments table by a
@@ -1700,6 +1715,7 @@ class DataTypeBuilder(L5xElementBuilder):
                             last_hidden_backing,
                         ).build()
                     )
+                    del name_to_child[member_name]
                 except Exception:
                     pass
 

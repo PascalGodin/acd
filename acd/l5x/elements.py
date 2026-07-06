@@ -1587,6 +1587,14 @@ class MemberBuilder(L5xElementBuilder):
 
 @dataclass
 class DataTypeBuilder(L5xElementBuilder):
+    @staticmethod
+    def _decode_member_name(rec: bytes) -> str:
+        u16 = rec.decode("utf-16-le", errors="replace")
+        null_idx = u16.find("\x00")
+        if null_idx >= 0:
+            u16 = u16[:null_idx]
+        return u16.strip()
+
     def build(self) -> DataType:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1637,33 +1645,48 @@ class DataTypeBuilder(L5xElementBuilder):
             )
             children_results = self._cur.fetchall()
 
-            # Build offset60→name map so BIT members can resolve their Target name.
-            # Each member's extended record stores the byte offset of that member's data
-            # within the UDT at [0x60]; BIT members reference their backing field's
-            # offset via [0x6c].  Non-BIT members have [0x6c]=0xFFFFFFFF and 0x68=0x800.
-            # Only include non-BIT members (0x68==0x800) so that BIT members sharing the
-            # same 0x60 value as their backing field do not overwrite the backing entry.
-            offset60_to_name: Dict[int, str] = {}
-            for idx2, child2 in enumerate(children_results):
-                key2 = 0x6E + idx2
-                if key2 not in extended_records:
-                    break
-                rec2 = bytes(extended_records[key2])
-                if len(rec2) >= 0x70:
-                    target_key2 = struct.unpack_from("<I", rec2, 0x6C)[0]
-                    val_68_2 = struct.unpack_from("<I", rec2, 0x68)[0]
-                    if target_key2 == 0xFFFFFFFF and val_68_2 == 0x800:
-                        val_60 = struct.unpack_from("<I", rec2, 0x60)[0]
-                        offset60_to_name[val_60] = child2[0]
+            # Build a name→child map so we pair members by name instead of
+            # by seq_number position (seq_number can be stale when members
+            # are deleted and re-added over a project's lifetime).
+            name_to_child: Dict[str, Tuple] = {}
+            for child in children_results:
+                name_to_child[child[0]] = child
 
-            # Some ACD files have mismatched member_count vs children list — iterate what we have.
-            # Track the most recent preceding hidden SINT (fallback target for Pattern-2 BIT members).
+            # Gather member extended record keys (attribute_id >= 0x6E) in
+            # declaration order (Logix Designer may renumber them to be
+            # contiguous after deletions).
+            member_keys = sorted(k for k in extended_records if k >= 0x6E)
+
+            # Build offset60→name map so BIT members can resolve their Target name.
+            # Each member's extended record stores the byte offset of that member's
+            # data within the UDT at [0x60]; BIT members reference their backing
+            # field's offset via [0x6c].  Non-BIT members have [0x6c]=0xFFFFFFFF
+            # and 0x68=0x800.  Only include non-BIT members (0x68==0x800) so that
+            # BIT members sharing the same 0x60 value as their backing field do
+            # not overwrite the backing entry.
+            offset60_to_name: Dict[int, str] = {}
+            for key in member_keys:
+                rec = extended_records[key]
+                member_name = DataTypeBuilder._decode_member_name(rec)
+                child = name_to_child.get(member_name)
+                if child is None:
+                    continue
+                if len(rec) >= 0x70:
+                    target_key2 = struct.unpack_from("<I", rec, 0x6C)[0]
+                    val_68_2 = struct.unpack_from("<I", rec, 0x68)[0]
+                    if target_key2 == 0xFFFFFFFF and val_68_2 == 0x800:
+                        val_60 = struct.unpack_from("<I", rec, 0x60)[0]
+                        offset60_to_name[val_60] = child[0]
+
+            # Track the most recent preceding hidden SINT (fallback target for
+            # Pattern-2 BIT members).
             last_hidden_backing: Union[str, None] = None
-            for idx, child in enumerate(children_results):
-                key = 0x6E + idx
-                if key not in extended_records:
-                    break
-                rec = bytes(extended_records[key])
+            for key in member_keys:
+                rec = extended_records[key]
+                member_name = DataTypeBuilder._decode_member_name(rec)
+                child = name_to_child.get(member_name)
+                if child is None:
+                    continue
                 # Update last_hidden_backing when we see a hidden member
                 if len(rec) >= 0x74:
                     is_hidden = bool(struct.unpack_from("<I", rec, 0x70)[0])
@@ -1672,7 +1695,7 @@ class DataTypeBuilder(L5xElementBuilder):
                 try:
                     children.append(
                         MemberBuilder(
-                            self._cur, child[1], bytes(extended_records[key]),
+                            self._cur, child[1], rec,
                             offset60_to_name,
                             last_hidden_backing,
                         ).build()

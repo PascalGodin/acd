@@ -26,11 +26,14 @@ from acd.record.sbregion import SbRegionRecord
 @dataclass
 class ExportL5x:
     input_filename: os.PathLike
-    _temp_dir: str = "build"  # tempfile.mkdtemp()
+    _temp_dir: str = ""
     _controller: Union[Controller, None] = None
     _project: Union[RSLogix5000Content, None] = None
 
     def __post_init__(self):
+        if not self._temp_dir:
+            acd_path = Path(self.input_filename)
+            self._temp_dir = str(acd_path.parent / acd_path.stem)
         log.info(
             "Creating temporary directory (if it doesn't exist to store ACD database files - "
             + self._temp_dir

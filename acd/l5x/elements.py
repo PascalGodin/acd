@@ -424,6 +424,88 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
+_PRIM = {
+    'BOOL':  ('B',   1),
+    'SINT':  ('<b',  1),
+    'INT':   ('<h',  2),
+    'DINT':  ('<i',  4),
+    'LINT':  ('<q',  8),
+    'BYTE':  ('B',   1),
+    'WORD':  ('<H',  2),
+    'DWORD': ('<I',  4),
+    'LWORD': ('<Q',  8),
+    'REAL':  ('<f',  4),
+    'LREAL': ('<d',  8),
+}
+
+
+def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
+                            data_type: str, n_elements: int):
+    """Read the initial value(s) of a tag from its data-table blob in the comps table.
+
+    Returns None if the type is not supported or the blob cannot be read.
+    For scalar tags (n_elements <= 1), returns a single Python int/float.
+    For array tags (n_elements > 1), returns a list of values.
+    """
+    dt_upper = data_type.upper() if data_type else ""
+    # Strip array brackets for type lookup, but keep n_elements from caller.
+    base_dt = re.sub(r'\[.*\]', '', dt_upper).strip()
+
+    pack_fmt_info = _PRIM.get(base_dt)
+    if pack_fmt_info is None:
+        return None
+
+    fmt, elem_size = pack_fmt_info
+    expected_bytes = n_elements * elem_size
+
+    cur.execute(
+        "SELECT record FROM comps WHERE object_id = ?", (data_table_instance,)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return None
+
+    raw_rec = bytes(rows[0][0])
+
+    # Determine read offset based on whether this is an array or scalar.
+    offset = 0x1A2 if n_elements > 1 else 0x19E
+
+    values = []
+    for i in range(n_elements):
+        byte_off = offset + i * elem_size
+        if byte_off + elem_size <= len(raw_rec):
+            val = struct.unpack_from(fmt, raw_rec, byte_off)[0]
+            # BOOL is stored as unsigned byte (B) — return int 0/1.
+            values.append(val)
+        else:
+            # Pad with zero for truncated trailing elements.
+            if fmt == 'B':
+                values.append(0)
+            else:
+                values.append(0)
+
+    if n_elements == 1:
+        return values[0]
+    return values
+
+
+def _count_array_elements(dimensions: Union[str, None]) -> int:
+    """Return the total element count for a tag based on its dimensions string.
+
+    Returns 1 for scalars (None or empty), or the product of dimension values.
+    """
+    if not dimensions:
+        return 1
+    try:
+        parts = [int(d) for d in dimensions.split(",") if d.strip().isdigit()]
+        count = 1
+        for p in parts:
+            count *= p
+        return max(count, 1)
+    except (ValueError, TypeError):
+        return 1
+
+
 @dataclass
 class Tag(L5xElement):
     name: str
@@ -435,6 +517,7 @@ class Tag(L5xElement):
     dimensions: Union[str, None]
     _data_table_instance: int
     _comments: List[Tuple[str, str]]
+    _initial_value: Union[List, int, float, None] = None
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
 
     @property
@@ -479,19 +562,80 @@ class Tag(L5xElement):
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
         # --- Data child element(s) ---
-        # Scalar primitives get Format="L5K" only.
-        # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
-        # nothing here — Decorated is not used for scalar STRING tags).
-        # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
-        dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
-        l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
-        data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+        # If _initial_value is available for a primitive type, emit <Data Format="Decorated">
+        # with the actual values (scalar or array). Otherwise fall through to the default
+        # zero-value L5K/Decorated rendering.
+        data_xml = ""
 
-        if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
-            # Generate Decorated data for non-primitive / array types
-            decorated = _generate_decorated(dt_base, self.dimensions, self._data_types_map)
-            if decorated:
-                data_xml = decorated
+        if self._initial_value is not None:
+            dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
+            if dt_base in _PRIM:
+                radix_attr = _PRIMITIVE_RADIX.get(dt_base, "Decimal")
+                iv = self._initial_value
+
+                if isinstance(iv, list):
+                    # Array: omit trailing zero elements.
+                    non_zero_end = 0
+                    for i in range(len(iv) - 1, -1, -1):
+                        v = iv[i]
+                        if dt_base in ("BOOL", "BIT"):
+                            if v != 0:
+                                non_zero_end = i + 1
+                                break
+                        elif isinstance(v, (int, float)):
+                            if v != 0.0 and v != 0:
+                                non_zero_end = i + 1
+                                break
+                    non_zero_end = max(non_zero_end, 1)
+
+                    def _fmt_elem_val(val):
+                        if dt_base in ("BOOL", "BIT"):
+                            return "1" if val else "0"
+                        if isinstance(val, float):
+                            return f"{val:.6g}"
+                        return str(int(val))
+
+                    elems = "".join(
+                        f'<Element Index="[{i}]" Value="{_fmt_elem_val(iv[i])}"/>'
+                        for i in range(non_zero_end)
+                    )
+                    dim_str = self.dimensions or "1"
+                    data_xml = (
+                        f'<Data Format="Decorated">\n'
+                        f'<Array Name="{self.name}" DataType="{dt_base}" '
+                        f'Dimensions="{dim_str}" Radix="{radix_attr}">{elems}</Array>\n'
+                        f'</Data>'
+                    )
+                else:
+                    # Scalar primitive
+                    if dt_base in ("BOOL", "BIT"):
+                        val_str = "1" if iv else "0"
+                    elif isinstance(iv, float):
+                        val_str = f"{iv:.6g}"
+                    else:
+                        val_str = str(int(iv))
+
+                    data_xml = (
+                        f'<Data Format="Decorated">\n'
+                        f'<{dt_base} Name="{self.name}" Value="{val_str}" '
+                        f'Radix="{radix_attr}"/>\n'
+                        f'</Data>'
+                    )
+
+        if not data_xml:
+            # Scalar primitives get Format="L5K" only.
+            # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
+            # nothing here — Decorated is not used for scalar STRING tags).
+            # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
+            dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
+            l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
+            data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+
+            if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
+                # Generate Decorated data for non-primitive / array types
+                decorated = _generate_decorated(dt_base, self.dimensions, self._data_types_map)
+                if decorated:
+                    data_xml = decorated
 
         if not desc_xml and not data_xml:
             return base
@@ -1588,10 +1732,14 @@ class TagBuilder(L5xElementBuilder):
             if r.main_record.dimension_3 != 0:
                 dim_parts.append(str(r.main_record.dimension_3))
             dimensions = ",".join(dim_parts) if dim_parts else None
+            dti = r.main_record.data_table_instance
+            initial_value = _read_tag_initial_value(
+                self._cur, dti, data_type, _count_array_elements(dimensions)
+            )
             return Tag(
                 results[0][0], results[0][0], "Base", data_type, radix,
-                external_access, constant, dimensions, r.main_record.data_table_instance,
-                comment_results,
+                external_access, constant, dimensions, dti,
+                comment_results, initial_value,
             )
 
         name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
@@ -1608,6 +1756,10 @@ class TagBuilder(L5xElementBuilder):
         if r.main_record.dimension_3 != 0:
             dim_parts.append(str(r.main_record.dimension_3))
         dimensions = ",".join(dim_parts) if dim_parts else None
+        dti = r.main_record.data_table_instance
+        initial_value = _read_tag_initial_value(
+            self._cur, dti, data_type, _count_array_elements(dimensions)
+        )
         return Tag(
             name,
             name,
@@ -1617,8 +1769,9 @@ class TagBuilder(L5xElementBuilder):
             external_access,
             constant,
             dimensions,
-            r.main_record.data_table_instance,
+            dti,
             comment_results,
+            initial_value,
         )
 
 
@@ -2166,17 +2319,17 @@ class ProgramBuilder(L5xElementBuilder):
             + " AND comp_name='RxRoutineCollection'"
         )
         collection_results = self._cur.fetchall()
-        collection_id = collection_results[0][1]
-
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
-            + str(collection_id)
-        )
-        routine_results = self._cur.fetchall()
 
         routines = []
-        for child in routine_results:
-            routines.append(RoutineBuilder(self._cur, child[1]).build())
+        if collection_results:
+            collection_id = collection_results[0][1]
+            self._cur.execute(
+                "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
+                + str(collection_id)
+            )
+            routine_results = self._cur.fetchall()
+            for child in routine_results:
+                routines.append(RoutineBuilder(self._cur, child[1]).build())
 
         # Get the Program Scoped Tags
         self._cur.execute(
@@ -2188,16 +2341,17 @@ class ProgramBuilder(L5xElementBuilder):
         if len(results) > 1:
             raise Exception("Contains more than one program tag collection")
 
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
-            + str(results[0][1])
-        )
-        results = self._cur.fetchall()
         tags: List[Tag] = []
-        for result in results:
-            tag = TagBuilder(self._cur, result[1]).build()
-            tag._data_types_map = self._data_types_map
-            tags.append(tag)
+        if results:
+            self._cur.execute(
+                "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
+                + str(results[0][1])
+            )
+            results = self._cur.fetchall()
+            for result in results:
+                tag = TagBuilder(self._cur, result[1]).build()
+                tag._data_types_map = self._data_types_map
+                tags.append(tag)
 
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="

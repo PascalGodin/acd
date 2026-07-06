@@ -118,6 +118,7 @@ class Member(L5xElement):
     target: Union[str, None]      # BIT members only; None omits the attribute
     bit_number: Union[int, None]  # BIT members only; None omits the attribute
     external_access: str
+    byte_offset: int = 0
     _description: Union[str, None] = field(default=None)
 
     def to_xml(self) -> str:
@@ -424,6 +425,141 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
+def _udt_has_non_zero(d: dict) -> bool:
+    """Recursively check if a decoded UDT element has any non-zero values."""
+    for v in d.values():
+        if isinstance(v, dict):
+            if _udt_has_non_zero(v):
+                return True
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    if _udt_has_non_zero(item):
+                        return True
+                elif item != 0 and item != "" and item is not None:
+                    return True
+        elif v != 0 and v != "" and v is not None:
+            return True
+    return False
+
+
+def _udt_scalar_to_xml(dt_name: str, values: dict,
+                        data_types_map: Dict[str, 'DataType']) -> str:
+    """Generate inner member XML for a decoded UDT scalar.
+
+    Returns a string of ``<DataValueMember>``, ``<StringValueMember>``,
+    ``<ArrayMember>``, and ``<StructureMember>`` elements (no outer
+    ``<Structure>`` wrapper).
+    """
+    dt_obj = data_types_map.get(dt_name.upper())
+    if dt_obj is None:
+        return ""
+
+    parts: List[str] = []
+    for member in dt_obj.members:
+        if member.hidden or member.data_type == "BIT":
+            continue
+        mname = member.name
+        mdt = member.data_type
+        mdt_upper = mdt.upper()
+        val = values.get(mname)
+
+        if val is None:
+            continue
+
+        if isinstance(val, dict):
+            # Nested UDT
+            inner = _udt_scalar_to_xml(mdt, val, data_types_map)
+            if inner:
+                parts.append(
+                    f'<StructureMember Name="{mname}" DataType="{mdt}">{inner}</StructureMember>'
+                )
+
+        elif isinstance(val, list) and val and isinstance(val[0], dict):
+            # Array of nested UDTs
+            inner_parts: List[str] = []
+            for i, elem in enumerate(val):
+                struct = _udt_scalar_to_xml(mdt, elem, data_types_map)
+                inner_parts.append(
+                    f'<Element Index="[{i}]"><Structure DataType="{mdt}">{struct}</Structure></Element>'
+                )
+            parts.append(
+                f'<ArrayMember Name="{mname}" DataType="{mdt}" Dimensions="{len(val)}">'
+                f'{"".join(inner_parts)}</ArrayMember>'
+            )
+
+        elif isinstance(val, list) and mdt_upper == "STRING":
+            # Array of STRINGs
+            for i, v in enumerate(val):
+                parts.append(
+                    f'<StringValueMember Name="{mname}[{i}]" DataType="STRING" Radix="ASCII">'
+                    f'{_escape_xml_attr(v)}</StringValueMember>'
+                )
+
+        elif isinstance(val, list):
+            # Array of primitives
+            radix = _PRIMITIVE_RADIX.get(mdt_upper, "Decimal")
+            zero = _PRIMITIVE_DECORATED_ZERO.get(mdt_upper, "0")
+            elems = "".join(
+                f'<Element Index="[{i}]" Value="{v}"/>' for i, v in enumerate(val)
+            )
+            parts.append(
+                f'<ArrayMember Name="{mname}" DataType="{mdt}" '
+                f'Dimensions="{len(val)}" Radix="{radix}">'
+                f'{elems}</ArrayMember>'
+            )
+
+        elif mdt_upper == "STRING":
+            parts.append(
+                f'<DataValueMember Name="{mname}" DataType="STRING" Radix="ASCII">'
+                f'{_escape_xml_attr(val)}</DataValueMember>'
+            )
+
+        elif mdt_upper in ("BOOL", "BIT"):
+            parts.append(
+                f'<DataValueMember Name="{mname}" DataType="BOOL" '
+                f'Value="{"1" if val else "0"}"/>'
+            )
+
+        else:
+            radix = _PRIMITIVE_RADIX.get(mdt_upper, "Decimal")
+            parts.append(
+                f'<DataValueMember Name="{mname}" DataType="{mdt}" '
+                f'Radix="{radix}" Value="{val}"/>'
+            )
+
+    return "".join(parts)
+
+
+def _udt_array_to_xml(tag_name: str, dt_base: str, values: List[dict],
+                       dim_str: str,
+                       data_types_map: Dict[str, 'DataType']) -> str:
+    """Generate an ``<Array>`` XML fragment for a decoded UDT array tag.
+
+    Trailing all-zero elements are omitted.
+    """
+    non_zero_end = 0
+    for i in range(len(values) - 1, -1, -1):
+        if _udt_has_non_zero(values[i]):
+            non_zero_end = i + 1
+            break
+    non_zero_end = max(non_zero_end, 1)
+
+    elems: List[str] = []
+    for i in range(non_zero_end):
+        struct = _udt_scalar_to_xml(dt_base, values[i], data_types_map)
+        elems.append(
+            f'<Element Index="[{i}]">'
+            f'<Structure DataType="{dt_base}">{struct}</Structure>'
+            f'</Element>'
+        )
+
+    return (
+        f'<Array Name="{tag_name}" DataType="{dt_base}" Dimensions="{dim_str}">'
+        f'{"".join(elems)}</Array>'
+    )
+
+
 _PRIM = {
     'BOOL':  ('B',   1),
     'SINT':  ('<b',  1),
@@ -437,6 +573,37 @@ _PRIM = {
     'REAL':  ('<f',  4),
     'LREAL': ('<d',  8),
 }
+
+# Logix STRING struct: DINT LEN (4 bytes) + SINT[82] DATA (82 bytes) + 2 bytes padding.
+_STRING_SIZE = 88
+
+
+def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int:
+    """Return the byte size of a DataType (primitive, STRING, or UDT).
+
+    For UDTs, computes max(byte_offset + elem_size * max(dimension,1))
+    across non-hidden non-BIT members.
+    Returns 0 for unknown types.
+    """
+    t = type_name.upper()
+    prim = _PRIM.get(t)
+    if prim is not None:
+        return prim[1]
+    if t == "STRING":
+        return _STRING_SIZE
+    dt = data_types_map.get(t)
+    if dt is None:
+        return 0
+    max_end = 0
+    for m in dt.members:
+        if m.hidden or m.data_type == "BIT":
+            continue
+        elem_sz = _get_type_size(m.data_type, data_types_map)
+        if elem_sz == 0:
+            continue
+        member_end = m.byte_offset + (elem_sz * max(m.dimension, 1))
+        max_end = max(max_end, member_end)
+    return max_end if max_end > 0 else 0
 
 
 def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
@@ -487,6 +654,141 @@ def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
     if n_elements == 1:
         return values[0]
     return values
+
+
+def _decode_udt_initial_value(
+    cur: Cursor,
+    data_table_instance: int,
+    data_type_name: str,
+    n_elements: int,
+    data_types_map: Dict[str, 'DataType'],
+) -> Union[dict, list, None]:
+    """Decode initial values for a UDT-typed tag from the data table blob.
+
+    Returns a dict for scalar UDTs, a list of dicts for UDT arrays,
+    or None if the type is not a user-defined UDT or cannot be decoded.
+    """
+    if not data_type_name:
+        return None
+    if n_elements > 10000:
+        return None
+
+    base_dt = re.sub(r'\[.*\]', '', data_type_name).strip()
+    dt_obj = data_types_map.get(base_dt.upper())
+    if dt_obj is None or dt_obj.cls != "User":
+        return None
+
+    cur.execute(
+        "SELECT record FROM comps WHERE object_id = ?", (data_table_instance,)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return None
+    raw_rec = bytes(rows[0][0])
+
+    struct_size = _get_type_size(base_dt.upper(), data_types_map)
+    if struct_size == 0:
+        return None
+
+    offset = 0x1A2 if n_elements > 1 else 0x19E
+
+    results: list = []
+    for elem_idx in range(n_elements):
+        base = offset + elem_idx * struct_size
+        decoded = _decode_single_udt_element(
+            raw_rec, base, dt_obj, data_types_map, 0
+        )
+        results.append(decoded)
+
+    if n_elements == 1:
+        return results[0]
+    return results
+
+
+def _decode_single_udt_element(
+    blob: bytes,
+    base_offset: int,
+    data_type: 'DataType',
+    data_types_map: Dict[str, 'DataType'],
+    depth: int,
+    _max_depth: int = 3,
+) -> dict:
+    """Decode one UDT element from *blob* at *base_offset*.
+
+    Returns {member_name: value} for non-hidden, non-BIT members.
+    Returns an empty dict when *depth* exceeds ``_max_depth``.
+    """
+    if depth > _max_depth:
+        return {}
+
+    result: dict = {}
+    for member in data_type.members:
+        if member.hidden or member.data_type == "BIT":
+            continue
+
+        mname = member.name
+        mdt = member.data_type
+        mdt_upper = mdt.upper()
+        off = base_offset + member.byte_offset
+
+        if member.dimension > 0:
+            elem_size = _get_type_size(mdt_upper, data_types_map)
+            if elem_size == 0:
+                continue
+            arr: list = []
+            for i in range(member.dimension):
+                elem_off = off + i * elem_size
+                val = _decode_scalar_member(
+                    blob, elem_off, mdt, data_types_map, depth + 1
+                )
+                arr.append(val)
+            result[mname] = arr
+        else:
+            val = _decode_scalar_member(
+                blob, off, mdt, data_types_map, depth + 1
+            )
+            result[mname] = val
+
+    return result
+
+
+def _decode_scalar_member(
+    blob: bytes,
+    offset: int,
+    data_type: str,
+    data_types_map: Dict[str, 'DataType'],
+    depth: int,
+):
+    """Decode a single scalar member value from *blob* at *offset*.
+
+    Handles primitives, STRING, and nested UDTs.  Returns 0 for
+    out-of-range reads, ``None`` for unknown types.
+    """
+    mdt_upper = data_type.upper()
+    prim = _PRIM.get(mdt_upper)
+    if prim is not None:
+        fmt, sz = prim
+        if offset + sz <= len(blob):
+            return struct.unpack_from(fmt, blob, offset)[0]
+        return 0
+
+    if mdt_upper == "STRING":
+        if offset + 4 > len(blob):
+            return ""
+        length = struct.unpack_from("<i", blob, offset)[0]
+        length = max(0, min(length, 82))
+        if offset + 4 + length > len(blob):
+            return ""
+        raw = blob[offset + 4: offset + 4 + length]
+        return raw.decode("utf-8", errors="replace")
+
+    dt_obj = data_types_map.get(mdt_upper)
+    if dt_obj is not None and depth <= 3:
+        return _decode_single_udt_element(
+            blob, offset, dt_obj, data_types_map, depth + 1
+        )
+
+    return None
 
 
 def _count_array_elements(dimensions: Union[str, None]) -> int:
@@ -569,9 +871,28 @@ class Tag(L5xElement):
 
         if self._initial_value is not None:
             dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
-            if dt_base in _PRIM:
+            iv = self._initial_value
+
+            if isinstance(iv, dict):
+                # UDT scalar
+                body = (
+                    f'<Structure DataType="{dt_base}">'
+                    f'{_udt_scalar_to_xml(dt_base, iv, self._data_types_map)}'
+                    f'</Structure>'
+                )
+                data_xml = f'<Data Format="Decorated">\n{body}\n</Data>'
+
+            elif isinstance(iv, list) and iv and isinstance(iv[0], dict):
+                # UDT array
+                dim_str = self.dimensions or "1"
+                body = _udt_array_to_xml(
+                    self.name, dt_base, iv, dim_str, self._data_types_map
+                )
+                if body:
+                    data_xml = f'<Data Format="Decorated">\n{body}\n</Data>'
+
+            elif dt_base in _PRIM:
                 radix_attr = _PRIMITIVE_RADIX.get(dt_base, "Decimal")
-                iv = self._initial_value
 
                 if isinstance(iv, list):
                     # Array: omit trailing zero elements.
@@ -1255,7 +1576,13 @@ class MemberBuilder(L5xElementBuilder):
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
 
-        return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description)
+        byte_offset = struct.unpack_from("<I", self.record, 0x60)[0]
+        return Member(
+            name, name, data_type, dimension, radix, hidden,
+            target, bit_number, external_access,
+            byte_offset=byte_offset,
+            _description=description,
+        )
 
 
 @dataclass
@@ -2351,6 +2678,17 @@ class ProgramBuilder(L5xElementBuilder):
             for result in results:
                 tag = TagBuilder(self._cur, result[1]).build()
                 tag._data_types_map = self._data_types_map
+                # Decode UDT initial values now that data_types_map is available.
+                # Skip multi-dimensional arrays (dimensions with 2+ parts).
+                if tag._initial_value is None and tag._data_table_instance:
+                    if not tag.dimensions or "," not in tag.dimensions:
+                        n = _count_array_elements(tag.dimensions)
+                        udt_val = _decode_udt_initial_value(
+                            self._cur, tag._data_table_instance, tag.data_type, n,
+                            self._data_types_map,
+                        )
+                        if udt_val is not None:
+                            tag._initial_value = udt_val
                 tags.append(tag)
 
         self._cur.execute(
@@ -2570,6 +2908,17 @@ class ControllerBuilder(L5xElementBuilder):
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id).build()
             tag._data_types_map = data_types_map
+            # Decode UDT initial values now that data_types_map is available.
+            # Skip multi-dimensional arrays (dimensions with 2+ parts).
+            if tag._initial_value is None and tag._data_table_instance:
+                if not tag.dimensions or "," not in tag.dimensions:
+                    n = _count_array_elements(tag.dimensions)
+                    udt_val = _decode_udt_initial_value(
+                        self._cur, tag._data_table_instance, tag.data_type, n,
+                        data_types_map,
+                    )
+                    if udt_val is not None:
+                        tag._initial_value = udt_val
             if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
                 tags.append(tag)
 

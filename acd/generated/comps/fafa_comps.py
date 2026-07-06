@@ -20,7 +20,7 @@ class FafaComps(KaitaiStruct):
         self._raw_header = self._io.read_bytes(144)
         _io__raw_header = KaitaiStream(BytesIO(self._raw_header))
         self.header = FafaComps.Header(_io__raw_header, self, self._root)
-        self.record_buffer = self._io.read_bytes((self.record_length - 144) - 4)
+        self.record_buffer = self._io.read_bytes(self.record_length - 144)
 
 
     def _fetch_instances(self):

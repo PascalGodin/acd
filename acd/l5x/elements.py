@@ -690,7 +690,7 @@ def _decode_udt_initial_value(
     if struct_size == 0:
         return None
 
-    offset = 0x1A2 if n_elements > 1 else 0x19E
+    offset = 0x1A2
 
     results: list = []
     for elem_idx in range(n_elements):

@@ -165,7 +165,10 @@ class ImportProjectFromFile(ImportProject):
     def import_project(self) -> RSLogix5000Content:
         # Import Project Interface
         export = ExportL5x(self.filename)
-        return export.project
+        try:
+            return export.project
+        finally:
+            export.close()
 
 
 @dataclass

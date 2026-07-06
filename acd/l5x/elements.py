@@ -123,13 +123,16 @@ class Member(L5xElement):
 
     @property
     def description(self) -> Union[str, None]:
-        return self._description
+        if self._description is None:
+            return None
+        return ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        if not self._description:
+        desc = self.description
+        if not desc:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
@@ -845,7 +848,10 @@ class Tag(L5xElement):
 
     @property
     def description(self) -> Union[str, None]:
-        return next((d for p, d in self._comments if p == ''), None)
+        raw = next((d for p, d in self._comments if p == ''), None)
+        if raw is None:
+            return None
+        return ' '.join(raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -885,6 +891,8 @@ class Tag(L5xElement):
         # longest entry — short entries like "Spare" or "End CIP" are element labels.
         candidates = [text for ref, text in self._comments if ref in ("", ".") and text]
         desc_raw = max(candidates, key=len) if candidates else None
+        if desc_raw is not None:
+            desc_raw = ' '.join(desc_raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
@@ -2224,6 +2232,23 @@ class TagBuilder(L5xElementBuilder):
                             else:
                                 target = base_target + "." + subpath_str
 
+        # Normalize comment paths to full Studio 5000 addresses.
+        # Empty paths (tag-level description) are kept as-is.
+        # Numeric paths like "20" become "tag_name.20".
+        # Bracket paths like "0]" become "tag_name[0]".
+        # Other paths (!HEXOID, .!HEXOID, full addresses) are left as-is
+        # for later resolution by ControllerBuilder.
+        normalized = []
+        for ref, text in comment_results:
+            if not ref:
+                normalized.append((ref, text))
+            elif ref.endswith("]"):
+                normalized.append((f"{tag_name}[{ref}", text))
+            elif ref.isdigit():
+                normalized.append((f"{tag_name}.{ref}", text))
+            else:
+                normalized.append((ref, text))
+
         return Tag(
             tag_name,
             tag_name,
@@ -2235,7 +2260,7 @@ class TagBuilder(L5xElementBuilder):
             dimensions,
             target,
             dti,
-            comment_results,
+            normalized,
             initial_value,
         )
 

@@ -14,3 +14,5 @@ dist
 /.mypy_cache/
 /acd_tools.egg-info/
 .vscode
+nul
+opencode.json

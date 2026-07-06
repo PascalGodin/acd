@@ -3082,6 +3082,32 @@ class ControllerBuilder(L5xElementBuilder):
             for path, text in tag._comments:
                 if not path:
                     resolved.append((path, text))
+                elif path.startswith(".!"):
+                    # For .! references (type 16/17 bit-level I/O comments),
+                    # find the first array member (dimension > 0) since these
+                    # references always target array elements like Data[N].
+                    array_member = None
+                    if dt:
+                        for m in dt.members:
+                            if m.bit_number is None and m.dimension > 0:
+                                array_member = m
+                                break
+                    _dm = array_member or data_member
+                    if not _dm:
+                        resolved.append((path, text))
+                        continue
+                    inner = path[2:]
+                    if "[" in inner and "." in inner and inner.index("[") < inner.rindex("."):
+                        hex_oid, bracket_part = inner.split("[", 1)
+                        array_idx, bit_part = bracket_part.rsplit(".", 1)
+                        array_idx = array_idx.rstrip("]")
+                        resolved.append((f"{tag.name}.{_dm.name}[{array_idx}].{bit_part}", text))
+                    elif "[" in inner:
+                        hex_oid, suffix = inner.split("[", 1)
+                        suffix = suffix.rstrip("]")
+                        resolved.append((f"{tag.name}.{_dm.name}[{suffix}]", text))
+                    else:
+                        resolved.append((path, text))
                 elif path.startswith("!"):
                     if not data_member:
                         resolved.append((path, text))

@@ -121,6 +121,10 @@ class Member(L5xElement):
     byte_offset: int = 0
     _description: Union[str, None] = field(default=None)
 
+    @property
+    def description(self) -> Union[str, None]:
+        return self._description
+
     def to_xml(self) -> str:
         base = super().to_xml()
         if not self._description:
@@ -832,6 +836,10 @@ class Tag(L5xElement):
     _comments: List[Tuple[str, str]]
     _initial_value: Union[List, int, float, None] = None
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+
+    @property
+    def description(self) -> Union[str, None]:
+        return next((d for p, d in self._comments if p == ''), None)
 
     @property
     def _l5x_exclude(self) -> bool:

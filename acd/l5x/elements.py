@@ -3060,6 +3060,47 @@ class ControllerBuilder(L5xElementBuilder):
             if tag.data_type and not tag.name.startswith("$") and not tag.name.startswith("__"):
                 tags.append(tag)
 
+        # Resolve !HEXOID comment paths to Studio 5000 addresses for I/O tags
+        for tag in tags:
+            if ":" not in tag.name:
+                continue
+            if not tag._comments:
+                continue
+            dt = data_types_map.get(tag.data_type.upper())
+            if not dt:
+                continue
+            data_member = None
+            for m in dt.members:
+                if m.bit_number is None and m.name.upper() not in ("FAULT", "STATUS"):
+                    data_member = m
+                    break
+            if data_member is None:
+                for m in dt.members:
+                    if m.bit_number is None:
+                        data_member = m
+                        break
+            if not data_member:
+                continue
+            resolved = []
+            for path, text in tag._comments:
+                if not path.startswith("!"):
+                    resolved.append((path, text))
+                    continue
+                rest = path[1:]
+                if "." in rest:
+                    hex_oid, suffix = rest.split(".", 1)
+                    if data_member.dimension > 0:
+                        resolved.append((f"{tag.name}.{data_member.name.upper()}[{suffix}]", text))
+                    else:
+                        resolved.append((f"{tag.name}.{data_member.name.upper()}.{suffix}", text))
+                elif "[" in rest:
+                    hex_oid, suffix = rest.split("[", 1)
+                    suffix = suffix.rstrip("]")
+                    resolved.append((f"{tag.name}.{data_member.name.upper()}[{suffix}]", text))
+                else:
+                    resolved.append((path, text))
+            tag._comments = resolved
+
         # Get the Program Collection and get the programs
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="

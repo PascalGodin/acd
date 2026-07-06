@@ -6,9 +6,9 @@
 
 ## Rockwell ACD Project File Tools
 
-The Rockwell `.ACD` file is an archive file that contains all the files used by RSLogix / Studio 5000 Logix Designer. It consists of version text files, compressed XML metadata, and several proprietary binary database files (`Comps.Dat`, `SbRegion.Dat`, `Comments.Dat`, `Nameless.Dat`).
+The Rockwell `.ACD` file is an archive that contains all the files used by RSLogix / Studio 5000 Logix Designer. It consists of version text files, compressed XML metadata, and several proprietary binary database files (`Comps.Dat`, `SbRegion.Dat`, `Comments.Dat`, `Nameless.Dat`).
 
-This library parses those binary databases and exposes the project contents — controller tags, programs, ladder rungs, data types (UDTs), add-on instructions (AOIs), and hardware modules — as Python objects. It can also serialise the parsed project back to an **L5X XML file** that Studio 5000 can import.
+This library parses those binary databases and exposes the project contents — controller tags, programs, ladder rungs, data types (UDTs), add-on instructions (AOIs), and hardware modules — as Python objects. It can also serialise the parsed project to an **L5X XML file** that Studio 5000 can import.
 
 > **Compatibility** — Tested against Studio 5000 firmware versions 20–35. Python 3.8+ is supported; Python 3.12+ is recommended.
 
@@ -22,45 +22,67 @@ pip install acd-tools
 
 ---
 
-### Quick start — parse an ACD file
+### Quick start — read an ACD file
 
 ```python
-from acd.api import ImportProjectFromFile
+from acd.api import load_acd
 
-project = ImportProjectFromFile("MyController.ACD").import_project()
+project = load_acd("MyController.ACD")
 controller = project.controller
 
 # Basic controller info
-print(controller._name)           # controller name
+print(controller.name)            # controller name
 print(controller.serial_number)   # e.g. "16#AB12_3456"
 print(controller.modified_date)
 
-# Iterate controller-scoped tags
+# Iterate controller-scoped tags and their initial values
 for tag in controller.tags:
-    print(f"  {tag.name}  ({tag.data_type})  — {tag._comments}")
+    print(f"  {tag.name}  ({tag.data_type})")
+    if tag._initial_value is not None:
+        print(f"    initial value: {tag._initial_value}")
 
 # Walk programs -> routines -> ladder rungs
 for program in controller.programs:
-    print(f"\nProgram: {program._name}")
+    print(f"\nProgram: {program.name}")
     for routine in program.routines:
-        print(f"  Routine: {routine._name}  [{routine.type}]")
+        print(f"  Routine: {routine.name}  [{routine.type}]")
         for i, rung in enumerate(routine.rungs):
             print(f"    Rung {i}: {rung}")
 
-# Inspect user-defined data types
+# Inspect user-defined data types and their members
 for udt in controller.data_types:
     member_names = [m.name for m in udt.members]
     print(f"UDT {udt.name}: {member_names}")
 
 # Inspect add-on instructions
 for aoi in controller.aois:
-    print(f"AOI {aoi._name}: {len(aoi.routines)} routines, {len(aoi.tags)} params")
+    print(f"AOI {aoi.name}: {len(aoi.routines)} routines, {len(aoi.tags)} params")
 
 # Inspect hardware modules
-for module in controller.map_devices:
-    print(f"Module {module._name}: vendor={module.vendor_id} "
+for module in controller.modules:
+    print(f"Module {module.name}: vendor={module.vendor_id} "
           f"type={module.product_type} code={module.product_code} slot={module.slot_no}")
 ```
+
+---
+
+### Tag values (including UDT initial values)
+
+Controller-scoped and program-scoped tags carry their initial values when the data table instance can be located in the binary database:
+
+```python
+# Scalar tag
+tag = controller.tags[0]
+print(tag._initial_value)        # e.g. 42 or "Hello" or {"Member1": 1, "Member2": 0}
+
+# Array tag
+for tg in controller.tags:
+    if tg.dimensions:
+        arr = tg._initial_value   # list of values, one per element
+        print(f"{tg.name}[0]: {arr[0] if arr else None}")
+```
+
+For UDT-typed tags the initial value is a `dict` (scalar) or `list[dict]` (array) keyed by member name. BOOL members are decoded from their packed bit position; nested UDTs and STRING members are handled recursively.
 
 ---
 
@@ -80,9 +102,29 @@ The output is pretty-printed by default. Pass `pretty_print=False` for a compact
 ConvertAcdToL5x("MyController.ACD", "MyController.L5X", pretty_print=False).extract()
 ```
 
-> **Note** — The L5X serialisation captures tags, programs, routines, rungs, UDTs, and AOIs.
-> Hardware module metadata (catalog numbers, connection parameters) is not fully round-tripped because
-> Rockwell stores those as opaque CIP identity records in the binary database rather than as strings.
+> **Note** — The L5X serialisation captures tags, programs, routines, rungs, UDTs, and AOIs with their initial values. Hardware module metadata (catalog numbers, connection parameters) is not fully round-tripped because Rockwell stores those as opaque CIP identity records rather than as strings.
+
+---
+
+### Edit rungs and save back to ACD
+
+Ladder rung text can be modified and written back to a working `.ACD` file. The library handles the binary encoding, including resolving tag names to/from `@HEX_OBJECT_ID@` placeholders:
+
+```python
+from acd.api import load_acd, save_acd, patch_rungs
+
+project = load_acd("MyController.ACD")
+controller = project.controller
+
+# Find the first rung of the first routine and change it
+routine = controller.programs[0].routines[0]
+changes = {routine.rung_ids[0]: "XIC(MySensor)OTE(MyOutput);"}
+
+patch_rungs(project, changes)
+save_acd(project, "MyController_modified.ACD")
+```
+
+Only `SbRegion.Dat` (rung text) is re-serialised. Other object types (tags, data types, AOI definitions, modules) pass through as raw bytes and are preserved verbatim. Editing those structures in the Python object model and saving back requires a binary serializer for `Comps.Dat`, which is not yet implemented.
 
 ---
 
@@ -102,8 +144,7 @@ ExtractAcdDatabase("MyController.ACD", "output/").extract()
 
 ### Extract raw database records to files
 
-Save every individual binary record from the Comps database as its own file,
-useful for reverse-engineering the record format:
+Save every individual binary record from the Comps database as its own file, useful for reverse-engineering the record format:
 
 ```python
 from acd.api import ExtractAcdDatabaseRecordsToFiles
@@ -115,8 +156,7 @@ ExtractAcdDatabaseRecordsToFiles("MyController.ACD", "output/").extract()
 
 ### Dump Comps database as a navigable folder tree
 
-Writes the entire Comps database as a directory tree where each node is a `.dat` file.
-A log file records the CIP class and instance for each record:
+Writes the entire Comps database as a directory tree where each node is a `.dat` file. A log file records the CIP class and instance for each record:
 
 ```python
 from acd.api import DumpCompsRecordsToFile
@@ -124,6 +164,30 @@ from acd.api import DumpCompsRecordsToFile
 DumpCompsRecordsToFile("MyController.ACD", "output/").extract()
 # Produces output/output.log  +  output/<comp_name>/<comp_name>.dat  (recursive)
 ```
+
+---
+
+### Integrity / project key
+
+Studio 5000's SDK validates ACD containers using a `FileInfo.Dat` checksum seeded by a project-specific key. The library can read and write this key, recompute the checksum, and verify that a loaded project matches the source ACD:
+
+```python
+from acd.api import load_acd
+from acd.integrity import get_fileinfo_key, set_fileinfo_key, verify_loaded_acd
+
+project = load_acd("MyController.ACD")
+
+# Check if a signing key is present
+key = get_fileinfo_key(project)
+
+# Register a key (32 bytes for modern Studio, 126 for older)
+set_fileinfo_key(project, b"\\x00" * 32)
+
+# Verify the loaded project matches the original ACD
+ok = verify_loaded_acd(project, "MyController.ACD")
+```
+
+When a key is registered, `save_acd()` recomputes `FileInfo.Dat` so the SDK accepts the output. Without a registered key, the container is written as-is (byte-equal round-trip of unmodified streams).
 
 ---
 
@@ -137,7 +201,7 @@ from acd.l5x.export_l5x import ExportL5x
 export = ExportL5x("MyController.ACD")
 
 # Raw SQLite cursor — full access to comps, rungs, region_map, comments, nameless tables
-cur = export._cur
+cur = export.cur
 cur.execute("SELECT comp_name, object_id FROM comps WHERE parent_id=0 AND record_type=256")
 row = cur.fetchone()
 ctrl_name, ctrl_id = row[0], row[1]
@@ -145,7 +209,11 @@ ctrl_name, ctrl_id = row[0], row[1]
 # High-level objects
 controller = export.controller
 project    = export.project
+
+export.close()   # release the SQLite connection
 ```
+
+> Always call `close()` when you are done, especially on Windows, to release the file lock on the SQLite database.
 
 ---
 
@@ -153,14 +221,15 @@ project    = export.project
 
 ```
 acd/
-├── api.py                  # Public API (ImportProjectFromFile, ConvertAcdToL5x, ...)
+├── api.py                  # Public API (load_acd, save_acd, patch_rungs, ...)
 ├── l5x/
 │   ├── export_l5x.py       # ACD -> SQLite -> Python objects
 │   └── elements.py         # Dataclasses + Builder classes for all project elements
 ├── database/               # Binary .Dat file reader
 ├── record/                 # Record parsers (Comps, SbRegion, Comments, Nameless)
 ├── generated/              # Kaitai Struct generated parsers (comps, comments, ...)
-└── zip/                    # ACD archive extraction
+├── integrity/              # FileInfo.Dat checksum and project key management
+└── zip/                    # ACD archive extraction and writing
 ```
 
 ---
@@ -176,9 +245,7 @@ pytest
 
 ### Developing
 
-Sections of the code are generated from kaitai template (.ksy) files in the resources/templates folder.
-These are generated during the install phase.
-The python scripts which are generated are located in the acd/generated folder.
+Sections of the code are generated from kaitai template (.ksy) files in the resources/templates folder. These are generated during the install phase. The python scripts which are generated are located in the acd/generated folder.
 
 ### Contributing
 

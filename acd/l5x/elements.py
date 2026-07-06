@@ -832,10 +832,16 @@ class Tag(L5xElement):
     external_access: str
     constant: Union[str, None]  # "true" for constants; None omits the attribute
     dimensions: Union[str, None]
-    _data_table_instance: int
-    _comments: List[Tuple[str, str]]
+    target: Union[str, None] = None  # AliasFor target; None for non-alias tags
+    _data_table_instance: int = 0
+    _comments: List[Tuple[str, str]] = field(default_factory=list)
     _initial_value: Union[List, int, float, None] = None
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.tag_type == "Alias":
+            self._xml_attr_overrides = {"tag_type": "TagType", "target": "AliasFor"}
 
     @property
     def description(self) -> Union[str, None]:
@@ -1404,6 +1410,16 @@ class Controller(L5xElement):
             "project_sn": "ProjectSN",
             "can_use_rpi_from_producer": "CanUseRPIFromProducer",
         }
+        self._io_tags: List[Tag] = [t for t in self.tags if ":" in t.name]
+        self._alias_tags: List[Tag] = [t for t in self.tags if t.tag_type == "Alias"]
+
+    @property
+    def io_tags(self) -> List[Tag]:
+        return self._io_tags
+
+    @property
+    def alias_tags(self) -> List[Tag]:
+        return self._alias_tags
 
     def to_xml(self) -> str:
         base = super().to_xml()
@@ -2041,6 +2057,30 @@ class ModuleBuilder(L5xElementBuilder):
         )
 
 
+def _resolve_tag_name_from_oid(cur, oid: int) -> Union[str, None]:
+    """Resolve a comps record's display name from its OID.
+
+    Returns the real tag name (from ext[0x01] if available) or the comp_name.
+    Returns None if the OID does not exist.
+    """
+    cur.execute("SELECT comp_name, record FROM comps WHERE object_id=?", (oid,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    comp_name, rec = row
+    rec = bytes(rec)
+    try:
+        r = RxGeneric.from_bytes(rec)
+        for er in r.extended_records:
+            if er.attribute_id == 1:
+                v = bytes(er.value)
+                nl = struct.unpack("<H", v[:2])[0]
+                return v[2:2+nl].decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return comp_name
+
+
 @dataclass
 class TagBuilder(L5xElementBuilder):
     def build(self) -> Tag:
@@ -2065,12 +2105,12 @@ class TagBuilder(L5xElementBuilder):
             r = RxGeneric.from_bytes(raw_rec)
         except Exception as e:
             return Tag(
-                results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
+                results[0][0], results[0][0], "Base", "", None, external_access, constant, None
             )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
             return Tag(
-                results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
+                results[0][0], results[0][0], "Base", "", None, external_access, constant, None
             )
         if r.main_record.data_type == 0xFFFFFFFF:
             data_type = ""
@@ -2094,31 +2134,6 @@ class TagBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        if 0x01 not in extended_records:
-            # Name comes from comp_name in the database; radix from main_record
-            raw_radix = r.main_record.radix
-            radix = radix_enum(raw_radix)
-            dim_parts = []
-            if r.main_record.dimension_1 != 0:
-                dim_parts.append(str(r.main_record.dimension_1))
-            if r.main_record.dimension_2 != 0:
-                dim_parts.append(str(r.main_record.dimension_2))
-            if r.main_record.dimension_3 != 0:
-                dim_parts.append(str(r.main_record.dimension_3))
-            dimensions = ",".join(dim_parts) if dim_parts else None
-            dti = r.main_record.data_table_instance
-            initial_value = _read_tag_initial_value(
-                self._cur, dti, data_type, _count_array_elements(dimensions)
-            )
-            return Tag(
-                results[0][0], results[0][0], "Base", data_type, radix,
-                external_access, constant, dimensions, dti,
-                comment_results, initial_value,
-            )
-
-        name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
-        name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
-
         raw_radix = r.main_record.radix
         radix = radix_enum(raw_radix)
 
@@ -2134,15 +2149,91 @@ class TagBuilder(L5xElementBuilder):
         initial_value = _read_tag_initial_value(
             self._cur, dti, data_type, _count_array_elements(dimensions)
         )
+
+        tag_name = results[0][0]
+        if 0x01 in extended_records:
+            name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
+            tag_name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
+
+        tag_type = "Base"
+        target = None
+
+        # Detect alias tags: look for remaining data after RxGeneric parsing
+        # containing attribute_id=0x65 (UTF-16LE encoded alias path).
+        consumed = 82 + sum(8 + len(bytes(er.value)) for er in r.extended_records)
+        remaining = raw_rec[consumed:]
+        if len(remaining) >= 8:
+            extra_attr_id = struct.unpack("<I", remaining[:4])[0]
+            if extra_attr_id == 0x65:
+                tag_type = "Alias"
+                extra_len = struct.unpack("<I", remaining[4:8])[0]
+                if extra_len > 0 and 8 + extra_len <= len(remaining):
+                    path_bytes = remaining[8:8+extra_len]
+                    path_text = path_bytes.decode("utf-16-le", errors="replace").rstrip("\x00")
+                    # Resolve the base target tag name from data_table_instance OID.
+                    base_target = _resolve_tag_name_from_oid(self._cur, dti)
+                    if base_target is not None:
+                        target = base_target
+                        # Path format: starts with @{target_oid_hex}@ followed by
+                        # optional .@{member_oid_hex}@ or literal suffix.
+                        # Examples:
+                        #   @00d5cc47@.@fbc47e54@        -> OID Gate_Go
+                        #   @5377b0d2@[5]                 -> literal [5]
+                        #   @64ca9836@.@0c5708b9@[0].3   -> OID Data + literal [0].3
+                        subpath_parts = []
+                        if "@." in path_text:
+                            # Multiple OID references separated by @.
+                            parts = path_text.split("@.")
+                            for part in parts[1:]:
+                                if not part:
+                                    continue
+                                if part.startswith("@"):
+                                    end = part.find("@", 1)
+                                    hex_oid = part[1:end] if end >= 0 else part[1:]
+                                    literal = part[end+1:] if end >= 0 else ""
+                                    try:
+                                        oid = int(hex_oid, 16)
+                                    except ValueError:
+                                        oid = 0
+                                    if oid:
+                                        member_name = _resolve_tag_name_from_oid(self._cur, oid)
+                                        if member_name:
+                                            subpath_parts.append(member_name)
+                                    if literal:
+                                        subpath_parts.append(literal)
+                                else:
+                                    subpath_parts.append(part)
+                        elif "@" in path_text:
+                            # Single OID reference with optional literal suffix.
+                            end = path_text.find("@", 1)
+                            if end >= 0:
+                                rest = path_text[end+1:]
+                                if rest:
+                                    subpath_parts.append(rest)
+                        if subpath_parts:
+                            subpath_str = ""
+                            for sp in subpath_parts:
+                                if sp.startswith("["):
+                                    subpath_str += sp
+                                elif subpath_str:
+                                    subpath_str += "." + sp
+                                else:
+                                    subpath_str = sp
+                            if subpath_str.startswith("["):
+                                target = base_target + subpath_str
+                            else:
+                                target = base_target + "." + subpath_str
+
         return Tag(
-            name,
-            name,
-            "Base",
+            tag_name,
+            tag_name,
+            tag_type,
             data_type,
             radix,
             external_access,
             constant,
             dimensions,
+            target,
             dti,
             comment_results,
             initial_value,
@@ -2966,7 +3057,7 @@ class ControllerBuilder(L5xElementBuilder):
                     )
                     if udt_val is not None:
                         tag._initial_value = udt_val
-            if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
+            if tag.data_type and not tag.name.startswith("$") and not tag.name.startswith("__"):
                 tags.append(tag)
 
         # Get the Program Collection and get the programs

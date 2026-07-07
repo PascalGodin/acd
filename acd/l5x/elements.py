@@ -2471,8 +2471,14 @@ class TagBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
+        # A Tag element's own Radix attribute is omitted entirely when the raw
+        # value is 0 (verified: real Studio 5000 L5X never shows
+        # Radix="NullType" on a <Tag> element itself -- always a primitive
+        # type's real radix, e.g. "Decimal"/"Binary" -- unlike <Member>
+        # elements, where "NullType" legitimately appears for struct-typed
+        # members and must still be shown literally there).
         raw_radix = r.main_record.radix
-        radix = radix_enum(raw_radix)
+        radix = radix_enum(raw_radix) if raw_radix != 0 else None
 
         dim_parts = []
         if r.main_record.dimension_1 != 0:

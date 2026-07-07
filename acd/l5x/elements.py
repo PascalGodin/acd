@@ -2135,6 +2135,27 @@ class ModuleBuilder(L5xElementBuilder):
         )
 
 
+def _build_hex_oid_map(cur) -> Dict[int, str]:
+    """Build map of hex OID → member name from comps member records."""
+    cur.execute("""
+        SELECT m.comp_name, m.record
+        FROM comps m
+        INNER JOIN comps c ON m.parent_id = c.object_id
+        WHERE c.comp_name = 'RxTypeMemberCollection'
+    """)
+    hex_oid_map: Dict[int, str] = {}
+    for name, rec in cur.fetchall():
+        raw = bytes(rec)
+        if len(raw) < 18:
+            continue
+        high = struct.unpack_from('<H', raw, 12)[0]
+        low = struct.unpack_from('<H', raw, 16)[0]
+        oid = (high << 16) | low
+        if oid not in hex_oid_map or len(name) < len(hex_oid_map[oid]):
+            hex_oid_map[oid] = name
+    return hex_oid_map
+
+
 def _resolve_tag_name_from_oid(cur, oid: int) -> Union[str, None]:
     """Resolve a comps record's display name from its OID.
 
@@ -2302,27 +2323,59 @@ class TagBuilder(L5xElementBuilder):
                             else:
                                 target = base_target + "." + subpath_str
 
+        # Resolve !HEXOID references to member names for non-I/O tags.
+        # I/O tags keep their !HEXOID refs for ControllerBuilder resolution.
+        if ":" not in tag_name:
+            hex_oid_map = _build_hex_oid_map(self._cur)
+            if hex_oid_map:
+                resolved_comments = []
+                for ref, text in comment_results:
+                    if ref and '!' in ref:
+                        def _replace(m):
+                            hex_val = int(m.group(1), 16)
+                            name = hex_oid_map.get(hex_val)
+                            return name if name else m.group(0)
+                        new_ref = re.sub(r'!([0-9A-F]{8})', _replace, ref)
+                        resolved_comments.append((new_ref, text))
+                    else:
+                        resolved_comments.append((ref, text))
+                comment_results = resolved_comments
+
         # Normalize comment paths to full Studio 5000 addresses.
         # Empty paths (tag-level description) are kept as-is.
+        # I/O .!HEXOID and !HEXOID paths are kept as-is for ControllerBuilder.
         # Numeric paths like "20" become "tag_name.20".
         # Bracket paths like "0]" become "tag_name[0]".
-        # Other paths (!HEXOID, .!HEXOID, full addresses) are left as-is
-        # for later resolution by ControllerBuilder.
+        # Resolved Member.Bit paths get the tag name prefix prepended.
         normalized = []
         for ref, text in comment_results:
             if not ref:
                 normalized.append((ref, text))
+            elif ref.startswith(".!") or ref.startswith("!"):
+                # I/O tag paths — keep for ControllerBuilder resolution
+                normalized.append((ref, text))
             elif ref.endswith("]"):
-                if ref.startswith("["):
+                if "[" in ref and not ref.startswith("["):
+                    # Member[N] — resolved from !HEXOID[N], keeps dot prefix
+                    normalized.append((f"{tag_name}.{ref}", text))
+                elif ref.startswith("["):
+                    # [N] — bare array element
                     normalized.append((f"{tag_name}{ref}", text))
                 else:
+                    # N] — bare element index (DB should fix to [N])
                     normalized.append((f"{tag_name}[{ref}", text))
             elif ref.isdigit():
                 normalized.append((f"{tag_name}.{ref}", text))
             elif "]." in ref:
-                # Array bit references like "[0].5", "[14].2" — the bracket part doesn't end with ]
-                # because there's a .bit suffix after it.
+                # Array element.member.bit refs like "[0].5", "[0].Flags.1"
                 normalized.append((f"{tag_name}{ref}", text))
+            elif "." in ref and ":" not in ref:
+                # Member.Bit — resolved from hex OID, needs tag name prefix.
+                # For array tags, add [0] since no element index is specified.
+                if dimensions is not None:
+                    normalized.append((f"{tag_name}[0].{ref}", text))
+                else:
+                    normalized.append((f"{tag_name}.{ref}", text))
             else:
                 normalized.append((ref, text))
 

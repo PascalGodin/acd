@@ -3570,12 +3570,16 @@ class DumpCompsRecords(L5xElementBuilder):
             object_id = result[1]
             name = result[0]
             record = result[4]
-            new_path = Path(os.path.join(self.base_directory, name))
+            # Some comp names carry characters that are invalid in Windows paths
+            # (e.g. AB module DataType names like "CHANNEL_DI_TIMESTAMP:O:0").
+            # Sanitize only for filesystem use; log_file output keeps the original name.
+            safe_name = re.sub(r'[<>:"|?*]', "_", name)
+            new_path = Path(os.path.join(self.base_directory, safe_name))
             if os.path.exists(os.path.join(new_path)):
                 shutil.rmtree(os.path.join(new_path))
             if not os.path.exists(os.path.join(new_path)):
                 os.makedirs(new_path)
-            with open(Path(os.path.join(new_path, name + ".dat")), "wb") as file:
+            with open(Path(os.path.join(new_path, safe_name + ".dat")), "wb") as file:
                 log_file.write(
                     f"Class - {struct.unpack_from('<H', result[4], 0xA)[0]} Instance {struct.unpack_from('<H', result[4], 0xC)[0]}- {str(new_path) + '/' + name}\n"
                 )

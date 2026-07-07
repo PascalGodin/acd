@@ -233,7 +233,10 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
 }
 
 # Types for which we emit no Decorated element at all (they use other formats).
-_SKIP_DECORATED: set = {"ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED"}
+_SKIP_DECORATED: set = {
+    "ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED",
+    "AXIS_CIP_DRIVE", "MOTION_GROUP",
+}
 
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
@@ -1108,6 +1111,15 @@ class Tag(L5xElement):
                 f'Dimensions="{self.dimensions.replace(",", " ")}"',
             )
 
+        # An Alias tag never shows its own DataType attribute (it has no
+        # value of its own -- Studio 5000 infers the type from AliasFor) --
+        # verified against real alias tags of multiple underlying types
+        # (REAL, BOOL, ...). Only strip it from the opening tag itself;
+        # self.data_type is still needed internally elsewhere (unused here
+        # since data_xml is skipped entirely for Alias tags below).
+        if self.tag_type == "Alias" and self.data_type:
+            base = re.sub(r'\s*DataType="' + re.escape(self.data_type) + r'"', '', base, count=1)
+
         # --- Description child element ---
         # Find tag-level description: empty tag_reference means the tag itself.
         # Tags with multiple empty-ref entries (e.g. array-element bit descriptions
@@ -1124,9 +1136,12 @@ class Tag(L5xElement):
         # If _initial_value is available for a primitive type, emit <Data Format="Decorated">
         # with the actual values (scalar or array). Otherwise fall through to the default
         # zero-value L5K/Decorated rendering.
+        # Alias tags never get a <Data> element at all (verified against real
+        # alias tags) -- they have no value of their own, only a reference.
         data_xml = ""
+        is_alias = self.tag_type == "Alias"
 
-        if self._initial_value is not None:
+        if not is_alias and self._initial_value is not None:
             dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
             iv = self._initial_value
 
@@ -1234,7 +1249,7 @@ class Tag(L5xElement):
                         f'</Data>'
                     )
 
-        if not data_xml:
+        if not data_xml and not is_alias:
             # Scalar primitives get Format="L5K" only.
             # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
             # nothing here — Decorated is not used for scalar STRING tags).
@@ -2424,24 +2439,33 @@ class TagBuilder(L5xElementBuilder):
         # Extract ExternalAccess and Constant from the raw record at fixed offsets:
         #   raw[0x278]: ExternalAccess enum (0=Read/Write, 2=Read Only, 3=None)
         #   raw[0x279]: Constant flag (0=false, 1=true)
+        # constant_flag is resolved to the final "true"/"false"/None Constant
+        # value further down, once tag_type and data_type are known (Alias
+        # tags and certain opaque built-in types like MESSAGE/AXIS_CIP_DRIVE
+        # never show a Constant attribute at all; every other Base tag shows
+        # it explicitly as "true" or "false" -- verified against a real
+        # project where 3174 of 3205 tags need an explicit Constant="false"
+        # that was previously omitted entirely).
         raw_rec = bytes(results[0][3])
         if len(raw_rec) > 0x279:
             external_access = external_access_enum(raw_rec[0x278])
-            constant = "true" if raw_rec[0x279] else None
+            constant_flag = bool(raw_rec[0x279])
         else:
             external_access = "Read/Write"
-            constant = None
+            constant_flag = False
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
         except Exception as e:
             return Tag(
-                results[0][0], results[0][0], "Base", "", None, external_access, constant, None
+                results[0][0], results[0][0], "Base", "", None, external_access,
+                "true" if constant_flag else "false", None
             )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
             return Tag(
-                results[0][0], results[0][0], "Base", "", None, external_access, constant, None
+                results[0][0], results[0][0], "Base", "", None, external_access,
+                "true" if constant_flag else "false", None
             )
         if r.main_record.data_type == 0xFFFFFFFF:
             data_type = ""
@@ -2625,6 +2649,15 @@ class TagBuilder(L5xElementBuilder):
                     normalized.append((f"{tag_name}{sep}{ref}", text))
             else:
                 normalized.append((ref, text))
+
+        # Constant is omitted entirely for Alias tags (they have no value of
+        # their own) and for opaque built-in types that don't support it
+        # (the same _SKIP_DECORATED set); every other Base tag shows it
+        # explicitly as "true" or "false" (verified against a real project).
+        if tag_type == "Alias" or data_type.upper() in _SKIP_DECORATED:
+            constant: Union[str, None] = None
+        else:
+            constant = "true" if constant_flag else "false"
 
         return Tag(
             tag_name,

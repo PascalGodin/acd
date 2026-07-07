@@ -126,7 +126,7 @@ class CommentsRecord:
                     0,
                     scope_id,
                 )
-            if r.header.record_type in (5, 6, 7, 8, 11, 15, 21):
+            if r.header.record_type in (5, 6, 7, 8, 11, 15, 21, 29):
                 body = bytes(r.body)
                 obj_id = struct.unpack_from("<I", body, 8)[0]
                 tag_ref = ""

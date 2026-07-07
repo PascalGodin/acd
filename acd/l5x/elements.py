@@ -3274,7 +3274,20 @@ class ControllerBuilder(L5xElementBuilder):
                     )
                     if udt_val is not None:
                         tag._initial_value = udt_val
-            if tag.data_type and not tag.name.startswith("$") and not tag.name.startswith("__"):
+            # Exclude internal placeholder/auto-generated tags:
+            #   "$..."      -- hash-named objects (not a valid Rockwell tag-name start
+            #                  character; real tags always start with a letter or "_").
+            #   "__l0"/"__CLONE" -- known Rockwell-internal AOI clone/runtime tag prefixes
+            #                  (same set Tag._l5x_exclude uses). A bare "__" prefix is a
+            #                  legal user tag name (e.g. "__MyFlag") and must NOT be
+            #                  excluded here, or a legitimately-named user tag would be
+            #                  silently dropped from the object model entirely.
+            if (
+                tag.data_type
+                and not tag.name.startswith("$")
+                and not tag.name.startswith("__l0")
+                and not tag.name.startswith("__CLONE")
+            ):
                 tags.append(tag)
 
         # Resolve comment paths to full Studio 5000 addresses for I/O tags

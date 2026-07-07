@@ -707,6 +707,22 @@ def _string_literal_cdata(text: str) -> str:
     return f"<![CDATA['{safe}']]>"
 
 
+def _l5k_string_padded(text: str, capacity: int) -> str:
+    """Format a string value as Rockwell's L5K array-literal string content.
+
+    A scalar STRING/string-family tag's ``Data Format="L5K"`` block encodes
+    the value as ``[LEN,'text$00$00...']`` -- the real text characters
+    followed by one ``$00`` token per unused byte, padded out to the type's
+    full declared capacity (e.g. 82 for the built-in STRING), verified
+    against a real Studio 5000 L5X export. Any literal ``$`` or ``'`` in the
+    text itself is escaped the same way ($-prefixed) per Rockwell's L5K
+    string-literal convention.
+    """
+    escaped = text.replace("$", "$$").replace("'", "$'")
+    pad = "$00" * max(capacity - len(text), 0)
+    return f"'{escaped}{pad}'"
+
+
 def _is_string_family_type(type_name: str, data_types_map: Dict[str, 'DataType']) -> bool:
     """Return True if type_name is the built-in STRING type or a custom
     string-family DataType (e.g. STRING20, STRING64, ...).
@@ -1114,7 +1130,24 @@ class Tag(L5xElement):
             dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
             iv = self._initial_value
 
-            if isinstance(iv, dict):
+            if not self.dimensions and isinstance(iv, dict) and _is_string_family_type(dt_base, self._data_types_map):
+                # Scalar string-family tag (built-in STRING or a custom type
+                # like STRING_20): Studio 5000 never uses Decorated for these
+                # -- only Data Format="L5K" (array-literal [LEN,'text...'],
+                # padded with $00 to the type's full capacity) and a separate
+                # Data Format="String" Length="N" block with the plain quoted
+                # text, verified against a real scalar STRING tag's L5X.
+                length = iv.get("LEN", 0)
+                text = iv.get("DATA", "")
+                cap = _string_family_capacity(dt_base, self._data_types_map)
+                l5k_body = f"[{length},{_l5k_string_padded(text, cap)}]"
+                data_xml = (
+                    f'<Data Format="L5K">\n<![CDATA[{l5k_body}]]>\n</Data>'
+                    f'<Data Format="String" Length="{length}">\n'
+                    f'{_string_literal_cdata(text)}\n</Data>'
+                )
+
+            elif isinstance(iv, dict):
                 # UDT scalar
                 body = (
                     f'<Structure DataType="{dt_base}">'

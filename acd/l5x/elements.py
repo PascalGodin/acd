@@ -11,6 +11,8 @@ from pathlib import Path
 from sqlite3 import Cursor
 from typing import List, Tuple, Dict, Union
 
+from loguru import logger as log
+
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
 from acd.l5x.port_structures import PORT_STRUCTURES
@@ -319,7 +321,8 @@ def _struct_members_xml(dt_name: str, data_types_map: Dict[str, "DataType"]) -> 
     if _is_string_family_type(dt_name, data_types_map):
         return (
             '<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="0"/>'
-            f'<DataValueMember Name="DATA" DataType="{dt_name}" Radix="ASCII">\n\n</DataValueMember>'
+            f'<DataValueMember Name="DATA" DataType="{dt_name}" Radix="ASCII">'
+            f'{_string_literal_cdata("")}</DataValueMember>'
         )
 
     # Built-in struct types (TIMER, COUNTER, CONTROL)
@@ -507,6 +510,20 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
     ``<ArrayMember>``, and ``<StructureMember>`` elements (no outer
     ``<Structure>`` wrapper).
     """
+    # String-family types (built-in STRING or a custom type like STRING_20)
+    # are always represented as {"LEN": int, "DATA": str} regardless of
+    # nesting level (top-level tag, array element, or member nested inside
+    # another struct) -- render the same LEN/DATA shape used everywhere else,
+    # with the DATA member's DataType matching the outer type's own name.
+    if _is_string_family_type(dt_name, data_types_map):
+        length = values.get("LEN", 0)
+        text = values.get("DATA", "")
+        return (
+            f'<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="{length}"/>'
+            f'<DataValueMember Name="DATA" DataType="{dt_name}" Radix="ASCII">'
+            f'{_string_literal_cdata(text)}</DataValueMember>'
+        )
+
     dt_obj = data_types_map.get(dt_name.upper())
     if dt_obj is None:
         return ""
@@ -544,14 +561,6 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
                 f'{"".join(inner_parts)}</ArrayMember>'
             )
 
-        elif isinstance(val, list) and _is_string_family_type(mdt_upper, data_types_map):
-            # Array of STRING / custom string-family type elements
-            for i, v in enumerate(val):
-                parts.append(
-                    f'<StringValueMember Name="{mname}[{i}]" DataType="{mdt}" Radix="ASCII">'
-                    f'{_escape_xml_attr(v)}</StringValueMember>'
-                )
-
         elif isinstance(val, list):
             # Array of primitives
             radix = _PRIMITIVE_RADIX.get(mdt_upper, "Decimal")
@@ -563,12 +572,6 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
                 f'<ArrayMember Name="{mname}" DataType="{mdt}" '
                 f'Dimensions="{len(val)}" Radix="{radix}">'
                 f'{elems}</ArrayMember>'
-            )
-
-        elif _is_string_family_type(mdt_upper, data_types_map):
-            parts.append(
-                f'<DataValueMember Name="{mname}" DataType="{mdt}" Radix="ASCII">'
-                f'{_escape_xml_attr(val)}</DataValueMember>'
             )
 
         elif mdt_upper in ("BOOL", "BIT"):
@@ -632,6 +635,23 @@ _PRIM = {
 
 # Logix STRING struct: DINT LEN (4 bytes) + SINT[82] DATA (82 bytes) + 2 bytes padding.
 _STRING_SIZE = 88
+
+
+def _string_literal_cdata(text: str) -> str:
+    """Format a decoded string value as Rockwell's quoted-literal CDATA content.
+
+    Studio 5000 renders a non-empty STRING/string-family DATA member's text
+    as ``<![CDATA['the text']]>`` -- wrapped in a CDATA section AND in
+    literal single quotes (matching its L5K string-literal convention), with
+    any embedded single quote doubled (Pascal/Ada-style escaping). An empty
+    string renders as bare ``<![CDATA[]]>`` with no quotes at all. Both
+    verified against a real Studio 5000 L5X export.
+    """
+    if not text:
+        return "<![CDATA[]]>"
+    escaped = text.replace("'", "''")
+    safe = Tag._sanitize_xml_text(escaped)
+    return f"<![CDATA['{safe}']]>"
 
 
 def _is_string_family_type(type_name: str, data_types_map: Dict[str, 'DataType']) -> bool:
@@ -755,10 +775,13 @@ def _decode_udt_initial_value(
 ) -> Union[dict, list, None]:
     """Decode initial values for a struct-typed tag from the data table blob.
 
-    Works for any DataType found in data_types_map -- user-defined UDTs as well
-    as Rockwell "ProductDefined"/module-defined types (e.g. AB:1794_IB32:I:0),
-    since both are read from the same generic member/byte_offset structure and
-    the same data-table blob layout (verified against real module I/O data).
+    Works for any DataType found in data_types_map -- user-defined UDTs,
+    Rockwell "ProductDefined"/module-defined types (e.g. AB:1794_IB32:I:0),
+    and string-family types (built-in STRING or a custom type like
+    STRING_20, decoded to {"LEN": int, "DATA": str}) -- since all of these
+    are read from the same generic member/byte_offset structure and the
+    same data-table blob layout (verified against real project data,
+    including a real non-blank custom string-family array tag).
 
     Returns a dict for scalar structs, a list of dicts for struct arrays,
     or None if the type is unknown or cannot be decoded.
@@ -771,16 +794,6 @@ def _decode_udt_initial_value(
     base_dt = re.sub(r'\[.*\]', '', data_type_name).strip()
     dt_obj = data_types_map.get(base_dt.upper())
     if dt_obj is None:
-        return None
-    if dt_obj.family == "StringFamily":
-        # A tag whose own top-level type is a string-family type (e.g. a
-        # scalar/array STRING20 tag) isn't handled here yet -- there's no
-        # verified reference for how Studio 5000 renders that case in
-        # Decorated XML at the top level (as opposed to a STRING-family
-        # *member* nested inside a UDT, which is decoded/rendered correctly
-        # elsewhere). Skip rather than guess, matching the existing behavior
-        # for the built-in STRING type (which was never reachable here at
-        # all, since it has no ACD DataType record of its own).
         return None
 
     cur.execute(
@@ -810,6 +823,29 @@ def _decode_udt_initial_value(
     return results
 
 
+def _decode_string_family_value(
+    blob: bytes, offset: int, type_name: str, data_types_map: Dict[str, 'DataType'],
+) -> dict:
+    """Decode a string-family struct's LEN+DATA fields from *blob* at *offset*.
+
+    Returns {"LEN": int, "DATA": str} -- the same shape Studio 5000 uses to
+    represent a STRING/string-family value at any nesting level (top-level
+    tag, array element, or a member nested inside another struct), so the
+    generic UDT-rendering code can treat it identically everywhere via
+    _udt_scalar_to_xml's own string-family check.
+    """
+    cap = _string_family_capacity(type_name, data_types_map)
+    if offset + 4 > len(blob):
+        return {"LEN": 0, "DATA": ""}
+    length = struct.unpack_from("<i", blob, offset)[0]
+    length = max(0, min(length, cap))
+    text = ""
+    if offset + 4 + length <= len(blob):
+        raw = blob[offset + 4: offset + 4 + length]
+        text = raw.decode("utf-8", errors="replace")
+    return {"LEN": length, "DATA": text}
+
+
 def _decode_single_udt_element(
     blob: bytes,
     base_offset: int,
@@ -825,6 +861,9 @@ def _decode_single_udt_element(
     """
     if depth > _max_depth:
         return {}
+
+    if data_type.family == "StringFamily":
+        return _decode_string_family_value(blob, base_offset, data_type.name, data_types_map)
 
     result: dict = {}
     for member in data_type.members:
@@ -870,8 +909,12 @@ def _decode_scalar_member(
 ):
     """Decode a single scalar member value from *blob* at *offset*.
 
-    Handles primitives, STRING, and nested UDTs.  Returns 0 for
-    out-of-range reads, ``None`` for unknown types.
+    Handles primitives and nested UDTs directly. String-family types
+    (built-in STRING or a custom type like STRING_20) return a
+    {"LEN": int, "DATA": str} dict -- the same shape used at every other
+    nesting level -- rather than a bare string, so callers always get a
+    consistent struct-like value for any string-family type.
+    Returns 0 for out-of-range primitive reads, ``None`` for unknown types.
 
     When *bit_number* is provided for a BOOL member, extracts that
     specific bit from the packed byte (Logix packs 8 BOOLs per byte
@@ -889,15 +932,7 @@ def _decode_scalar_member(
         return 0
 
     if _is_string_family_type(mdt_upper, data_types_map):
-        cap = _string_family_capacity(mdt_upper, data_types_map)
-        if offset + 4 > len(blob):
-            return ""
-        length = struct.unpack_from("<i", blob, offset)[0]
-        length = max(0, min(length, cap))
-        if offset + 4 + length > len(blob):
-            return ""
-        raw = blob[offset + 4: offset + 4 + length]
-        return raw.decode("utf-8", errors="replace")
+        return _decode_string_family_value(blob, offset, data_type, data_types_map)
 
     dt_obj = data_types_map.get(mdt_upper)
     if dt_obj is not None and depth <= 3:
@@ -2176,14 +2211,24 @@ class ModuleBuilder(L5xElementBuilder):
         for (conn_name, conn_rec) in self._cur.fetchall():
             conn_raw = bytes(conn_rec)
             conn_type = None
+            code = None
             if len(conn_raw) >= 92:
                 code = struct.unpack_from("<H", conn_raw, 90)[0]
                 conn_type = _CONNECTION_TYPE_BY_CODE.get(code)
             if conn_type is None:
-                # Unrecognized code or too-short record: fall back to the
-                # old name-based heuristic rather than guessing wrong.
+                # Unrecognized code (or too-short record): fall back to the
+                # old name-based heuristic rather than guessing wrong, but
+                # surface it so new codes can be identified and added to
+                # _CONNECTION_TYPE_BY_CODE instead of silently mis-guessed.
                 name_lower = conn_name.lower()
                 conn_type = "Output" if ("output" in name_lower or name_lower == "config") else "Input"
+                log.warning(
+                    "Unrecognized connection type code {} for connection '{}' on module "
+                    "'{}' (record length {}) -- falling back to name heuristic, guessed "
+                    "'{}'. Please report this so the code can be added to "
+                    "_CONNECTION_TYPE_BY_CODE.",
+                    code, conn_name, name, len(conn_raw), conn_type,
+                )
             connections.append((conn_name, "0.0", conn_type))
 
         return Module(

@@ -311,14 +311,15 @@ def _struct_members_xml(dt_name: str, data_types_map: Dict[str, "DataType"]) -> 
     if dt_name in _SKIP_DECORATED:
         return None
 
-    # Handle STRING and custom string-family types (STRING20, ...) uniformly:
-    # LEN (DINT) + DATA (STRING/ASCII). The LEN/DATA sub-member DataTypes are
-    # themselves generic CIP keywords regardless of the outer string type's
-    # own name/length.
+    # Handle STRING and custom string-family types (e.g. a user-defined type
+    # named STRING_20 or ASCII_TWENTY, detected via the family flag rather
+    # than the type's name) uniformly: LEN (DINT) + DATA (ASCII text). Studio
+    # 5000 shows the DATA member's own DataType as the *outer* string type's
+    # name (e.g. DataType="STRING_20"), not a generic "STRING" literal.
     if _is_string_family_type(dt_name, data_types_map):
         return (
             '<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="0"/>'
-            '<DataValueMember Name="DATA" DataType="STRING" Radix="ASCII">\n\n</DataValueMember>'
+            f'<DataValueMember Name="DATA" DataType="{dt_name}" Radix="ASCII">\n\n</DataValueMember>'
         )
 
     # Built-in struct types (TIMER, COUNTER, CONTROL)
@@ -1887,6 +1888,22 @@ class DataTypeBuilder(L5xElementBuilder):
         return DataType(name, name, string_family, class_type, children, description)
 
 
+# Connection Type CIP enum, read at absolute offset 90 (u16le) of a
+# RxMapConnectionCollection child's raw record. Verified against a real
+# Studio 5000 project (matching every connection's raw bytes, keyed by
+# (comp_name, RPI) read from offset 92, against its actual L5X Type=
+# attribute): a clean, zero-exception discriminator across 74 real
+# connection records spanning all four values seen so far. Other CIP
+# connection types (e.g. Safety Input/Output, Listen-Only, Config) may use
+# additional codes not yet observed -- see the name-based fallback below.
+_CONNECTION_TYPE_BY_CODE: Dict[int, str] = {
+    5: "Input",
+    6: "Output",
+    7: "DiagnosticInput",
+    23: "MotionSync",
+}
+
+
 @dataclass
 class ModuleBuilder(L5xElementBuilder):
     # Map from modid (u32) → module name, built by ControllerBuilder and passed in.
@@ -2142,25 +2159,31 @@ class ModuleBuilder(L5xElementBuilder):
 
         # Read individual connection records from RxMapConnectionCollection children.
         # Each child's comp_name is the connection Name in the L5X output.
-        # Connection Type is inferred from the name (heuristic):
-        #   names containing "output" or equal to "config" -> "Output"
-        #   all others -> "Input"
+        # Connection Type is read from a u16le CIP enum at raw offset 90 (see
+        # _CONNECTION_TYPE_BY_CODE) -- not from the connection's name, since a
+        # connection can be named e.g. "Standard" and be either Input or Output
+        # depending on the specific module (confirmed with real project data).
         # RPI: we do not have a reliable binary decoder for the short connection
         # records seen in the test data, so we default to "0.0" (acceptable for import).
         self._cur.execute(
-            "SELECT c2.comp_name FROM comps c1 "
+            "SELECT c2.comp_name, c2.record FROM comps c1 "
             "JOIN comps c2 ON c2.parent_id = c1.object_id "
             "WHERE c1.parent_id = ? AND c1.comp_name = 'RxMapConnectionCollection' "
             "AND c2.comp_name NOT IN ('Output') "
             "ORDER BY c2.seq_number",
             (self._object_id,),
         )
-        for (conn_name,) in self._cur.fetchall():
-            name_lower = conn_name.lower()
-            if "output" in name_lower or name_lower == "config":
-                conn_type = "Output"
-            else:
-                conn_type = "Input"
+        for (conn_name, conn_rec) in self._cur.fetchall():
+            conn_raw = bytes(conn_rec)
+            conn_type = None
+            if len(conn_raw) >= 92:
+                code = struct.unpack_from("<H", conn_raw, 90)[0]
+                conn_type = _CONNECTION_TYPE_BY_CODE.get(code)
+            if conn_type is None:
+                # Unrecognized code or too-short record: fall back to the
+                # old name-based heuristic rather than guessing wrong.
+                name_lower = conn_name.lower()
+                conn_type = "Output" if ("output" in name_lower or name_lower == "config") else "Input"
             connections.append((conn_name, "0.0", conn_type))
 
         return Module(

@@ -132,7 +132,14 @@ class ExportL5x:
         )
         comments_db = DbExtract(os.path.join(self._temp_dir, "Comments.Dat")).read()
         comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record)) is not None]
-        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
+        # Deduplicate: for same (parent, tag_reference), keep the one with the longest description
+        # (preferring more descriptive type-6/7 records over shorter ones).
+        seen: Dict[tuple, tuple] = {}
+        for t in comment_tuples:
+            key = (t[5], t[6])
+            if key not in seen or len(t[3]) > len(seen[key][3]):
+                seen[key] = t
+        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", seen.values())
         self._db.commit()
 
         log.info(

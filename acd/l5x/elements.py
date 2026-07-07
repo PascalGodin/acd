@@ -157,7 +157,8 @@ class DataType(L5xElement):
         base = super().to_xml()
         if not self._description:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+        desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
@@ -352,12 +353,38 @@ def _struct_members_xml(dt_name: str, data_types_map: Dict[str, "DataType"]) -> 
     return "".join(parts)
 
 
+def _build_elem_comments(tag_name: str, comments: List[Tuple[str, str]]) -> Dict[int, List[str]]:
+    """Build a mapping from array element index to list of comment texts.
+
+    Matches comment refs like ``tag_name[14]`` or ``tag_name[0].5``
+    to the element index (the ``N`` in ``[N]``).
+    """
+    result: Dict[int, List[str]] = {}
+    for ref, text in comments:
+        if not ref or ref == ".":
+            continue
+        if ref.startswith(tag_name):
+            suffix = ref[len(tag_name):]
+            if suffix.startswith("["):
+                end_bracket = suffix.find("]")
+                if end_bracket > 0:
+                    try:
+                        idx = int(suffix[1:end_bracket])
+                        result.setdefault(idx, []).append(text)
+                    except ValueError:
+                        pass
+    return result
+
+
 def _generate_decorated(dt_base: str, dimensions: Union[str, None],
-                        data_types_map: Dict[str, "DataType"]) -> str:
+                        data_types_map: Dict[str, "DataType"],
+                        tag_name: str = "", comments: Union[List[Tuple[str, str]], None] = None) -> str:
     """Generate a complete <Data Format="Decorated"> XML string for a tag.
 
     dt_base:    the base DataType name (uppercase, array brackets already stripped)
     dimensions: comma-separated dimension string (e.g. "100" or "4,8") or None for scalar
+    tag_name:   the owning tag name (used for comment matching)
+    comments:   list of (ref, text) tuples from the tag's _comments field
     Returns "" if this type should not have a Decorated element.
     """
     if dt_base in _SKIP_DECORATED:
@@ -428,6 +455,24 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
                 )
             elems = _struct_elems([], dim_parts)
             body = f'<Array DataType="{dt_base}" Dimensions="{dim_str}">{elems}</Array>'
+
+    # Inject <Comment> children for array elements that have inline comments.
+    elem_comments = _build_elem_comments(tag_name, comments) if comments else {}
+    if comments and tag_name and elem_comments:
+        def _inject_comment(m):
+            idx_str = m.group(1)
+            try:
+                idx = int(idx_str)
+                if idx in elem_comments:
+                    cxml = "".join(
+                        f'<Comment><![CDATA[{c}]]></Comment>' for c in elem_comments[idx]
+                    )
+                    return f'<Element Index="[{idx}]">{cxml}</Element>'
+            except ValueError:
+                pass
+            return m.group(0)
+
+        body = re.sub(r'<Element Index="\[(\d+)\]"\s*/>', _inject_comment, body)
 
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
@@ -949,10 +994,27 @@ class Tag(L5xElement):
                             return f"{val:.6g}"
                         return str(int(val))
 
-                    elems = "".join(
-                        f'<Element Index="[{i}]" Value="{_fmt_elem_val(iv[i])}"/>'
-                        for i in range(non_zero_end)
-                    )
+                    _elem_comments = _build_elem_comments(self.name, self._comments) if self._comments else {}
+                    def _fmt_element_comment(c):
+                        c = " ".join(c.replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip()
+                        return self._sanitize_xml_text(c)
+                    elems_parts = []
+                    for i in range(non_zero_end):
+                        comments = _elem_comments.get(i, [])
+                        val_attr = f'Value="{_fmt_elem_val(iv[i])}"'
+                        if comments:
+                            comment_xml = "".join(
+                                f'<Comment><![CDATA[{_fmt_element_comment(c)}]]></Comment>'
+                                for c in comments
+                            )
+                            elems_parts.append(
+                                f'<Element Index="[{i}]" {val_attr}>{comment_xml}</Element>'
+                            )
+                        else:
+                            elems_parts.append(
+                                f'<Element Index="[{i}]" {val_attr}/>'
+                            )
+                    elems = "".join(elems_parts)
                     dim_str = self.dimensions or "1"
                     data_xml = (
                         f'<Data Format="Decorated">\n'
@@ -987,7 +1049,10 @@ class Tag(L5xElement):
 
             if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
                 # Generate Decorated data for non-primitive / array types
-                decorated = _generate_decorated(dt_base, self.dimensions, self._data_types_map)
+                decorated = _generate_decorated(
+                    dt_base, self.dimensions, self._data_types_map,
+                    tag_name=self.name, comments=self._comments,
+                )
                 if decorated:
                     data_xml = decorated
 
@@ -1028,7 +1093,8 @@ class LocalTag(L5xElement):
         base = super().to_xml()
         if not self._description:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+        desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
@@ -1063,7 +1129,8 @@ class Parameter(L5xElement):
         base = super().to_xml()
         if not self._description:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+        desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
@@ -1120,7 +1187,8 @@ class Module(L5xElement):
         # Optional <Description>
         desc_xml = ""
         if self._description:
-            desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+            desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+            desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
 
         ekey = f'<EKey State="{self._ekey_state}"/>'
         ports = self._build_ports_xml()
@@ -1282,7 +1350,7 @@ class Routine(L5xElement):
                     continue
                 comment_xml = ""
                 if i in self._rung_comments:
-                    comment_text = self._rung_comments[i]
+                    comment_text = self._rung_comments[i].replace('\r\n', '\n').replace('\r', '\n')
                     comment_xml = f'<Comment><![CDATA[{comment_text}]]></Comment>'
                 rung_xmls.append(
                     f'<Rung Number="{i}" Type="N">'
@@ -1324,9 +1392,11 @@ class AOI(L5xElement):
         idx = base.index(">")
         inject = ""
         if self._description:
-            inject += f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+            desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+            inject += f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         if self._revision_note:
-            inject += f'<RevisionNote>\n<![CDATA[{self._revision_note}]]>\n</RevisionNote>'
+            note = ' '.join(self._revision_note.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+            inject += f'<RevisionNote>\n<![CDATA[{note}]]>\n</RevisionNote>'
         return base[:idx + 1] + inject + base[idx + 1:]
 
 
@@ -2243,9 +2313,16 @@ class TagBuilder(L5xElementBuilder):
             if not ref:
                 normalized.append((ref, text))
             elif ref.endswith("]"):
-                normalized.append((f"{tag_name}[{ref}", text))
+                if ref.startswith("["):
+                    normalized.append((f"{tag_name}{ref}", text))
+                else:
+                    normalized.append((f"{tag_name}[{ref}", text))
             elif ref.isdigit():
                 normalized.append((f"{tag_name}.{ref}", text))
+            elif "]." in ref:
+                # Array bit references like "[0].5", "[14].2" — the bracket part doesn't end with ]
+                # because there's a .bit suffix after it.
+                normalized.append((f"{tag_name}{ref}", text))
             else:
                 normalized.append((ref, text))
 

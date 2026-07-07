@@ -86,6 +86,44 @@ For UDT-typed tags the initial value is a `dict` (scalar) or `list[dict]` (array
 
 ---
 
+### Tag and per-element/per-bit descriptions
+
+Whole-tag descriptions are available via the `description` property:
+
+```python
+tag = controller.tags[0]
+print(tag.description)   # e.g. "Bin Status" (multi-line text is word-wrapped to one line)
+```
+
+Per-element and per-bit comments (the same ones Studio 5000 shows as `<Comment Operand="...">`
+entries in an L5X export) are available as `(path, text)` tuples on `tag._comments`, already
+resolved to full Studio 5000 addresses:
+
+```python
+for path, text in tag._comments:
+    if path:   # empty path == the tag-level description, already covered by .description
+        print(f"{path}: {text}")
+
+# e.g.:
+#   HTV_BStatus_Status[10].11: Tally Package Accumulating
+#   Local:10:I.Data.13: Grader 13' PE
+#   IO074:I.Data[0].0: Tray 4 / Accumulation / Motor Aux.
+#   SorterStatusToGradeScan.SorterFeedback.UsingScanSolution: Should Be 1 if...
+```
+
+I/O module tags (name contains `:`) are also available separately via `controller.io_tags`,
+and alias tags via `controller.alias_tags`:
+
+```python
+for tag in controller.io_tags:
+    print(tag.name, tag.data_type)
+
+for alias in controller.alias_tags:
+    print(f"{alias.name} -> {alias.target}")
+```
+
+---
+
 ### Convert ACD to L5X
 
 Export the parsed project as an L5X XML file (importable by Studio 5000):

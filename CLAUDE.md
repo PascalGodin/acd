@@ -61,11 +61,24 @@ byte offsets out of it (via `struct.unpack_from`), and construct the correspondi
 **Everything is binary-offset-driven, not name-driven.** A new/unfamiliar UDT, tag, or AOI
 needs zero code changes to parse correctly — `DataTypeBuilder`/`MemberBuilder` read `dimension`,
 `data_type`, `bit_number`, etc. from fixed offsets in the raw record for every UDT, whatever
-it's called. The **only** name-based heuristic anywhere in the parsing pipeline is in
-`ControllerBuilder`'s I/O comment-resolution block (`elements.py`, search for `"FAULT", "STATUS"`)
-which excludes members literally named `Fault`/`Status` when guessing which member of an I/O
-module's UDT is "the data member" for legacy bit-comment resolution — scoped narrowly to that
-one use case, not to tag/UDT typing in general.
+it's called, including Rockwell "ProductDefined"/module-defined types and string-family types
+(`STRING`, or a custom type like `STRING_20` detected via the `family` flag, never by matching
+the type's own name — a type could just as easily be named `ASCII_TWENTY`). The **only**
+name-based heuristics anywhere in the parsing pipeline are:
+- `ControllerBuilder`'s I/O comment-resolution block (`elements.py`, search for `"FAULT",
+  "STATUS"`), which excludes members literally named `Fault`/`Status` when guessing which
+  member of an I/O module's UDT is "the data member" for legacy bit-comment resolution —
+  scoped narrowly to that one use case, not to tag/UDT typing in general.
+- `ModuleBuilder`'s connection-type name-heuristic fallback (see `_CONNECTION_TYPE_BY_CODE`),
+  used only when a connection record's type-code byte is unrecognized or the record is too
+  short — the primary path reads a real binary enum (see below), logging a warning when it
+  falls back so unrecognized codes don't silently get mis-guessed.
+
+**When you find a classification that currently has to guess from a name** (like the
+connection-type heuristic did until it was replaced), look harder for a real discriminating
+byte/flag before accepting the heuristic as final — see "Connection Type" below for the method
+that worked, and consider adding a `log.warning()` (loguru, already used in this file) on the
+fallback path so future unrecognized cases are visible instead of silently mis-guessed.
 
 ## Comment / description resolution — read this before touching `comments.py` or `_comments`
 
@@ -87,15 +100,26 @@ L5X, or the tag's `<Description>`). Getting the full address (`Tag[3].Flags.2`, 
    what's being described (see `record_type` handling in `acd/record/comments.py`):
    - `1`/`2` (AsciiRecord): whole-tag/whole-object descriptions and rung comments.
    - `3`/`4`/`13`/`14` (Kaitai `Utf16Record`): standard structured Kaitai-dispatched types.
-   - `5`/`6`/`7`/`8`/`11`/`15`: array/bit operand descriptions with an identical hand-parsed
-     layout (`unknown(8) + obj_id(u4) + unknown(4) + utf16 tag_ref + ascii text`) — **not**
-     dispatched by the Kaitai `.ksy` file, parsed by hand in `comments.py`. If you find a new
-     numbered type with this same byte shape, just add it to this tuple.
+   - `5`/`6`/`7`/`8`/`11`/`15`/`19`/`24`/`29`/`30`/`37`/`39`: array/bit operand descriptions with
+     an identical hand-parsed layout (`unknown(8, scope_id at [2:4]) + obj_id(u4 at [8:12]) +
+     unknown(4) + utf16 tag_ref + ascii text`) — **not** dispatched by the Kaitai `.ksy` file,
+     parsed by hand in `comments.py`. This list was built incrementally by finding real examples
+     of each shape in an actual project and confirming the byte layout matched; if you find a
+     new numbered type with this same byte shape (8-byte header, obj_id at offset 8), just add
+     it to this tuple — don't assume the list above is exhaustive, more probably exist.
+     `tag_reference` can be an arbitrarily long chain of `!HEXOID` references (one per nesting
+     level) plus array indices (including multi-dimensional, comma-separated: `[2,2,1]`) and a
+     trailing bit number, e.g. `"[1].!HEXOID1[1].!HEXOID2.9"` for
+     `Tag[1].Member1[1].Member2.9` — already handled correctly by the existing multi-match
+     hex-OID regex once the record type itself is recognized; no per-shape resolution logic
+     needed, just recognize the type.
+   - `19` is **overloaded**: most instances are genuine tag comments (as above), but some carry
+     AOI edit-history metadata instead (a literal `tag_reference` of `"UDI_LAST_EDITED_BY"` with
+     a username/computer string as the text, parallel to the `12`/`UDI_HISTORY` handling below).
+     Verified these don't collide with any real tag's `(parent, scope_id)`, so no extra
+     filtering was added — but re-check this if you ever see a `UDI_LAST_EDITED_BY` string leak
+     into `Tag._comments`.
    - `16`/`17`: similar but with `obj_id` at a different offset (6, not 8).
-   - `21`: same hand-parsed layout as 5/6/7/8/11/15, but its `tag_reference` can be a
-     **double-chained** `!HEXOID1.!HEXOID2` reference (nested UDT member paths like
-     `Tag.Member1.Member2`) — already handled correctly by the existing multi-match hex-OID
-     regex once the record type is recognized.
    - `12`: UDI metadata (AOI RevisionNote) — different, unrelated layout.
 4. **Hex-OID resolution.** References like `!06DC4E61` or `.!06DC4E61.!0751B500` are object IDs
    into `RxTypeMemberCollection`; `_build_hex_oid_map()` in `elements.py` resolves them to member
@@ -110,6 +134,19 @@ L5X, or the tag's `<Description>`). Getting the full address (`Tag[3].Flags.2`, 
      excludes *both* `[` and digits, or it can match mid-way through a 2+-digit number and
      corrupt it (this was a real regression: `(?<!\[)` alone matched inside `"[10]"`, producing
      `"[1[0]"`).
+   - Comma-separated multi-dimensional indices (`[2,2,1]`) — the same lookbehind must *also*
+     exclude a comma, or it mis-fires on the last component of an already-correct index (`"1]"`
+     preceded by `,` looks just like a bare missing-bracket case otherwise), corrupting
+     `"[2,2,1]"` into `"[2,2,[1]"`.
+   - String-family values (`STRING`, or a custom type like `STRING_20`) are represented
+     identically at every nesting level — top-level tag, array element, or a member nested
+     inside another struct — as `{"LEN": int, "DATA": str}`, rendered as a `Structure`/
+     `StructureMember` with separate `LEN` (DINT) and `DATA` (ASCII) `DataValueMember`s. Never
+     represent a string value as a bare/flat string internally — every consumer (XML rendering,
+     comment-path matching for `.DATA[N]`/`.DATA[N].bit`) expects this dict shape, verified
+     against a real non-blank custom string-family array tag. The `DATA` member's own text
+     content is further wrapped as `<![CDATA['text']]>` (quoted L5K-style literal) when
+     non-empty, or bare `<![CDATA[]]>` (no quotes) when empty — see `_string_literal_cdata()`.
 
 **When verifying comment/description output, don't trust any pre-built "reference" JSON/index
 a downstream project might hand you** (e.g. something like `ref.json` derived from an L5X/CSV
@@ -121,6 +158,22 @@ Studio 5000 "Export Tags" CSV's `COMMENT`/`TAG` rows. Don't assume either is alr
 the working directory — if you need to verify comment/description output and don't have one,
 ask the user to export a fresh L5X (File > Save As / Export) and/or tag CSV report from Studio
 5000 for the specific ACD under test.
+
+## Connection Type / RPI (Module builder)
+
+`ModuleBuilder` reads each I/O connection's Type (Input/Output/DiagnosticInput/MotionSync/...)
+from a real u16le CIP enum at raw offset 90, and its RPI (microseconds) from a u32le
+immediately after it at offset 92 — not from the connection's name. The connection's own name
+(e.g. `"Standard"`) gives **no reliable signal**: in a real project, most `"Standard"`
+connections were `Type="Output"` while a couple were `Type="Input"`. If you ever need to
+reverse-engineer a similar "guess from name" situation, the method that worked here: collect
+every real `<Connection Name=... RPI=... Type=...>` from a project's own L5X export, match each
+one to its raw ACD record (RPI is a convenient unique-ish key to match on), then scan every byte
+offset for one whose value is constant within each `Type=` group and differs across groups — a
+real 1-byte/2-byte enum will show up as a clean, zero-exception discriminator immediately.
+`_CONNECTION_TYPE_BY_CODE` only has the codes seen so far (5/6/7/23); unrecognized codes log a
+`log.warning()` and fall back to the old name heuristic rather than silently guessing — check
+the logs if you ever suspect a module's connection Type is wrong.
 
 ## Known limitations / things not implemented
 

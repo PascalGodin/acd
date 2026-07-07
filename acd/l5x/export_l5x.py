@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sqlite3
 import struct
 from dataclasses import dataclass
@@ -132,6 +133,8 @@ class ExportL5x:
         )
         comments_db = DbExtract(os.path.join(self._temp_dir, "Comments.Dat")).read()
         comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record)) is not None]
+        # Fix garbled "N]" -> "[N]" in tag_references (missing opening bracket).
+        comment_tuples = [self._normalize_comment(t) for t in comment_tuples]
         # Deduplicate: for same (parent, tag_reference), keep the one with the longest description
         # (preferring more descriptive type-6/7 records over shorter ones).
         seen: Dict[tuple, tuple] = {}
@@ -158,6 +161,21 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()
+
+    @staticmethod
+    def _normalize_comment(t: tuple) -> tuple:
+        """Normalize comment tag_reference: fix garbled \"N]\" -> \"[N]\".
+        Hex OID resolution is handled by TagBuilder (non-I/O tags).
+        """
+        seq, sub_len, obj_id, text, rec_type, parent, tag_ref, rung, member = t
+        if not tag_ref:
+            return t
+
+        new_ref = re.sub(r'(?<!\[)(\d+])', r'[\1', tag_ref)
+
+        if new_ref != tag_ref:
+            return (seq, sub_len, obj_id, text, rec_type, parent, new_ref, rung, member)
+        return t
 
     @property
     def controller(self):

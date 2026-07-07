@@ -175,7 +175,12 @@ class ExportL5x:
         if not tag_ref:
             return t
 
-        new_ref = re.sub(r'(?<![\[\d])(\d+])', r'[\1', tag_ref)
+        # The lookbehind excludes "[", a digit, AND "," so this only matches a
+        # digit-run at the true start of a bare/garbled index (e.g. "10]" with
+        # no opening bracket at all) -- not the last component of an
+        # already-bracketed multi-dimensional index like "[2,2,1]", where the
+        # "1]" segment is preceded by a comma, not a missing bracket.
+        new_ref = re.sub(r'(?<![\[\d,])(\d+])', r'[\1', tag_ref)
 
         if new_ref != tag_ref:
             return (seq, sub_len, obj_id, text, rec_type, parent, new_ref, rung, member, scope_id)

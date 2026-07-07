@@ -311,8 +311,11 @@ def _struct_members_xml(dt_name: str, data_types_map: Dict[str, "DataType"]) -> 
     if dt_name in _SKIP_DECORATED:
         return None
 
-    # Handle STRING as a special built-in: LEN (DINT) + DATA (STRING/ASCII)
-    if dt_name == "STRING":
+    # Handle STRING and custom string-family types (STRING20, ...) uniformly:
+    # LEN (DINT) + DATA (STRING/ASCII). The LEN/DATA sub-member DataTypes are
+    # themselves generic CIP keywords regardless of the outer string type's
+    # own name/length.
+    if _is_string_family_type(dt_name, data_types_map):
         return (
             '<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="0"/>'
             '<DataValueMember Name="DATA" DataType="STRING" Radix="ASCII">\n\n</DataValueMember>'
@@ -540,11 +543,11 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
                 f'{"".join(inner_parts)}</ArrayMember>'
             )
 
-        elif isinstance(val, list) and mdt_upper == "STRING":
-            # Array of STRINGs
+        elif isinstance(val, list) and _is_string_family_type(mdt_upper, data_types_map):
+            # Array of STRING / custom string-family type elements
             for i, v in enumerate(val):
                 parts.append(
-                    f'<StringValueMember Name="{mname}[{i}]" DataType="STRING" Radix="ASCII">'
+                    f'<StringValueMember Name="{mname}[{i}]" DataType="{mdt}" Radix="ASCII">'
                     f'{_escape_xml_attr(v)}</StringValueMember>'
                 )
 
@@ -561,9 +564,9 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
                 f'{elems}</ArrayMember>'
             )
 
-        elif mdt_upper == "STRING":
+        elif _is_string_family_type(mdt_upper, data_types_map):
             parts.append(
-                f'<DataValueMember Name="{mname}" DataType="STRING" Radix="ASCII">'
+                f'<DataValueMember Name="{mname}" DataType="{mdt}" Radix="ASCII">'
                 f'{_escape_xml_attr(val)}</DataValueMember>'
             )
 
@@ -628,6 +631,40 @@ _PRIM = {
 
 # Logix STRING struct: DINT LEN (4 bytes) + SINT[82] DATA (82 bytes) + 2 bytes padding.
 _STRING_SIZE = 88
+
+
+def _is_string_family_type(type_name: str, data_types_map: Dict[str, 'DataType']) -> bool:
+    """Return True if type_name is the built-in STRING type or a custom
+    string-family DataType (e.g. STRING20, STRING64, ...).
+
+    Custom string-family types are detected generically via the DataType's own
+    ``family`` flag (read from extended record 0x6C in the ACD binary by
+    DataTypeBuilder), not by matching against a hardcoded name -- so any
+    project-defined string type of any name/length is recognized correctly.
+    """
+    t = type_name.upper()
+    if t == "STRING":
+        return True
+    dt = data_types_map.get(t)
+    return dt is not None and dt.family == "StringFamily"
+
+
+def _string_family_capacity(type_name: str, data_types_map: Dict[str, 'DataType']) -> int:
+    """Return the configured character capacity of a string-family type.
+
+    82 for the built-in STRING type. For a custom string-family type, reads
+    the dimension of its DATA member from the ACD's own type definition
+    (rather than assuming the default 82-character length).
+    """
+    t = type_name.upper()
+    if t == "STRING":
+        return 82
+    dt = data_types_map.get(t)
+    if dt is not None:
+        for m in dt.members:
+            if m.name.upper() == "DATA":
+                return m.dimension
+    return 82
 
 
 def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int:
@@ -733,6 +770,16 @@ def _decode_udt_initial_value(
     base_dt = re.sub(r'\[.*\]', '', data_type_name).strip()
     dt_obj = data_types_map.get(base_dt.upper())
     if dt_obj is None:
+        return None
+    if dt_obj.family == "StringFamily":
+        # A tag whose own top-level type is a string-family type (e.g. a
+        # scalar/array STRING20 tag) isn't handled here yet -- there's no
+        # verified reference for how Studio 5000 renders that case in
+        # Decorated XML at the top level (as opposed to a STRING-family
+        # *member* nested inside a UDT, which is decoded/rendered correctly
+        # elsewhere). Skip rather than guess, matching the existing behavior
+        # for the built-in STRING type (which was never reachable here at
+        # all, since it has no ACD DataType record of its own).
         return None
 
     cur.execute(
@@ -840,11 +887,12 @@ def _decode_scalar_member(
             return val
         return 0
 
-    if mdt_upper == "STRING":
+    if _is_string_family_type(mdt_upper, data_types_map):
+        cap = _string_family_capacity(mdt_upper, data_types_map)
         if offset + 4 > len(blob):
             return ""
         length = struct.unpack_from("<i", blob, offset)[0]
-        length = max(0, min(length, 82))
+        length = max(0, min(length, cap))
         if offset + 4 + length > len(blob):
             return ""
         raw = blob[offset + 4: offset + 4 + length]

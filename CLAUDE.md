@@ -131,6 +131,12 @@ ask the user to export a fresh L5X (File > Save As / Export) and/or tag CSV repo
   information isn't stored as strings in the ACD binary. Only relevant for **new hardware
   module models**, not new UDTs/tags/AOIs.
 - Module (I/O) metadata is not fully round-tripped to L5X (opaque CIP identity records).
+- `_decode_udt_initial_value`/`_decode_single_udt_element` (initial-*value* decoding from the
+  data-table blob, `elements.py`) has a hardcoded recursion depth limit of 3 nested structs —
+  this is a generic safety cap (not tied to any specific type/module), separate from the
+  *structure*-generation recursion (`_struct_members_xml` and friends), which has no depth
+  limit at all. If you ever see a deeply-nested UDT's initial value silently come back empty,
+  check this limit first.
 
 ## Testing gotchas
 

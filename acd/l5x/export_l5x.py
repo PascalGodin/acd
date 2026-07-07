@@ -70,7 +70,7 @@ class ExportL5x:
         )
         log.debug("Create Comments table in sqllite db")
         self._cur.execute(
-            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int)"
+            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int, scope_id int)"
         )
 
         log.debug("Create Nameless table in sqllite db")
@@ -135,14 +135,18 @@ class ExportL5x:
         comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record)) is not None]
         # Fix garbled "N]" -> "[N]" in tag_references (missing opening bracket).
         comment_tuples = [self._normalize_comment(t) for t in comment_tuples]
-        # Deduplicate: for same (parent, tag_reference), keep the one with the longest description
-        # (preferring more descriptive type-6/7 records over shorter ones).
+        # Deduplicate: for same (parent, tag_reference, scope_id), keep the one with the
+        # longest description (preferring more descriptive type-6/7 records over shorter
+        # ones). scope_id is included because multiple unrelated tags can share the same
+        # (parent) container key while having identical-looking tag_reference suffixes
+        # (e.g. two different array tags both having a "[0].DN" element) — scope_id is
+        # what actually distinguishes them (see TagBuilder / _build_hex_oid_map usage).
         seen: Dict[tuple, tuple] = {}
         for t in comment_tuples:
-            key = (t[5], t[6])
+            key = (t[5], t[6], t[9])
             if key not in seen or len(t[3]) > len(seen[key][3]):
                 seen[key] = t
-        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", seen.values())
+        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?)", seen.values())
         self._db.commit()
 
         log.info(
@@ -159,7 +163,7 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_comps_parent_name ON comps(parent_id, comp_name)")
         self._cur.execute("CREATE INDEX idx_rungs_object_id ON rungs(object_id)")
         self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
-        self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
+        self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent, scope_id)")
         self._db.commit()
 
     @staticmethod
@@ -167,14 +171,14 @@ class ExportL5x:
         """Normalize comment tag_reference: fix garbled \"N]\" -> \"[N]\".
         Hex OID resolution is handled by TagBuilder (non-I/O tags).
         """
-        seq, sub_len, obj_id, text, rec_type, parent, tag_ref, rung, member = t
+        seq, sub_len, obj_id, text, rec_type, parent, tag_ref, rung, member, scope_id = t
         if not tag_ref:
             return t
 
         new_ref = re.sub(r'(?<![\[\d])(\d+])', r'[\1', tag_ref)
 
         if new_ref != tag_ref:
-            return (seq, sub_len, obj_id, text, rec_type, parent, new_ref, rung, member)
+            return (seq, sub_len, obj_id, text, rec_type, parent, new_ref, rung, member, scope_id)
         return t
 
     @property

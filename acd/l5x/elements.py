@@ -397,12 +397,20 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     if dt_base in _SKIP_DECORATED:
         return ""
 
+    # dt_base is always upper-cased (matching data_types_map's key convention),
+    # but Studio 5000 shows the DataType attribute in its real original casing
+    # (e.g. "LugWrk", not "LUGWRK") -- recover it from the DataType object
+    # itself when there is one (built-in reserved keywords like TIMER/STRING
+    # have no ACD DataType record and are canonically all-caps anyway).
+    dt_obj_for_name = data_types_map.get(dt_base)
+    display_name = dt_obj_for_name.name if dt_obj_for_name is not None else dt_base
+
     if dimensions is None:
         # Scalar struct
         inner = _struct_members_xml(dt_base, data_types_map)
         if inner is None:
             return ""
-        body = f'<Structure DataType="{dt_base}">{inner}</Structure>'
+        body = f'<Structure DataType="{display_name}">{inner}</Structure>'
     else:
         # Array tag: parse dimensions (up to 3D, comma-separated)
         dim_parts = [int(d) for d in dimensions.split(",") if d.strip().isdigit()]
@@ -410,8 +418,12 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             return ""
 
         # For multi-dimensional arrays the total element count is the product.
-        # We generate flat [0]..[N-1] indices for 1D, and nested for multi-D.
-        # Logix displays multi-dim as [i][j] etc.
+        # Multi-dimensional element indices are a single comma-separated list
+        # inside one bracket pair (e.g. "[1,2,0]"), NOT separate brackets per
+        # dimension (verified against a real 3D UDT array tag) -- Dimensions=
+        # itself is also comma-separated on the <Array> element specifically
+        # (the top-level <Tag Dimensions="..."> attribute uses spaces instead,
+        # handled separately in Tag.to_xml's base attribute rendering).
         total = 1
         for d in dim_parts:
             total *= d
@@ -426,7 +438,7 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             # BOOL array: flat indexed elements with Radix="Decimal"
             def _bool_elems(parts: List[int], remaining: List[int]) -> str:
                 if not remaining:
-                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    idx = "[" + ",".join(str(p) for p in parts) + "]"
                     return f'<Element Index="{idx}" Value="0"/>'
                 return "".join(
                     _bool_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
@@ -438,7 +450,7 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             # Primitive array (DINT, REAL, etc.)
             def _prim_elems(parts: List[int], remaining: List[int]) -> str:
                 if not remaining:
-                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    idx = "[" + ",".join(str(p) for p in parts) + "]"
                     return f'<Element Index="{idx}" Value="{zero}"/>'
                 return "".join(
                     _prim_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
@@ -451,17 +463,17 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             inner = _struct_members_xml(dt_base, data_types_map)
             if inner is None:
                 return ""
-            struct_xml = f'<Structure DataType="{dt_base}">{inner}</Structure>'
+            struct_xml = f'<Structure DataType="{display_name}">{inner}</Structure>'
 
             def _struct_elems(parts: List[int], remaining: List[int]) -> str:
                 if not remaining:
-                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    idx = "[" + ",".join(str(p) for p in parts) + "]"
                     return f'<Element Index="{idx}">{struct_xml}</Element>'
                 return "".join(
                     _struct_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
                 )
             elems = _struct_elems([], dim_parts)
-            body = f'<Array DataType="{dt_base}" Dimensions="{dim_str}">{elems}</Array>'
+            body = f'<Array DataType="{display_name}" Dimensions="{dim_str}">{elems}</Array>'
 
     # Inject <Comment> children for array elements that have inline comments.
     elem_comments = _build_elem_comments(tag_name, comments) if comments else {}
@@ -595,8 +607,49 @@ def _udt_array_to_xml(tag_name: str, dt_base: str, values: List[dict],
                        data_types_map: Dict[str, 'DataType']) -> str:
     """Generate an ``<Array>`` XML fragment for a decoded UDT array tag.
 
-    Trailing all-zero elements are omitted.
+    For a 1-D array, trailing all-zero elements are omitted (matches
+    verified Studio 5000 behavior for primitive/UDT 1-D arrays). For a
+    multi-dimensional array (comma-separated dim_str, e.g. "4,3,2"), no
+    truncation is applied -- every element is emitted with a comma-separated
+    Index (e.g. "[3,2,1]"), and the flat *values* list (row-major, matching
+    _decode_udt_initial_value's flat iteration and the ACD's own storage
+    order) is mapped back to per-dimension indices -- verified against a
+    real 3-D UDT array tag, where Studio 5000 shows all elements
+    untruncated.
     """
+    dt_obj_for_name = data_types_map.get(dt_base.upper())
+    display_name = dt_obj_for_name.name if dt_obj_for_name is not None else dt_base
+
+    dim_parts = [int(d) for d in dim_str.split(",") if d.strip().isdigit()]
+
+    if len(dim_parts) > 1:
+        # Multi-dimensional: emit every element, row-major indices.
+        elems: List[str] = []
+        for flat_idx, val in enumerate(values):
+            # Compute per-dimension indices via successive divmod using each
+            # dimension's own "weight" (product of the dimensions after it).
+            weights = []
+            acc = 1
+            for d in reversed(dim_parts):
+                weights.insert(0, acc)
+                acc *= d
+            idx_parts = []
+            remaining = flat_idx
+            for w in weights:
+                idx_parts.append(remaining // w)
+                remaining %= w
+            idx = "[" + ",".join(str(p) for p in idx_parts) + "]"
+            struct = _udt_scalar_to_xml(dt_base, val, data_types_map)
+            elems.append(
+                f'<Element Index="{idx}">'
+                f'<Structure DataType="{display_name}">{struct}</Structure>'
+                f'</Element>'
+            )
+        return (
+            f'<Array Name="{tag_name}" DataType="{display_name}" Dimensions="{dim_str}">'
+            f'{"".join(elems)}</Array>'
+        )
+
     non_zero_end = 0
     for i in range(len(values) - 1, -1, -1):
         if _udt_has_non_zero(values[i]):
@@ -609,12 +662,12 @@ def _udt_array_to_xml(tag_name: str, dt_base: str, values: List[dict],
         struct = _udt_scalar_to_xml(dt_base, values[i], data_types_map)
         elems.append(
             f'<Element Index="[{i}]">'
-            f'<Structure DataType="{dt_base}">{struct}</Structure>'
+            f'<Structure DataType="{display_name}">{struct}</Structure>'
             f'</Element>'
         )
 
     return (
-        f'<Array Name="{tag_name}" DataType="{dt_base}" Dimensions="{dim_str}">'
+        f'<Array Name="{tag_name}" DataType="{display_name}" Dimensions="{dim_str}">'
         f'{"".join(elems)}</Array>'
     )
 
@@ -708,10 +761,20 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
     for m in dt.members:
         if m.hidden or m.data_type == "BIT":
             continue
-        elem_sz = _get_type_size(m.data_type, data_types_map)
-        if elem_sz == 0:
-            continue
-        member_end = m.byte_offset + (elem_sz * max(m.dimension, 1))
+        if m.data_type.upper() == "BOOL" and m.dimension > 0:
+            # BOOL arrays are bit-packed into DINT-sized (4-byte) words, 32
+            # bits per word -- NOT one byte per element. Verified against a
+            # real UDT (LugWrk) whose true total size only matches when a
+            # trailing BOOL[32] member is sized as 4 bytes, not 32; without
+            # this, every member/struct size computed *after* a BOOL array
+            # member is wrong, corrupting offsets for any subsequent element
+            # in an array of that struct.
+            member_end = m.byte_offset + (((m.dimension + 31) // 32) * 4)
+        else:
+            elem_sz = _get_type_size(m.data_type, data_types_map)
+            if elem_sz == 0:
+                continue
+            member_end = m.byte_offset + (elem_sz * max(m.dimension, 1))
         max_end = max(max_end, member_end)
     return max_end if max_end > 0 else 0
 
@@ -1017,6 +1080,17 @@ class Tag(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
+
+        # The <Tag> element's own Dimensions attribute uses SPACE-separated
+        # values (e.g. Dimensions="4 3 2"), verified against a real 3D-array
+        # tag's L5X export -- unlike the comma-separated storage format used
+        # internally everywhere else (array indexing, <Array Dimensions=...>,
+        # etc., which stays comma-separated and is unaffected by this).
+        if self.dimensions:
+            base = base.replace(
+                f'Dimensions="{self.dimensions}"',
+                f'Dimensions="{self.dimensions.replace(",", " ")}"',
+            )
 
         # --- Description child element ---
         # Find tag-level description: empty tag_reference means the tag itself.
@@ -3106,16 +3180,18 @@ class ProgramBuilder(L5xElementBuilder):
                 tag = TagBuilder(self._cur, result[1]).build()
                 tag._data_types_map = self._data_types_map
                 # Decode UDT initial values now that data_types_map is available.
-                # Skip multi-dimensional arrays (dimensions with 2+ parts).
+                # Multi-dimensional arrays are supported: _decode_udt_initial_value
+                # iterates the flat (row-major) element count, and Tag.to_xml's
+                # UDT-array branch / _udt_array_to_xml re-derive the per-dimension
+                # [i,j,k] indices from that same flat ordering when rendering.
                 if tag._initial_value is None and tag._data_table_instance:
-                    if not tag.dimensions or "," not in tag.dimensions:
-                        n = _count_array_elements(tag.dimensions)
-                        udt_val = _decode_udt_initial_value(
-                            self._cur, tag._data_table_instance, tag.data_type, n,
-                            self._data_types_map,
-                        )
-                        if udt_val is not None:
-                            tag._initial_value = udt_val
+                    n = _count_array_elements(tag.dimensions)
+                    udt_val = _decode_udt_initial_value(
+                        self._cur, tag._data_table_instance, tag.data_type, n,
+                        self._data_types_map,
+                    )
+                    if udt_val is not None:
+                        tag._initial_value = udt_val
                 tags.append(tag)
 
         self._cur.execute(
@@ -3336,16 +3412,18 @@ class ControllerBuilder(L5xElementBuilder):
             tag = TagBuilder(self._cur, _tag_object_id).build()
             tag._data_types_map = data_types_map
             # Decode UDT initial values now that data_types_map is available.
-            # Skip multi-dimensional arrays (dimensions with 2+ parts).
+            # Multi-dimensional arrays are supported: _decode_udt_initial_value
+            # iterates the flat (row-major) element count, and Tag.to_xml's
+            # UDT-array branch / _udt_array_to_xml re-derive the per-dimension
+            # [i,j,k] indices from that same flat ordering when rendering.
             if tag._initial_value is None and tag._data_table_instance:
-                if not tag.dimensions or "," not in tag.dimensions:
-                    n = _count_array_elements(tag.dimensions)
-                    udt_val = _decode_udt_initial_value(
-                        self._cur, tag._data_table_instance, tag.data_type, n,
-                        data_types_map,
-                    )
-                    if udt_val is not None:
-                        tag._initial_value = udt_val
+                n = _count_array_elements(tag.dimensions)
+                udt_val = _decode_udt_initial_value(
+                    self._cur, tag._data_table_instance, tag.data_type, n,
+                    data_types_map,
+                )
+                if udt_val is not None:
+                    tag._initial_value = udt_val
             # Exclude internal placeholder/auto-generated tags:
             #   "$..."      -- hash-named objects (not a valid Rockwell tag-name start
             #                  character; real tags always start with a letter or "_").

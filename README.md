@@ -82,7 +82,13 @@ for tg in controller.tags:
         print(f"{tg.name}[0]: {arr[0] if arr else None}")
 ```
 
-For UDT-typed tags the initial value is a `dict` (scalar) or `list[dict]` (array) keyed by member name. BOOL members are decoded from their packed bit position; nested UDTs and STRING members are handled recursively.
+For UDT-typed tags the initial value is a `dict` (scalar) or `list[dict]` (array) keyed by member name. BOOL members are decoded from their packed bit position; nested UDTs and STRING members are handled recursively. This also applies to Rockwell "module-defined" types (e.g. an I/O module tag typed `AB:1794_IB32:I:0`) — since every DataType's member layout is read from the ACD's own type definitions, decoding works identically whether the struct is a user-created UDT or an implicit module type:
+
+```python
+for tag in controller.io_tags:
+    print(tag.name, tag.data_type, tag._initial_value)
+    # e.g. Local:10:I AB:1756_DI:I:0 {'Fault': 0, 'Data': 15870}
+```
 
 ---
 

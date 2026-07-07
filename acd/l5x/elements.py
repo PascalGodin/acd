@@ -715,10 +715,15 @@ def _decode_udt_initial_value(
     n_elements: int,
     data_types_map: Dict[str, 'DataType'],
 ) -> Union[dict, list, None]:
-    """Decode initial values for a UDT-typed tag from the data table blob.
+    """Decode initial values for a struct-typed tag from the data table blob.
 
-    Returns a dict for scalar UDTs, a list of dicts for UDT arrays,
-    or None if the type is not a user-defined UDT or cannot be decoded.
+    Works for any DataType found in data_types_map -- user-defined UDTs as well
+    as Rockwell "ProductDefined"/module-defined types (e.g. AB:1794_IB32:I:0),
+    since both are read from the same generic member/byte_offset structure and
+    the same data-table blob layout (verified against real module I/O data).
+
+    Returns a dict for scalar structs, a list of dicts for struct arrays,
+    or None if the type is unknown or cannot be decoded.
     """
     if not data_type_name:
         return None
@@ -727,7 +732,7 @@ def _decode_udt_initial_value(
 
     base_dt = re.sub(r'\[.*\]', '', data_type_name).strip()
     dt_obj = data_types_map.get(base_dt.upper())
-    if dt_obj is None or dt_obj.cls != "User":
+    if dt_obj is None:
         return None
 
     cur.execute(

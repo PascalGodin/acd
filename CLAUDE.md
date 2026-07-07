@@ -77,8 +77,8 @@ L5X, or the tag's `<Description>`). Getting the full address (`Tag[3].Flags.2`, 
 1. **Container key.** Each tag's comments are found via `parent = (comment_id << 16) | cip_type`,
    where `comment_id`/`cip_type` are read from the tag's own comps record (`RxGeneric`).
 2. **Scope collisions.** Multiple *unrelated* tags can share the exact same `(comment_id,
-   cip_type)` key (e.g. tags that never got their own unique `comment_id` assigned — this
-   affected up to 435 tags in one real project). **`comments` table has a `scope_id` column**
+   cip_type)` key (e.g. tags that never got their own unique `comment_id` assigned — this can
+   affect hundreds of tags in a single large project). **`comments` table has a `scope_id` column**
    (a 2-byte discriminator at absolute byte offset 16 in both the tag's own raw record and every
    comment record) that must be matched in addition to `parent`, or comments from completely
    different tags get merged together and mislabeled. `TagBuilder` already does this — if you
@@ -111,9 +111,16 @@ L5X, or the tag's `<Description>`). Getting the full address (`Tag[3].Flags.2`, 
      corrupt it (this was a real regression: `(?<!\[)` alone matched inside `"[10]"`, producing
      `"[1[0]"`).
 
-**When verifying comment/description output, don't trust `ref.json`-style derived references
-blindly** — it can have its own bugs. Prefer checking directly against a real Studio 5000
-L5X/CSV export's `<Comment Operand="...">` / `COMMENT` rows, which is unambiguous ground truth.
+**When verifying comment/description output, don't trust any pre-built "reference" JSON/index
+a downstream project might hand you** (e.g. something like `ref.json` derived from an L5X/CSV
+by another script) **blindly** — it's typically hand-built by a separate AI/script pass and can
+silently encode the very same bugs it's meant to catch. It may also not exist at all, or be
+stale relative to the ACD you're actually testing against. The only trustworthy ground truth is
+a real Studio 5000 export: an L5X's `<Comment Operand="...">` / `<Description>` elements, or a
+Studio 5000 "Export Tags" CSV's `COMMENT`/`TAG` rows. Don't assume either is already present in
+the working directory — if you need to verify comment/description output and don't have one,
+ask the user to export a fresh L5X (File > Save As / Export) and/or tag CSV report from Studio
+5000 for the specific ACD under test.
 
 ## Known limitations / things not implemented
 

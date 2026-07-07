@@ -2221,9 +2221,15 @@ class TagBuilder(L5xElementBuilder):
             data_type_results = self._cur.fetchall()
             data_type = data_type_results[0][0]
 
+        # scope_id: a 2-byte discriminator at absolute offset 16 of the tag's own raw
+        # record. Multiple unrelated tags can share the same (comment_id, cip_type)
+        # "parent" container key in Comments.Dat (e.g. tags that never got their own
+        # unique comment_id assigned) — scope_id is the extra field Rockwell uses
+        # internally to tell their comments apart within a shared container.
+        own_scope_id = struct.unpack_from("<H", raw_rec, 16)[0] if len(raw_rec) >= 18 else 0
         self._cur.execute(
-            "SELECT tag_reference, record_string FROM comments WHERE parent="
-            + str((r.comment_id * 0x10000) + r.cip_type)
+            "SELECT tag_reference, record_string FROM comments WHERE parent=? AND scope_id=?",
+            ((r.comment_id * 0x10000) + r.cip_type, own_scope_id),
         )
         comment_results = self._cur.fetchall()
 
@@ -2371,11 +2377,14 @@ class TagBuilder(L5xElementBuilder):
                 normalized.append((f"{tag_name}{ref}", text))
             elif "." in ref and ":" not in ref:
                 # Member.Bit — resolved from hex OID, needs tag name prefix.
+                # ref may already carry its own leading "." (e.g. resolved from a
+                # ".!HEXOID" reference into ".Gain") — avoid inserting a second dot.
                 # For array tags, add [0] since no element index is specified.
+                sep = "" if ref.startswith(".") else "."
                 if dimensions is not None:
-                    normalized.append((f"{tag_name}[0].{ref}", text))
+                    normalized.append((f"{tag_name}[0]{sep}{ref}", text))
                 else:
-                    normalized.append((f"{tag_name}.{ref}", text))
+                    normalized.append((f"{tag_name}{sep}{ref}", text))
             else:
                 normalized.append((ref, text))
 

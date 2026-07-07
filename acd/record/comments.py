@@ -16,7 +16,7 @@ class CommentsRecord:
     def __post_init__(self):
         entry = CommentsRecord.parse(self.dat_record)
         if entry is not None:
-            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", entry)
+            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", entry)
 
     @staticmethod
     def _parse_udi_body(body: bytes) -> Optional[tuple]:
@@ -63,6 +63,15 @@ class CommentsRecord:
         if dat_record.identifier != 64250:
             return None
         try:
+            raw_full = bytes(dat_record.record.record_buffer)
+            # scope_id: a 2-byte discriminator at absolute offset 16 in the raw record
+            # (byte offset 2 within the record body, right after the 4-byte
+            # record_length prefix + 10-byte header). Rockwell uses this internally
+            # to disambiguate comments when multiple unrelated tags/objects share the
+            # same (comment_id, cip_type) container key — the same value also appears
+            # at offset 16 in the owning tag's own comps record. Without this, comment
+            # rows for different tags sharing a container get scrambled together.
+            scope_id = struct.unpack_from("<H", raw_full, 16)[0] if len(raw_full) >= 18 else 0
             r = FafaComents.from_bytes(dat_record.record.record_buffer)
             # Type-12 (0x0C) records carry UDI metadata such as the AOI RevisionNote.
             # The body is raw bytes; parse it to extract the text.
@@ -84,6 +93,7 @@ class CommentsRecord:
                     "__REVISION_NOTE__",
                     0,              # rung_content
                     0,              # member_ref
+                    scope_id,
                 )
             if r.header.record_type in (16, 17):
                 body = bytes(r.body)
@@ -114,8 +124,9 @@ class CommentsRecord:
                     tag_ref,
                     0,
                     0,
+                    scope_id,
                 )
-            if r.header.record_type in (5, 6, 7, 8, 11):
+            if r.header.record_type in (5, 6, 7, 8, 11, 15, 21):
                 body = bytes(r.body)
                 obj_id = struct.unpack_from("<I", body, 8)[0]
                 tag_ref = ""
@@ -150,6 +161,7 @@ class CommentsRecord:
                     tag_ref,
                     0,
                     0,
+                    scope_id,
                 )
             if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
                 tag_ref = r.body.tag_reference.value
@@ -180,6 +192,7 @@ class CommentsRecord:
                 tag_ref,
                 rung_content,
                 member_ref,
+                scope_id,
             )
         except Exception:
             return None

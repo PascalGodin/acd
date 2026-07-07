@@ -171,7 +171,7 @@ class ExportL5x:
         if not tag_ref:
             return t
 
-        new_ref = re.sub(r'(?<!\[)(\d+])', r'[\1', tag_ref)
+        new_ref = re.sub(r'(?<![\[\d])(\d+])', r'[\1', tag_ref)
 
         if new_ref != tag_ref:
             return (seq, sub_len, obj_id, text, rec_type, parent, new_ref, rung, member)

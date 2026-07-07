@@ -115,6 +115,36 @@ class CommentsRecord:
                     0,
                     0,
                 )
+            if r.header.record_type in (5, 6):
+                body = bytes(r.body)
+                obj_id = struct.unpack_from("<I", body, 8)[0]
+                rest = body[20:]
+                tag_ref_end = None
+                for i in range(0, len(rest), 2):
+                    if i + 1 < len(rest) and rest[i] == 0 and rest[i + 1] == 0:
+                        tag_ref_end = i
+                        break
+                if tag_ref_end is not None and tag_ref_end > 0:
+                    tag_ref = rest[:tag_ref_end].decode("utf-16-le")
+                    desc_start = tag_ref_end + 2
+                    while desc_start < len(rest) and rest[desc_start] == 0:
+                        desc_start += 1
+                    desc_end = rest.find(b"\x00", desc_start)
+                    record_string = rest[desc_start:desc_end].decode("ascii", errors="replace") if desc_end > desc_start else ""
+                else:
+                    tag_ref = ""
+                    record_string = ""
+                return (
+                    r.header.seq_number,
+                    r.header.sub_record_length,
+                    obj_id,
+                    record_string,
+                    r.header.record_type,
+                    r.header.parent,
+                    tag_ref,
+                    0,
+                    0,
+                )
             if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
                 tag_ref = r.body.tag_reference.value
             else:

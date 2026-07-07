@@ -115,25 +115,31 @@ class CommentsRecord:
                     0,
                     0,
                 )
-            if r.header.record_type in (5, 6):
+            if r.header.record_type in (5, 6, 7, 8, 11):
                 body = bytes(r.body)
                 obj_id = struct.unpack_from("<I", body, 8)[0]
-                rest = body[20:]
-                tag_ref_end = None
-                for i in range(0, len(rest), 2):
-                    if i + 1 < len(rest) and rest[i] == 0 and rest[i + 1] == 0:
-                        tag_ref_end = i
+                tag_ref = ""
+                record_string = ""
+                # Parse UTF-16LE null-terminated tag_ref from body[16:]
+                utf16_start = 16
+                pos = utf16_start
+                code_units = []
+                while pos + 1 < len(body):
+                    cu = struct.unpack_from("<H", body, pos)[0]
+                    if cu == 0:
                         break
-                if tag_ref_end is not None and tag_ref_end > 0:
-                    tag_ref = rest[:tag_ref_end].decode("utf-16-le")
-                    desc_start = tag_ref_end + 2
-                    while desc_start < len(rest) and rest[desc_start] == 0:
-                        desc_start += 1
-                    desc_end = rest.find(b"\x00", desc_start)
-                    record_string = rest[desc_start:desc_end].decode("ascii", errors="replace") if desc_end > desc_start else ""
-                else:
-                    tag_ref = ""
-                    record_string = ""
+                    code_units.append(cu)
+                    pos += 2
+                if code_units:
+                    tag_ref = "".join(chr(cu) for cu in code_units)
+                    # Skip null terminator and any subsequent null padding.
+                    pos += 2
+                    while pos < len(body) and body[pos] == 0:
+                        pos += 1
+                    # Read null-terminated ASCII text.
+                    text_end = body.find(b"\x00", pos)
+                    if text_end > pos:
+                        record_string = body[pos:text_end].decode("ascii", errors="replace")
                 return (
                     r.header.seq_number,
                     r.header.sub_record_length,

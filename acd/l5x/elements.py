@@ -2198,8 +2198,10 @@ class ModuleBuilder(L5xElementBuilder):
         # _CONNECTION_TYPE_BY_CODE) -- not from the connection's name, since a
         # connection can be named e.g. "Standard" and be either Input or Output
         # depending on the specific module (confirmed with real project data).
-        # RPI: we do not have a reliable binary decoder for the short connection
-        # records seen in the test data, so we default to "0.0" (acceptable for import).
+        # RPI (microseconds) is a u32le at raw offset 92, immediately after the
+        # type code -- both found and verified together against a real project
+        # by cross-referencing every connection's raw bytes (keyed by this same
+        # RPI value) against its actual L5X Type= attribute.
         self._cur.execute(
             "SELECT c2.comp_name, c2.record FROM comps c1 "
             "JOIN comps c2 ON c2.parent_id = c1.object_id "
@@ -2212,9 +2214,11 @@ class ModuleBuilder(L5xElementBuilder):
             conn_raw = bytes(conn_rec)
             conn_type = None
             code = None
-            if len(conn_raw) >= 92:
+            rpi_str = "0"
+            if len(conn_raw) >= 96:
                 code = struct.unpack_from("<H", conn_raw, 90)[0]
                 conn_type = _CONNECTION_TYPE_BY_CODE.get(code)
+                rpi_str = str(struct.unpack_from("<I", conn_raw, 92)[0])
             if conn_type is None:
                 # Unrecognized code (or too-short record): fall back to the
                 # old name-based heuristic rather than guessing wrong, but
@@ -2229,7 +2233,7 @@ class ModuleBuilder(L5xElementBuilder):
                     "_CONNECTION_TYPE_BY_CODE.",
                     code, conn_name, name, len(conn_raw), conn_type,
                 )
-            connections.append((conn_name, "0.0", conn_type))
+            connections.append((conn_name, rpi_str, conn_type))
 
         return Module(
             name,           # L5xElement._name (private)

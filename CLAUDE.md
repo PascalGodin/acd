@@ -463,6 +463,50 @@ synthetic blob) plus a correction to `test_scalar_primitive_tag_xml_shape`'s own
 which was itself a casualty of this bug (never independently verified against real ground truth
 for the small fixture, just whatever the wrong offset happened to produce).
 
+## REAL/LREAL NaN and Infinity rendering (`_l5k_real_literal`/`_decorated_real_literal`)
+
+Found while attempting a full whole-project `to_xml()` export of a large real project for the
+first time (previously only individual routines/tags had been spot-checked) — it crashed
+entirely with `ValueError: not enough values to unpack` in `_l5k_real_literal`. Root cause: a
+handful of real REAL/REAL[] tags in that project (uninitialized, never written) decode to
+NaN/Infinity, and Python formats these as bare `"nan"`/`"inf"` (no `"e"` to split on), which
+`_l5k_real_literal` assumed would always be present. **This affected every non-finite REAL value
+project-wide, and made whole-project export impossible for any project containing one** — not a
+cosmetic issue.
+
+Confirmed against that same project's own Studio 5000 L5X export (it has 6 such tags: one
+`REAL[12]` array with `Infinity` in one element, several scalar `REAL` tags with `NaN`) that
+Rockwell uses the classic MSVC CRT special-value convention, but the two output contexts
+(`<Data Format="L5K">` vs `<Data Format="Decorated">`) render it differently, and a scalar
+Decorated value renders differently again from an *array* Decorated value:
+
+- **L5K** (`_l5k_real_literal`): the special-value label is left-padded with zeros into the same
+  8-character mantissa slot a normal number occupies, then the usual `e+000` exponent is still
+  appended: `"1.#QNAN000e+000"` for NaN, `"1.#INF0000e+000"` for +Infinity.
+- **Decorated, scalar** (`_decorated_real_literal(..., in_array=False)`): the bare label with no
+  padding/exponent — confirmed `"1.#QNAN"` for NaN; `"1.#INF"` for Infinity is inferred by direct
+  symmetry (not independently observed in this project, no scalar Infinity tag existed to check).
+- **Decorated, array element** (`_decorated_real_literal(..., in_array=True)`): a genuinely
+  different, truncated value — `"1.$"` for the one case observed (+Infinity) — this is a real,
+  reproducible quirk/bug in Studio 5000's *own* array-element exporter (verified byte-for-byte:
+  `<Element Index="[11]" Value="1.$"/>` in the real L5X), not something we're free to "fix" to be
+  more sensible. Applied to NaN too since no counter-evidence exists and the truncation looks like
+  a generic "any `#`-prefixed label gets mangled in this code path" bug rather than one specific
+  to Infinity.
+- Sign-prefixed forms (`-1.#QNAN...`, `-1.#INF...`, `-1.$`) and the classic MSVC `-1.#IND`
+  indeterminate-NaN special case were not observed in this project (all 6 tags were positive-signed)
+  and are inferred by symmetry only — revisit if a real negative-signed non-finite value is ever
+  found to disagree.
+
+Also applied `_decorated_real_literal` to UDT member REAL/REAL[] fields (`_udt_scalar_to_xml`),
+which previously used bare `f"{val}"` (Python's full-precision float repr, e.g.
+`"1.2999999523162842"`) instead of the short `.6g`-style form every other REAL value in the
+codebase uses — likely a latent, separate fidelity bug beyond just the NaN/Infinity crash, though
+not independently verified against a real nested-UDT-with-REAL-member sample.
+
+Regression tests: `test_l5k_real_literal_nan_and_infinity_do_not_crash`,
+`test_decorated_real_literal_scalar_nan`, `test_decorated_real_literal_array_infinity_matches_real_quirk`.
+
 ## Rung patch write-back (`patch_rungs`/`patch_sbregion_dat`)
 
 This path (`acd/zip/write_dat.py`) had **zero test coverage** until it was manually exercised

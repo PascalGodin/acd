@@ -1,9 +1,16 @@
+import math
 import sqlite3
 import struct
 from datetime import datetime
 from xml.dom import minidom
 
-from acd.l5x.elements import _escape_xml_attr, _filetime_to_iso, _read_tag_initial_value
+from acd.l5x.elements import (
+    _decorated_real_literal,
+    _escape_xml_attr,
+    _filetime_to_iso,
+    _l5k_real_literal,
+    _read_tag_initial_value,
+)
 
 
 def test_filetime_to_iso_zero_is_empty():
@@ -102,3 +109,35 @@ def test_read_tag_initial_value_scalar_uses_0x1a2_offset():
     value = _read_tag_initial_value(cur, 1, "DINT", 1)
 
     assert value == 42
+
+
+def test_l5k_real_literal_nan_and_infinity_do_not_crash():
+    # A real production project was found with several uninitialized REAL
+    # tags decoding to NaN/Infinity, which crashed this function entirely
+    # (str.split("e") on Python's bare "nan"/"inf" formatting, with no "e"
+    # to split on). Verified against that same project's own Studio 5000
+    # L5X export: NaN -> "1.#QNAN000e+000", +Infinity -> "1.#INF0000e+000"
+    # (the classic MSVC CRT special-value convention, left-padded with
+    # zeros into the normal 8-digit mantissa slot).
+    assert _l5k_real_literal(float("nan")) == "1.#QNAN000e+000"
+    assert _l5k_real_literal(float("inf")) == "1.#INF0000e+000"
+    assert _l5k_real_literal(float("-inf")) == "-1.#INF0000e+000"
+
+
+def test_decorated_real_literal_scalar_nan():
+    # Verified against the real project referenced above: a scalar tag's
+    # Decorated NaN value is the bare label "1.#QNAN" (no padding/exponent,
+    # unlike the L5K form).
+    assert _decorated_real_literal(float("nan"), in_array=False) == "1.#QNAN"
+
+
+def test_decorated_real_literal_array_infinity_matches_real_quirk():
+    # Verified against the real project referenced above: an array
+    # Element's Decorated value for +Infinity is the truncated "1.$" --
+    # a real, reproducible quirk in Studio 5000's own array Decorated-value
+    # exporter (distinct from the scalar case above).
+    assert _decorated_real_literal(float("inf"), in_array=True) == "1.$"
+
+
+def test_decorated_real_literal_finite_uses_short_form():
+    assert _decorated_real_literal(0.4047619, in_array=False) == "0.404762"

@@ -265,7 +265,15 @@ class ExportL5x:
         )[0]
 
         identifier_offset = 78
-        record_length_absolute = identifier_offset + region_length - 4
+        # region_length is always an exact multiple of 16 (one 16-byte entry
+        # per rung/region), verified across every local fixture and a real
+        # project -- it is not a "- 4" short of the true payload size, the
+        # original "- 4" here silently dropped exactly the single last entry
+        # in the whole table every time (confirmed against a real project: a
+        # routine's very last rung was missing from region_map, and the
+        # dropped 16-byte entry sat exactly at the true end of the buffer,
+        # one entry beyond what "- 4" allowed the read loop to reach).
+        record_length_absolute = identifier_offset + region_length
         c = 0
         while identifier_offset <= (record_length_absolute - 16):
             parent_id_identifier = struct.unpack(

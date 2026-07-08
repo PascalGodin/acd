@@ -794,7 +794,6 @@ def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
         return None
 
     fmt, elem_size = pack_fmt_info
-    expected_bytes = n_elements * elem_size
 
     cur.execute(
         "SELECT record FROM comps WHERE object_id = ?", (data_table_instance,)
@@ -807,6 +806,29 @@ def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
 
     # Determine read offset based on whether this is an array or scalar.
     offset = 0x1A2 if n_elements > 1 else 0x19E
+
+    # BOOL/BIT *arrays* are bit-packed by Rockwell -- 32 bits per 4-byte
+    # DWORD, NOT one byte per element (a scalar BOOL, n_elements == 1, is
+    # NOT packed this way and is read as a plain byte below like every
+    # other primitive). This matches the same bit-packing already
+    # accounted for in _get_type_size()'s BOOL-array sizing
+    # (ceil(N/32)*4) -- that fix covered how much space the array
+    # occupies, but this function still read one raw byte per element
+    # regardless, silently returning garbage (whichever byte of the
+    # packed DWORD happened to line up with that element's naive
+    # per-element offset) for every BOOL array tag. Verified against a
+    # real project: BitFlags[2] decoded as 32 (a raw packed byte value)
+    # instead of the correct 0/1 bit.
+    if base_dt in ("BOOL", "BIT") and n_elements > 1:
+        values = []
+        for i in range(n_elements):
+            dword_off = offset + (i // 32) * 4
+            if dword_off + 4 <= len(raw_rec):
+                dword = struct.unpack_from("<I", raw_rec, dword_off)[0]
+                values.append((dword >> (i % 32)) & 1)
+            else:
+                values.append(0)
+        return values
 
     values = []
     for i in range(n_elements):

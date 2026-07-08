@@ -1,7 +1,9 @@
+import sqlite3
+import struct
 from datetime import datetime
 from xml.dom import minidom
 
-from acd.l5x.elements import _escape_xml_attr, _filetime_to_iso
+from acd.l5x.elements import _escape_xml_attr, _filetime_to_iso, _read_tag_initial_value
 
 
 def test_filetime_to_iso_zero_is_empty():
@@ -40,3 +42,35 @@ def test_escape_xml_attr_keeps_attribute_well_formed():
     xml = f'<AOI Vendor="{_escape_xml_attr(garbage)}"/>'
     parsed = minidom.parseString(xml)  # raises on malformed XML
     assert parsed.documentElement.tagName == "AOI"
+
+
+def test_read_tag_initial_value_bool_array_bit_packing():
+    # Regression test for a real bug found while verifying export_routine()
+    # against a real Studio 5000 import: BOOL *array* values were read one
+    # raw byte per element (naive per-element offset), but Rockwell
+    # bit-packs BOOL arrays 32 bits per 4-byte DWORD. A real 256-element
+    # BOOL array tag (BitFlags) decoded index [2] as 32 (a raw packed byte
+    # value) instead of the correct 0/1 bit -- any non-zero "value" then
+    # renders as BOOL True in the generated XML, silently corrupting every
+    # BOOL array tag's exported initial value project-wide.
+    #
+    # Build a synthetic data-table blob: 40 logical bits spanning two
+    # packed DWORDs at offset 0x1A2 (the array read offset), with only
+    # bit 2 of the first DWORD and bit 5 of the second DWORD set.
+    n_elements = 40
+    blob = bytearray(0x1A2 + 8)
+    struct.pack_into("<I", blob, 0x1A2, 1 << 2)
+    struct.pack_into("<I", blob, 0x1A2 + 4, 1 << 5)
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE comps (object_id INTEGER, record BLOB)")
+    db.execute("INSERT INTO comps VALUES (1, ?)", (bytes(blob),))
+    cur = db.cursor()
+
+    values = _read_tag_initial_value(cur, 1, "BOOL", n_elements)
+
+    assert len(values) == n_elements
+    expected = [0] * n_elements
+    expected[2] = 1
+    expected[32 + 5] = 1
+    assert values == expected

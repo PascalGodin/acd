@@ -110,6 +110,11 @@ class ExportL5x:
             "CREATE TABLE nameless(object_id int, parent_id int, record BLOB NOT NULL)"
         )
 
+        log.debug("Create Regnlink table in sqllite db")
+        self._cur.execute(
+            "CREATE TABLE regnlink(routine_id int, fragment int, rung_object_id int)"
+        )
+
         log.info("Extracting ACD database file")
         unzip = Unzip(self.input_filename)
         unzip.write_files(self._temp_dir)
@@ -150,6 +155,11 @@ class ExportL5x:
             "Getting records from ACD Region Map file and storing in sqllite database"
         )
         self.populate_region_map()
+
+        log.info(
+            "Getting records from ACD RegnLink file and storing in sqllite database"
+        )
+        self.populate_regnlink(set(comps_by_id.keys()))
 
         log.info(
             "Getting records from ACD SbRegion file and storing in sqllite database"
@@ -317,6 +327,80 @@ class ExportL5x:
             identifier_offset += 16
 
         self._db.commit()
+
+    def populate_regnlink(self, known_object_ids: set) -> None:
+        """Parse RegnLink.Dat and build a (routine_id, fragment) -> rung_object_id
+        lookup used to resolve which rung a rung-level comment belongs to.
+
+        RegnLink.Dat stores, per routine, a linked list of that routine's rungs.
+        Each 22-byte link record has the shape (all little-endian):
+
+          [0:4]   owner_id   -- the *routine's own* comps object_id (constant
+                                 for every link record belonging to that routine)
+          [4:8]   own_id     -- this link's own rung object_id (or the routine's
+                                 own object_id, for the list head)
+          [8:12]  next_id    -- the *next* rung's object_id in rung order
+                                 (0xFFFFFFFF terminates the list)
+          [12:16] type       -- 0x00020000 for a normal live link; 0xFFFF0000
+                                 marks a stale/deleted link that must be
+                                 ignored (found via a real project: a routine's
+                                 first rung had two link records, an old
+                                 dead-ended stale one and the real current one --
+                                 without filtering by type, the stale one could
+                                 win and truncate/misdirect the whole chain)
+          [16:18] flags      -- unknown, constant "0001" in every sample seen
+          [18:20] fragment   -- a 16-bit value that is *specific to the rung
+                                 identified by next_id*, not to this record's
+                                 own owner/own_id
+          [20:22] unknown    -- unexplained, not needed for this lookup
+
+        The critical discovery (verified byte-exact against a real Studio 5000
+        "Export Routine" ground truth, see CLAUDE.md "Rung comments" section):
+        a comment's rung_content field in Comments.Dat (see RoutineBuilder.build())
+        has this exact same fragment value as its **upper 16 bits** when that
+        comment is attached to the rung identified by next_id above. Resolving
+        a comment's target rung is then: fragment = rung_content >> 16; look up
+        (routine_id, fragment) here to get the rung's object_id; find that
+        object_id's position in the routine's own (region_map-ordered) rung list.
+
+        Records are not reliably contiguous in the file (real, long-lived
+        projects fragment this data across edits) -- found by scanning the
+        entire file for every occurrence of a *known* comps object_id as the
+        4-byte owner field, which is small enough (file sizes seen so far:
+        tens of KB to a few hundred KB) for a linear scan to be fast. Since
+        routine object_ids are unknown at this point in ingestion (Comps has
+        just been parsed, RoutineBuilder hasn't run yet), the check is
+        conservatively widened to *any* known comps object_id rather than
+        routines specifically -- a false-positive owner match is harmless,
+        since RoutineBuilder only ever queries the fragments for its own
+        specific routine_id, and a record whose "next_id" doesn't correspond
+        to any real rung in that routine's own rungs list is simply never
+        matched during lookup.
+        """
+        path = os.path.join(self._temp_dir, "RegnLink.Dat")
+        if not os.path.exists(path):
+            return
+        with open(path, "rb") as f:
+            data = f.read()
+
+        rows: List[tuple] = []
+        limit = len(data) - 22
+        i = 0
+        while i <= limit:
+            owner_id = struct.unpack_from("<I", data, i)[0]
+            if owner_id in known_object_ids:
+                next_id, typ = struct.unpack_from("<II", data, i + 8)
+                if typ != 0xFFFF0000:
+                    fragment = struct.unpack_from("<H", data, i + 18)[0]
+                    rows.append((owner_id, fragment, next_id))
+            i += 1
+
+        if rows:
+            self._cur.executemany("INSERT INTO regnlink VALUES (?,?,?)", rows)
+            self._cur.execute(
+                "CREATE INDEX idx_regnlink_routine_fragment ON regnlink(routine_id, fragment)"
+            )
+            self._db.commit()
 
 
 if __name__ == "__main__":

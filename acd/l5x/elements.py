@@ -477,24 +477,6 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
-def _udt_has_non_zero(d: dict) -> bool:
-    """Recursively check if a decoded UDT element has any non-zero values."""
-    for v in d.values():
-        if isinstance(v, dict):
-            if _udt_has_non_zero(v):
-                return True
-        elif isinstance(v, list):
-            for item in v:
-                if isinstance(item, dict):
-                    if _udt_has_non_zero(item):
-                        return True
-                elif item != 0 and item != "" and item is not None:
-                    return True
-        elif v != 0 and v != "" and v is not None:
-            return True
-    return False
-
-
 def _udt_scalar_to_xml(dt_name: str, values: dict,
                         data_types_map: Dict[str, 'DataType']) -> str:
     """Generate inner member XML for a decoded UDT scalar.
@@ -588,15 +570,20 @@ def _udt_array_to_xml(tag_name: str, dt_base: str, values: List[dict],
                        data_types_map: Dict[str, 'DataType']) -> str:
     """Generate an ``<Array>`` XML fragment for a decoded UDT array tag.
 
-    For a 1-D array, trailing all-zero elements are omitted (matches
-    verified Studio 5000 behavior for primitive/UDT 1-D arrays). For a
-    multi-dimensional array (comma-separated dim_str, e.g. "4,3,2"), no
-    truncation is applied -- every element is emitted with a comma-separated
-    Index (e.g. "[3,2,1]"), and the flat *values* list (row-major, matching
-    _decode_udt_initial_value's flat iteration and the ACD's own storage
-    order) is mapped back to per-dimension indices -- verified against a
-    real 3-D UDT array tag, where Studio 5000 shows all elements
-    untruncated.
+    Every element up to the array's actual length is emitted -- no
+    truncation, for either a 1-D or a multi-dimensional array. (A previous
+    version omitted trailing all-zero elements for 1-D arrays specifically;
+    that was never actually verified against real Studio 5000 output
+    despite a docstring claiming otherwise, a real "Export Routine" sample
+    directly contradicts it, and it was the likely trigger for a real
+    Logix Designer crash during a native Import Routine attempt -- see the
+    equivalent fix for primitive arrays in Tag.to_xml().) For a
+    multi-dimensional array (comma-separated dim_str, e.g. "4,3,2"), every
+    element is emitted with a comma-separated Index (e.g. "[3,2,1]"), and
+    the flat *values* list (row-major, matching _decode_udt_initial_value's
+    flat iteration and the ACD's own storage order) is mapped back to
+    per-dimension indices -- verified against a real 3-D UDT array tag,
+    where Studio 5000 shows all elements untruncated.
     """
     dt_obj_for_name = data_types_map.get(dt_base.upper())
     display_name = dt_obj_for_name.name if dt_obj_for_name is not None else dt_base
@@ -631,15 +618,8 @@ def _udt_array_to_xml(tag_name: str, dt_base: str, values: List[dict],
             f'{"".join(elems)}</Array>'
         )
 
-    non_zero_end = 0
-    for i in range(len(values) - 1, -1, -1):
-        if _udt_has_non_zero(values[i]):
-            non_zero_end = i + 1
-            break
-    non_zero_end = max(non_zero_end, 1)
-
     elems: List[str] = []
-    for i in range(non_zero_end):
+    for i in range(len(values)):
         struct = _udt_scalar_to_xml(dt_base, values[i], data_types_map)
         elems.append(
             f'<Element Index="[{i}]">'

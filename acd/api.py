@@ -268,13 +268,20 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         dt for dt in project.controller.data_types if dt.name.upper() in referenced_type_names
     ]
 
+    # NOTE: individual <Tag>/<DataType> elements never carry a Use= attribute
+    # themselves -- only the wrapping container elements (<Tags Use="Context">,
+    # <DataTypes Use="Context">, <Programs Use="Context">, <Routines
+    # Use="Context">, <Program Use="Context">, <Controller Use="Context">) and
+    # the routine actually being targeted (<Routine Use="Target">) do.
+    # Verified against a real Studio 5000 "Export Routine" output of this
+    # exact routine+edit: previously this incorrectly added Use="Context" to
+    # every <Tag> element, which was the actual trigger for a real Logix
+    # Designer crash (0x80004003 "Invalid pointer") on import -- confirmed by
+    # importing Studio 5000's own (Use=-free) export of the identical edit
+    # successfully, then diffing it attribute-by-attribute against ours.
     data_types_xml = "".join(dt.to_xml() for dt in referenced_data_types)
-    controller_tags_xml = "".join(
-        _inject_use_attr(t.to_xml(), "Tag", "Context") for t in controller_tags
-    )
-    program_tags_xml = "".join(
-        _inject_use_attr(t.to_xml(), "Tag", "Context") for t in program_tags
-    )
+    controller_tags_xml = "".join(t.to_xml() for t in controller_tags)
+    program_tags_xml = "".join(t.to_xml() for t in program_tags)
     routine_xml = _inject_use_attr(routine.to_xml(), "Routine", "Target")
 
     owner_attr = f' Owner="{_escape_xml_attr(owner)}"' if owner else ""

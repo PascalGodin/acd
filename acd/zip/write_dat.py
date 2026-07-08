@@ -94,10 +94,16 @@ def _restore_tag_refs(new_text: str, orig_text_with_refs: str, id_to_name: Dict[
         if name:
             scoped[name] = oid
 
-    # Apply longest-first replacement
+    # Apply longest-first replacement.
+    # Format: 8 hex digits, zero-padded, lowercase -- verified against a real
+    # project's SbRegion.Dat (20,710 @HEX@ refs sampled, all exactly this
+    # shape, 0 with uppercase letters). Using ":X" (uppercase, no padding)
+    # instead produced numerically-equivalent but textually different
+    # references, causing an otherwise-identical rung to re-encode as a
+    # different byte sequence (and therefore compress to a different size).
     for name in sorted(scoped, key=len, reverse=True):
         if name in new_text:
-            new_text = new_text.replace(name, f"@{scoped[name]:X}@")
+            new_text = new_text.replace(name, f"@{scoped[name]:08x}@")
 
     return new_text
 
@@ -130,8 +136,10 @@ def patch_sbregion_dat(
             to substitute when writing back.  Available as project._id_to_name after load_acd().
 
     Returns:
-        New SbRegion.Dat bytes (uncompressed).  Swap into project._raw_files["SbRegion.Dat"]
-        before calling save_acd().
+        New SbRegion.Dat bytes, gzip-compressed to match the original container
+        convention (every internal .Dat/.Idx file is stored gzip-compressed in a
+        real ACD).  Swap into project._raw_files["SbRegion.Dat"] before calling
+        save_acd().
     """
     if not changes:
         return dat_bytes
@@ -186,4 +194,29 @@ def patch_sbregion_dat(
     struct.pack_into("<I", new_header, 8, new_file_length)   # file_length
     struct.pack_into("<I", new_header, 20, new_num_fafa)     # number_records_fafa
 
-    return bytes(new_header) + bytes(new_records) + trailer
+    new_dat = bytes(new_header) + bytes(new_records) + trailer
+
+    # Re-compress to match the original container convention: every internal
+    # .Dat/.Idx file (SbRegion.Dat included) is stored gzip-compressed in a
+    # real ACD. build_acd_bytes() writes _raw_files verbatim with no
+    # compression step of its own, so if we returned the raw/decompressed
+    # bytes here, the saved container would store SbRegion.Dat ~12x larger
+    # than the original AND -- more importantly -- as a plain (non-gzip)
+    # stream, which the real Studio 5000 SDK may not tolerate even though
+    # this library's own reader (Unzip) is lenient and sniffs the gzip
+    # magic bytes before deciding whether to decompress.
+    #
+    # Verified against a real project: Rockwell's own encoder uses gzip
+    # compresslevel=1 (fastest) with mtime=0 (no embedded timestamp) --
+    # with those two params, Python's gzip.compress() output is byte-for-
+    # byte identical to the original from offset 10 onward (the entire
+    # DEFLATE payload + CRC32 + ISIZE trailer). The only remaining
+    # difference is the header's XFL/OS bytes (offsets 8-9), which are
+    # purely informational per RFC 1952 and have zero effect on
+    # decompression -- patched here anyway for a fully byte-identical
+    # round-trip when the content itself is unchanged (Rockwell's encoder
+    # writes XFL=0x00, OS=0x0b/NTFS; Python defaults to XFL=0x04, OS=0xff).
+    compressed = bytearray(gzip.compress(new_dat, compresslevel=1, mtime=0))
+    compressed[8] = 0x00   # XFL
+    compressed[9] = 0x0B   # OS = NTFS
+    return bytes(compressed)

@@ -117,6 +117,14 @@ for path, text in tag._comments:
 #   SorterStatusToGradeScan.SorterFeedback.UsingScanSolution: Should Be 1 if...
 ```
 
+These same per-element/per-bit comments are also emitted as a standalone `<Comments>` block
+in `tag.to_xml()` / L5X output (right after `<Description>`, before `<Data>`), matching a real
+Studio 5000 export — verified byte-exact (`Operand="..."` is the path above with the tag name
+stripped and upper-cased, e.g. `Operand=".GAIN"`, `Operand="[2,2,1].BFRLUG.Z5_SAWPATTERN.3"`).
+This only covers regular controller/program-scoped `<Tag>` elements — per-bit comments on I/O
+module connections (`<Module><Connections><Connection><InputTag>/<OutputTag><Comments>`) are not
+yet emitted (see the note under "Convert ACD to L5X" below).
+
 I/O module tags (name contains `:`) are also available separately via `controller.io_tags`,
 and alias tags via `controller.alias_tags`:
 
@@ -146,7 +154,7 @@ The output is pretty-printed by default. Pass `pretty_print=False` for a compact
 ConvertAcdToL5x("MyController.ACD", "MyController.L5X", pretty_print=False).extract()
 ```
 
-> **Note** — The L5X serialisation captures tags, programs, routines, rungs, UDTs, and AOIs with their initial values. Hardware module metadata (catalog numbers, connection parameters) is not fully round-tripped because Rockwell stores those as opaque CIP identity records rather than as strings.
+> **Note** — The L5X serialisation captures tags, programs, routines, rungs, UDTs, and AOIs with their initial values, along with per-tag `<Description>` and `<Comments>` blocks. Hardware module metadata (catalog numbers, connection parameters) is not fully round-tripped because Rockwell stores those as opaque CIP identity records rather than as strings, and per-bit comments on I/O module connections (`<Module><Connections><Connection><InputTag>/<OutputTag><Comments>`) are not yet emitted. A whole-project structural comparison against a real Studio 5000 export (one large real-world project) also turned up small, not-yet-root-caused count differences in `<Tag>`/`<Module>`/`<Routine>`/`<Program>`/`<Rung>`/`<Description>` elements — see `CLAUDE.md`'s "Known limitations" for details. Tag-level description/comment fidelity itself was verified byte-exact against that same project.
 
 ---
 

@@ -1,4 +1,5 @@
 import html
+import math
 import os
 import re
 import shutil
@@ -275,7 +276,23 @@ def _l5k_real_literal(value: float) -> str:
     """Format a REAL/LREAL value in Rockwell's L5K scientific-notation
     convention: 8 decimal digits, 3-digit zero-padded exponent, e.g.
     1.0 -> "1.00000000e+000", -0.5 -> "-5.00000000e-001".
+
+    NaN/Infinity: a real project was found with several uninitialized REAL
+    tags decoding to non-finite values, which previously crashed this
+    function entirely (str.split("e") on a mantissa with no "e", since
+    Python formats these as bare "nan"/"inf"). Confirmed against that same
+    project's own Studio 5000 L5X export -- Rockwell renders these using
+    the classic MSVC CRT convention, with the special-value label left
+    padded with zeros into the same 8-character mantissa slot a normal
+    number would occupy: "1.#QNAN000e+000" for NaN, "1.#INF0000e+000" for
+    +Infinity. The sign-prefixed forms ("-1.#QNAN...", "-1.#INF...") and
+    the classic "-1.#IND" indeterminate-NaN special case were not observed
+    in any real sample and are inferred by symmetry, not verified.
     """
+    if math.isnan(value) or math.isinf(value):
+        label = "#QNAN" if math.isnan(value) else "#INF"
+        sign = "-" if math.copysign(1.0, value) < 0 else ""
+        return f"{sign}1.{label.ljust(8, '0')}e+000"
     if value == 0.0:
         return "0.00000000e+000"
     formatted = f"{value:.8e}"  # e.g. "1.00000000e+00" or "-5.00000000e-01"
@@ -283,6 +300,33 @@ def _l5k_real_literal(value: float) -> str:
     sign = exp[0]
     exp_digits = exp[1:].zfill(3)
     return f"{mantissa}e{sign}{exp_digits}"
+
+
+def _decorated_real_literal(value: float, in_array: bool) -> str:
+    """Format a REAL/LREAL value for a Decorated Value="..." attribute
+    (DataValue/DataValueMember for a scalar, Array Element for an array).
+
+    Finite values use the normal "%.6g"-style short form Studio 5000 uses
+    for Decorated (distinct from L5K's fixed 8-digit scientific notation,
+    see _l5k_real_literal). NaN/Infinity: confirmed against a real
+    project's own Studio 5000 export that a *scalar* tag's Decorated NaN
+    value is the bare label "1.#QNAN" (no padding/exponent, unlike L5K) --
+    the analogous "1.#INF" for scalar Infinity was not observed but is
+    inferred by direct symmetry. An *array* Element's Decorated value for
+    the one non-finite case observed (+Infinity) was instead the truncated
+    "1.$" -- a real, reproducible quirk/bug in Studio 5000's own array
+    Decorated-value exporter (distinct from the scalar case), applied here
+    for NaN too since no counter-evidence exists and the truncation looks
+    like a generic "any '#'-prefixed special-value label gets mangled in
+    this code path" bug rather than one specific to Infinity.
+    """
+    if math.isnan(value) or math.isinf(value):
+        if in_array:
+            return "-1.$" if math.copysign(1.0, value) < 0 else "1.$"
+        label = "#QNAN" if math.isnan(value) else "#INF"
+        sign = "-" if math.copysign(1.0, value) < 0 else ""
+        return f"{sign}1.{label}"
+    return f"{value:.6g}"
 
 # Radix string used in Decorated DataValueMember for each numeric primitive.
 # BOOL and BIT use no Radix attribute; REAL/LREAL use "Float"; all integers use "Decimal".
@@ -628,8 +672,15 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
             # Array of primitives
             radix = _PRIMITIVE_RADIX.get(mdt_upper, "Decimal")
             zero = _PRIMITIVE_DECORATED_ZERO.get(mdt_upper, "0")
+
+            def _fmt_member_elem(v):
+                if isinstance(v, float):
+                    return _decorated_real_literal(v, in_array=True)
+                return v
+
             elems = "".join(
-                f'<Element Index="[{i}]" Value="{v}"/>' for i, v in enumerate(val)
+                f'<Element Index="[{i}]" Value="{_fmt_member_elem(v)}"/>'
+                for i, v in enumerate(val)
             )
             parts.append(
                 f'<ArrayMember Name="{mname}" DataType="{mdt}" '
@@ -645,9 +696,14 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
 
         else:
             radix = _PRIMITIVE_RADIX.get(mdt_upper, "Decimal")
+            member_val = (
+                _decorated_real_literal(val, in_array=False)
+                if isinstance(val, float)
+                else val
+            )
             parts.append(
                 f'<DataValueMember Name="{mname}" DataType="{mdt}" '
-                f'Radix="{radix}" Value="{val}"/>'
+                f'Radix="{radix}" Value="{member_val}"/>'
             )
 
     return "".join(parts)
@@ -1346,7 +1402,7 @@ class Tag(L5xElement):
                         if dt_base in ("BOOL", "BIT"):
                             return "1" if val else "0"
                         if isinstance(val, float):
-                            return f"{val:.6g}"
+                            return _decorated_real_literal(val, in_array=True)
                         return str(int(val))
 
                     # NOTE: array-element comments go in the tag's standalone
@@ -1397,7 +1453,7 @@ class Tag(L5xElement):
                         val_str = "1" if iv else "0"
                         l5k_val = val_str
                     elif isinstance(iv, float):
-                        val_str = f"{iv:.6g}"
+                        val_str = _decorated_real_literal(iv, in_array=False)
                         l5k_val = _l5k_real_literal(iv)
                     else:
                         val_str = str(int(iv))

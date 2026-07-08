@@ -183,6 +183,27 @@ _PRIMITIVE_L5K_ZERO: Dict[str, str] = {
 }
 
 
+def _l5k_array_literal(dt_base: str, values: list) -> str:
+    """Format a primitive array's values as an L5K array literal, e.g.
+    "[2#0,2#1,2#0]" for BOOL, "[1,2,3]" for DINT.
+
+    Verified against a real project's <Data Format="L5K"> for a 256-element
+    BOOL array tag: BOOL/BIT use the "2#0"/"2#1" binary-literal prefix;
+    other integer types are plain decimal; REAL/LREAL use the same
+    scientific-notation convention as the scalar case (_l5k_real_literal).
+    The real sample line-wraps the literal for readability, but that's
+    whitespace-insignificant for both XML and L5K parsing, so this emits
+    a single line.
+    """
+    if dt_base in ("BOOL", "BIT"):
+        parts = [f"2#{1 if v else 0}" for v in values]
+    elif dt_base in ("REAL", "LREAL"):
+        parts = [_l5k_real_literal(v) for v in values]
+    else:
+        parts = [str(int(v)) for v in values]
+    return "[" + ",".join(parts) + "]"
+
+
 def _l5k_real_literal(value: float) -> str:
     """Format a REAL/LREAL value in Rockwell's L5K scientific-notation
     convention: 8 decimal digits, 3-digit zero-padded exponent, e.g.
@@ -1219,9 +1240,23 @@ class Tag(L5xElement):
                         )
                     elems = "".join(elems_parts)
                     dim_str = self.dimensions or "1"
+                    # A primitive array tag with a known value gets BOTH a
+                    # <Data Format="L5K"> block AND the <Data Format="Decorated">
+                    # block, same as the scalar case below -- verified against a
+                    # real 256-element BOOL array tag; previously only Decorated
+                    # was emitted here, silently dropping L5K entirely (this was
+                    # the likely trigger for a real Logix Designer crash during
+                    # a native Import Routine attempt using this tag as context).
+                    l5k_array_val = _l5k_array_literal(dt_base, iv)
                     data_xml = (
+                        f'<Data Format="L5K">\n<![CDATA[{l5k_array_val}]]>\n</Data>'
                         f'<Data Format="Decorated">\n'
-                        f'<Array Name="{self.name}" DataType="{dt_base}" '
+                        # Verified against a real project: a top-level tag's
+                        # own <Array> Decorated element has no Name= attribute
+                        # (unlike a nested ArrayMember inside a Structure,
+                        # which does carry one) -- previously this incorrectly
+                        # included Name="{self.name}".
+                        f'<Array DataType="{dt_base}" '
                         f'Dimensions="{dim_str}" Radix="{radix_attr}">{elems}</Array>\n'
                         f'</Data>'
                     )

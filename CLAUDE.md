@@ -236,16 +236,18 @@ the logs if you ever suspect a module's connection Type is wrong.
   separate from (and larger than) the regular per-`<Tag>` `<Comments>` block, which **is**
   implemented and was verified byte-exact against that same project (see comment-resolution
   section above).
-- **Whole-project L5X fidelity has only been spot-checked, not fully verified.** A structural
-  element-count comparison against one real project's own Studio 5000 L5X export
-  (`<Tag>`/`<DataType>`/`<Module>`/`<AOI>`/`<Routine>`/`<Rung>`/`<Program>`/`<Comment
-  Operand=`/`<Description>` counts) found `DataType` and `AddOnInstructionDefinition` counts
-  match exactly, but `Tag` (+12), `Module` (+3), `Routine` (+9), `Program` (+1), `Rung` (-1), and
-  `Description` (-40) do not, and none of these have been root-caused yet. These are being left
-  as open items to resolve opportunistically (e.g. while implementing/verifying a specific
-  routine or UDT export) rather than as a dedicated investigation — don't assume whole-project
-  L5X output is byte-identical to a real Studio 5000 export just because a specific feature
-  (like tag comments) was verified exact.
+- **Whole-project L5X fidelity, update**: a full whole-project element-count comparison against a
+  real Studio 5000 L5X export (see "Whole-project element-count verification" below) found and
+  fixed real bugs causing `Tag`/`Module`/`Program`/`Routine`/`Rung` count mismatches — all five
+  are now **exact matches** (0 diff), joining `DataType`/`AddOnInstructionDefinition`. `Description`
+  is also now much closer (was -40, now only short by the module-comment gap above plus a few
+  `<Trend>`/`<Pen>` descriptions, since Trends aren't implemented at all — see above) after fixing
+  a real comment-dedup bug (see below). **`Comment` (rung-level specifically) is still a large,
+  currently-unsolved gap**: only 98 of 582 real rung comments are emitted for one real project —
+  see "Rung comments: multiple comments per routine cannot be attributed to the correct rung"
+  below for the full investigation. Don't assume whole-project L5X output is byte-identical to a
+  real Studio 5000 export just because a specific feature (like tag comments, or these
+  element counts) was verified exact — rung-comment content specifically is known-incomplete.
 - `_decode_udt_initial_value`/`_decode_single_udt_element` (initial-*value* decoding from the
   data-table blob, `elements.py`) has a hardcoded recursion depth limit of 3 nested structs —
   this is a generic safety cap (not tied to any specific type/module), separate from the
@@ -411,6 +413,87 @@ on Windows blindly replaces every `"\n"` with `"\r\n"`, including the `"\n"` hal
 already-present `"\r\n"` pair from the ACD's own raw text, which doubles into `"\r\r\n"` (renders
 as a spurious blank line) if left un-normalized. Caught by comparing byte-for-byte against a real
 export where line breaks were single, not doubled.
+
+## Whole-project element-count verification, and a real Comments.Dat dedup bug
+
+`export_routine()` and individual-tag/routine spot-checks had been the only verification method
+until this investigation: exporting an entire real project's `to_xml()` and comparing element
+counts (`<Tag>`, `<Module>`, `<Routine>`, `<Rung>`, `<Program>`, `<Description>`, `<Comment>`,
+...) against that same project's own Studio 5000 L5X export. This surfaced several real bugs no
+per-feature test had caught (see "Known limitations" for the ones still open):
+
+- **Phantom `<Program>`/`<Module>`/`<Tag>`/`<Routine>` elements**: deleted-but-not-purged comps
+  records with a distinct `record_type` (or, for Routine, a `routine_type_enum(0) ==
+  "TypeLess"` CIP value) that don't appear in the real L5X at all. Fixed by filtering these out
+  in `ControllerBuilder`/`ProgramBuilder`/`RoutineBuilder` — see each builder's own inline
+  comments for the specific record_type values found.
+- **`populate_region_map()`'s read loop silently dropped the table's last entry** (an erroneous
+  `- 4` in the loop bound, present since the function was first written) — lost whichever single
+  16-byte entry happened to be physically last in the whole table, which for one real project
+  landed in the *middle* of one routine's own rung sequence, silently shifting every subsequent
+  rung's number by one in that routine alone. Fixed by removing the `- 4` (verified: `region_length`
+  is always an exact multiple of 16 across every local fixture and this real project).
+- **A real comment-dedup bug, found via a routine's own missing `<Description>`**: the
+  `seen[key]` dedup step in `export_l5x.py` (see the comment-resolution notes above) used
+  `(parent, tag_reference, scope_id)` as its key, keeping whichever candidate had the longest
+  text. A routine's own whole-routine Description (`rung_content == 0`) and one of its *rung*
+  comments (`rung_content != 0`) can share the exact same `(parent, tag_reference="", scope_id,
+  object_id)` — found via a real "Get_Bin" routine where the real Description ("Find bin for
+  current set") was shorter than an unrelated rung comment sharing the same key, so the
+  dedup step silently kept the rung comment and discarded the Description. Fixed by adding
+  `rung_content` to the dedup key. This also means a **routine can have at most one dedup
+  collision saved per (parent, tag_reference, scope_id, rung_content) tuple** — see the next
+  section for a related, *unsolved* problem this investigation also uncovered.
+
+## Rung comments: multiple comments per routine cannot be attributed to the correct rung (unsolved)
+
+**This is a known, currently-unsolved gap, not a bug with an identified fix** — documented here
+in detail so a future session doesn't repeat the same dead ends.
+
+`RoutineBuilder.build()` currently assumes a rung comment's `object_id` (the comments table
+column, read from the `AsciiRecord` body's own dedicated `object_id` field, distinct from
+`rung_content`) directly encodes `rung_index = object_id - 1` (rung 0 → object_id 1). **This is
+wrong for any routine with more than one rung comment**: verified against a real project that
+`object_id` (and `member_ref`) are identical across *every* rung-comment row sharing the same
+routine's `(parent, scope_id)` key — e.g. all 26 of one real `Main` routine's rung comments had
+`object_id=1, member_ref=3866099821`, both constant. The only per-comment-varying field is
+`rung_content` itself (`AsciiRecord` body bytes `[4:8]` of `unknown_1`), currently only used as a
+boolean "is this a rung comment vs. the whole-routine description" flag (`if rung_content:` in
+`RoutineBuilder.build()`) — its actual *value* was assumed to be irrelevant. Whole-project
+verification exposed the real consequence: a project with 582 real rung comments (per its own
+Studio 5000 L5X export) only produced 98 via our code — every routine with 2+ rung comments
+collapses down to just one (whichever `RoutineBuilder.build()`'s dict-building loop happens to
+process for that `rung_index` slot first, since every comment maps to the same wrong index).
+
+**What was tried and ruled out** (verified against the real "Main" routine's 26 rung comments,
+cross-referenced against that routine's real rung numbers from its own Studio 5000 L5X export):
+- `rung_content`'s raw bytes do not appear *anywhere* else in the ACD, searched as a raw
+  little-endian `u32` across `Comps.Dat`, `SbRegion.Dat` (including the currently-unused
+  `"REGION LE UID"` record type's trailing UID field — a promising-looking lead that turned out
+  not to match), `Nameless.Dat`, `XRefs.Dat`, and `RegnLink.Dat`. If it's an object reference at
+  all, it isn't a direct/literal one.
+- Not a `float`/`double` reinterpretation (decoded values are nonsensical, e.g. `1.68e-26`,
+  `-157837967360.0`) — not any kind of position/ordering hint either (sorting by the raw integer
+  value does not reproduce the real rung order).
+- Not simple file/record enumeration order in `Comments.Dat` either (the raw `DbExtract` record
+  index order for these 26 comments does not match their real rung-number order).
+- Every one of the 26 values shares `0xFF` in exactly the same byte position (the second-least-
+  significant byte, e.g. `0xD212FF81`, `0xE735FF84`, ...) — a real, non-coincidental pattern
+  (looks like a tagged/flagged reference scheme of some kind), but no further meaning was found;
+  masking/dropping that byte doesn't yield a value found anywhere else either.
+
+**Practical impact**: a routine with exactly one rung comment works correctly today (no
+ambiguity to resolve, since there's only one candidate for the one dict slot). Any routine with
+two or more rung comments will silently show only one of them (and it may be attributed to the
+wrong rung number). This is a strictly bigger real-world gap than the Description-dedup bug
+above (582 vs. 98 rung comments in one real project) but has no identified root cause yet.
+
+**Suggested next step if revisited**: export several minimal, purpose-built ACD/L5X pairs (via
+Studio 5000 directly) with a small number of *known* rung comments in *known* rung positions —
+e.g. a routine with exactly 2 rung comments a few rungs apart, then one with 3, then one with a
+comment on rung 0 specifically — and diff the raw `Comments.Dat` bytes between each variant to
+isolate exactly which bytes change as comments are added/moved, rather than continuing to
+pattern-match against one large, already-existing project's data.
 
 ## UDT L5K rendering (`_l5k_udt_literal`)
 

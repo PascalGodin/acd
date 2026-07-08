@@ -823,15 +823,29 @@ def _l5k_string_padded(text: str, capacity: int) -> str:
     text itself is escaped the same way ($-prefixed) per Rockwell's L5K
     string-literal convention.
 
-    A raw NUL byte (``\\x00``) can end up inside *text* itself (not just the
-    computed padding) if a nested string member's decoded length includes
-    what's actually unused/uninitialized data -- found via a real UDT array
-    tag's L5K rendering, where a raw NUL byte in the text produced
-    non-well-formed XML (control characters are illegal in XML 1.0 outside
-    CDATA-escaping). Escaped the same way as computed padding (``$00``) so
-    this can never happen regardless of the root cause.
+    Raw control bytes (not just ``\\x00``) can end up inside *text* itself
+    (not just the computed padding) if a nested string member's decoded
+    length includes what's actually unused/uninitialized data. First found
+    via a real UDT array tag's L5K rendering with an embedded NUL; a second,
+    wider real-project sample (a whole-project export) hit the exact same
+    class of bug with a raw ``\\x1c`` byte instead, confirming this isn't
+    NUL-specific -- any control character is illegal raw XML content
+    (outside CDATA-escaping) and must be handled the same way. Confirmed
+    against that project's own Studio 5000 L5X export that Rockwell's own
+    convention is a general ``$XX`` (uppercase hex) escape for *every*
+    control character, not just NUL -- real examples found: ``$00``, ``$01``,
+    ``$0B``, ``$1B`` (the last one inside a Decorated array Element's
+    ``Value="..."`` attribute, confirming this same escaping applies beyond
+    just the L5K literal too). Escaping every control character (0x00-0x1F,
+    0x7F) this way, rather than just NUL, so this can never happen again
+    regardless of which specific byte value the root-cause garbage data
+    happens to produce.
     """
-    escaped = text.replace("$", "$$").replace("'", "$'").replace("\x00", "$00")
+    escaped = text.replace("$", "$$").replace("'", "$'")
+    escaped = "".join(
+        f"${ord(ch):02X}" if ord(ch) < 0x20 or ord(ch) == 0x7F else ch
+        for ch in escaped
+    )
     pad = "$00" * max(capacity - len(text), 0)
     return f"'{escaped}{pad}'"
 
@@ -3128,7 +3142,23 @@ def routine_type_enum(idx: int) -> str:
 
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
-    def build(self) -> Routine:
+    def build(self) -> Union[Routine, None]:
+        """Build a Routine, or None if this comps record is a deleted/placeholder
+        object rather than a real routine.
+
+        A real project was found with several extra RxRoutineCollection children
+        (under multiple different programs) that don't appear in that project's
+        own Studio 5000 L5X export at all. Their record_type value varies
+        inconsistently (515, 512, 0 -- not one consistent marker, unlike the
+        clean record_type discriminator used for Program/Module), but every one
+        of them shares the same real signal: either the record is too short/
+        malformed for RxGeneric to parse at all, or it parses fine but resolves
+        to routine_type_enum(0) == "TypeLess" -- a genuine CIP enum value
+        Rockwell itself uses to mark a deleted/placeholder routine, not a
+        parsing artifact. Returning None here (and filtering it out at both
+        call sites) matches Studio 5000's own behavior of omitting these
+        entirely rather than emitting a phantom <Routine Type=""/>.
+        """
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
             + str(self._object_id)
@@ -3138,13 +3168,15 @@ class RoutineBuilder(L5xElementBuilder):
         try:
             r = RxGeneric.from_bytes(results[0][3])
         except Exception as e:
-            return Routine(results[0][0], results[0][0], "", [])
+            return None
 
         record = results[0][3]
         name = results[0][0]
         routine_type = routine_type_enum(
             struct.unpack_from("<H", r.record_buffer, 0x30)[0]
         )
+        if routine_type == "TypeLess":
+            return None
 
         self._cur.execute(
             "SELECT rm.object_id, r.rung FROM region_map rm "
@@ -3489,9 +3521,11 @@ class AoiBuilder(L5xElementBuilder):
             )
             for (child_oid,) in self._cur.fetchall():
                 try:
-                    routines.append(RoutineBuilder(self._cur, child_oid).build())
+                    routine = RoutineBuilder(self._cur, child_oid).build()
                 except Exception:
-                    pass
+                    routine = None
+                if routine is not None:
+                    routines.append(routine)
 
         # --- Description + RevisionNote ---
         aoi_description: Union[str, None] = None
@@ -3591,7 +3625,9 @@ class ProgramBuilder(L5xElementBuilder):
             )
             routine_results = self._cur.fetchall()
             for child in routine_results:
-                routines.append(RoutineBuilder(self._cur, child[1]).build())
+                routine = RoutineBuilder(self._cur, child[1]).build()
+                if routine is not None:
+                    routines.append(routine)
 
         # Get the Program Scoped Tags
         self._cur.execute(

@@ -141,7 +141,7 @@ class Member(L5xElement):
     target: Union[str, None]      # BIT members only; None omits the attribute
     bit_number: Union[int, None]  # BIT members only; None omits the attribute
     external_access: str
-    byte_offset: int = 0
+    _byte_offset: int = 0
     _description: Union[str, None] = field(default=None)
 
     @property
@@ -204,6 +204,18 @@ _PRIMITIVE_L5K_ZERO: Dict[str, str] = {
 }
 
 
+def _l5k_prim_literal(dt_upper: str, val) -> str:
+    """Format a single primitive value in Rockwell's L5K convention:
+    "2#0"/"2#1" for BOOL/BIT, scientific notation for REAL/LREAL
+    (_l5k_real_literal), plain decimal for every other integer type.
+    """
+    if dt_upper in ("BOOL", "BIT"):
+        return f"2#{1 if val else 0}"
+    if dt_upper in ("REAL", "LREAL"):
+        return _l5k_real_literal(val)
+    return str(int(val))
+
+
 def _l5k_array_literal(dt_base: str, values: list) -> str:
     """Format a primitive array's values as an L5K array literal, e.g.
     "[2#0,2#1,2#0]" for BOOL, "[1,2,3]" for DINT.
@@ -216,12 +228,46 @@ def _l5k_array_literal(dt_base: str, values: list) -> str:
     whitespace-insignificant for both XML and L5K parsing, so this emits
     a single line.
     """
-    if dt_base in ("BOOL", "BIT"):
-        parts = [f"2#{1 if v else 0}" for v in values]
-    elif dt_base in ("REAL", "LREAL"):
-        parts = [_l5k_real_literal(v) for v in values]
-    else:
-        parts = [str(int(v)) for v in values]
+    return "[" + ",".join(_l5k_prim_literal(dt_base, v) for v in values) + "]"
+
+
+def _l5k_udt_literal(dt_name: str, values, data_types_map: Dict[str, 'DataType']) -> str:
+    """Format a decoded UDT scalar or array value as an L5K literal, e.g.
+    "[1,0,0,0,0,7,0,0,0,0,38387892,0]" for a scalar struct, or
+    "[[...],[...],...]" for an array of structs -- member values in
+    declaration order (same order/skip rules as _udt_scalar_to_xml:
+    hidden and BIT members omitted), comma-separated, recursively
+    bracketed for nested structs/arrays. Verified against a real 25-element
+    UDT array tag (To_Skip[25]): every element's L5K literal matches
+    Studio 5000's own <Data Format="L5K"> content exactly.
+    """
+    if isinstance(values, list):
+        return "[" + ",".join(_l5k_udt_literal(dt_name, v, data_types_map) for v in values) + "]"
+
+    if _is_string_family_type(dt_name, data_types_map):
+        length = values.get("LEN", 0)
+        text = values.get("DATA", "")
+        cap = _string_family_capacity(dt_name, data_types_map)
+        return f"[{length},{_l5k_string_padded(text, cap)}]"
+
+    dt_obj = data_types_map.get(dt_name.upper())
+    if dt_obj is None:
+        return "[]"
+
+    parts: List[str] = []
+    for member in dt_obj.members:
+        if member.hidden or member.data_type == "BIT":
+            continue
+        val = values.get(member.name)
+        if val is None:
+            continue
+        mdt = member.data_type
+        if isinstance(val, dict) or (isinstance(val, list) and val and isinstance(val[0], dict)):
+            parts.append(_l5k_udt_literal(mdt, val, data_types_map))
+        elif isinstance(val, list):
+            parts.append(_l5k_array_literal(mdt.upper(), val))
+        else:
+            parts.append(_l5k_prim_literal(mdt.upper(), val))
     return "[" + ",".join(parts) + "]"
 
 
@@ -720,8 +766,16 @@ def _l5k_string_padded(text: str, capacity: int) -> str:
     against a real Studio 5000 L5X export. Any literal ``$`` or ``'`` in the
     text itself is escaped the same way ($-prefixed) per Rockwell's L5K
     string-literal convention.
+
+    A raw NUL byte (``\\x00``) can end up inside *text* itself (not just the
+    computed padding) if a nested string member's decoded length includes
+    what's actually unused/uninitialized data -- found via a real UDT array
+    tag's L5K rendering, where a raw NUL byte in the text produced
+    non-well-formed XML (control characters are illegal in XML 1.0 outside
+    CDATA-escaping). Escaped the same way as computed padding (``$00``) so
+    this can never happen regardless of the root cause.
     """
-    escaped = text.replace("$", "$$").replace("'", "$'")
+    escaped = text.replace("$", "$$").replace("'", "$'").replace("\x00", "$00")
     pad = "$00" * max(capacity - len(text), 0)
     return f"'{escaped}{pad}'"
 
@@ -788,12 +842,12 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
             # this, every member/struct size computed *after* a BOOL array
             # member is wrong, corrupting offsets for any subsequent element
             # in an array of that struct.
-            member_end = m.byte_offset + (((m.dimension + 31) // 32) * 4)
+            member_end = m._byte_offset + (((m.dimension + 31) // 32) * 4)
         else:
             elem_sz = _get_type_size(m.data_type, data_types_map)
             if elem_sz == 0:
                 continue
-            member_end = m.byte_offset + (elem_sz * max(m.dimension, 1))
+            member_end = m._byte_offset + (elem_sz * max(m.dimension, 1))
         max_end = max(max_end, member_end)
     return max_end if max_end > 0 else 0
 
@@ -986,7 +1040,7 @@ def _decode_single_udt_element(
         mname = member.name
         mdt = member.data_type
         mdt_upper = mdt.upper()
-        off = base_offset + member.byte_offset
+        off = base_offset + member._byte_offset
 
         bn = member.bit_number if mdt_upper == "BOOL" else None
         if member.dimension > 0:
@@ -1240,22 +1294,37 @@ class Tag(L5xElement):
                 )
 
             elif isinstance(iv, dict):
-                # UDT scalar
+                # UDT scalar. Verified against a real project: this also
+                # gets a <Data Format="L5K"> block alongside Decorated,
+                # same as every other known-value tag shape (scalar
+                # primitives, primitive arrays) -- previously only
+                # Decorated was emitted here.
+                l5k_udt_val = _l5k_udt_literal(dt_base, iv, self._data_types_map)
                 body = (
                     f'<Structure DataType="{dt_base}">'
                     f'{_udt_scalar_to_xml(dt_base, iv, self._data_types_map)}'
                     f'</Structure>'
                 )
-                data_xml = f'<Data Format="Decorated">\n{body}\n</Data>'
+                data_xml = (
+                    f'<Data Format="L5K">\n<![CDATA[{l5k_udt_val}]]>\n</Data>'
+                    f'<Data Format="Decorated">\n{body}\n</Data>'
+                )
 
             elif isinstance(iv, list) and iv and isinstance(iv[0], dict):
-                # UDT array
+                # UDT array. Same L5K-block fix as the scalar case above --
+                # verified against a real 25-element UDT array tag
+                # (To_Skip[25]): the real export has both L5K and
+                # Decorated blocks, previously only Decorated was emitted.
                 dim_str = self.dimensions or "1"
                 body = _udt_array_to_xml(
                     self.name, dt_base, iv, dim_str, self._data_types_map
                 )
                 if body:
-                    data_xml = f'<Data Format="Decorated">\n{body}\n</Data>'
+                    l5k_udt_val = _l5k_udt_literal(dt_base, iv, self._data_types_map)
+                    data_xml = (
+                        f'<Data Format="L5K">\n<![CDATA[{l5k_udt_val}]]>\n</Data>'
+                        f'<Data Format="Decorated">\n{body}\n</Data>'
+                    )
 
             elif dt_base in _PRIM:
                 radix_attr = _PRIMITIVE_RADIX.get(dt_base, "Decimal")
@@ -1664,8 +1733,14 @@ class Routine(L5xElement):
     rungs: List[str]
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
+    _description: Union[str, None] = field(default=None)
 
     def to_xml(self) -> str:
+        desc_xml = ""
+        if self._description:
+            desc = _multiline_xml_text(self._description)
+            desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
+
         rll_content = ""
         if self.type == "RLL" and self.rungs:
             rung_xmls = []
@@ -1685,7 +1760,7 @@ class Routine(L5xElement):
                 )
             if rung_xmls:
                 rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
-        return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{rll_content}</Routine>'
+        return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{rll_content}</Routine>'
 
 
 @dataclass
@@ -2022,7 +2097,7 @@ class MemberBuilder(L5xElementBuilder):
         return Member(
             name, name, data_type, dimension, radix, hidden,
             target, bit_number, external_access,
-            byte_offset=byte_offset,
+            _byte_offset=byte_offset,
             _description=description,
         )
 
@@ -3054,22 +3129,37 @@ class RoutineBuilder(L5xElementBuilder):
         # rung comments entirely (e.g. "Flasher" showing a comment that was
         # actually written for a completely different tally/sorting routine).
         rung_comments: Dict[int, str] = {}
+        # The routine's own whole-routine description shares the exact same
+        # record shape as rung comments (record_type=1, same parent/scope_id)
+        # but with rung_content==0 -- previously treated purely as "internal
+        # metadata to exclude" (per the note above), but verified against a
+        # real project that this is actually the routine's own Description
+        # (e.g. "Shift the Data on the Grading Chain and Start a Skip if
+        # needed" for a real "Lug_Skip" routine) -- rendered by Studio 5000
+        # as a <Description> child of <Routine>, before <RLLContent>.
+        description: Union[str, None] = None
         try:
             own_scope_id = struct.unpack_from("<H", record, 16)[0] if len(record) >= 18 else 0
             comment_parent = (r.comment_id * 0x10000) + r.cip_type
             self._cur.execute(
-                "SELECT object_id, record_string FROM comments "
-                "WHERE parent=? AND scope_id=? AND record_type=1 AND rung_content!=0",
+                "SELECT object_id, record_string, rung_content FROM comments "
+                "WHERE parent=? AND scope_id=? AND record_type=1",
                 (comment_parent, own_scope_id),
             )
-            for obj_id, rec_str in self._cur.fetchall():
-                rung_index = obj_id - 1  # convert 1-based to 0-based
-                if rung_index >= 0 and rec_str and rung_index not in rung_comments:
-                    rung_comments[rung_index] = rec_str
+            desc_candidates = []
+            for obj_id, rec_str, rung_content in self._cur.fetchall():
+                if rung_content:
+                    rung_index = obj_id - 1  # convert 1-based to 0-based
+                    if rung_index >= 0 and rec_str and rung_index not in rung_comments:
+                        rung_comments[rung_index] = rec_str
+                elif rec_str:
+                    desc_candidates.append(rec_str)
+            if desc_candidates:
+                description = max(desc_candidates, key=len)
         except Exception:
             pass
 
-        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments)
+        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments, description)
 
 
 def _parse_fffeff(data: bytes, offset: int):

@@ -1208,20 +1208,18 @@ class Tag(L5xElement):
                 radix_attr = _PRIMITIVE_RADIX.get(dt_base, "Decimal")
 
                 if isinstance(iv, list):
-                    # Array: omit trailing zero elements.
-                    non_zero_end = 0
-                    for i in range(len(iv) - 1, -1, -1):
-                        v = iv[i]
-                        if dt_base in ("BOOL", "BIT"):
-                            if v != 0:
-                                non_zero_end = i + 1
-                                break
-                        elif isinstance(v, (int, float)):
-                            if v != 0.0 and v != 0:
-                                non_zero_end = i + 1
-                                break
-                    non_zero_end = max(non_zero_end, 1)
-
+                    # Array: emit every element at the tag's full declared
+                    # length. A previous version omitted trailing zero
+                    # elements -- that was never verified against real
+                    # Studio 5000 output, and a real "Export Routine"
+                    # sample directly contradicts it (a 256-element BOOL
+                    # array was shown in full, not truncated). Worse: a
+                    # truncated array was the likely trigger for a real
+                    # Logix Designer crash (0x80004003 "Invalid pointer")
+                    # during a native Import Routine attempt using a
+                    # context tag built from this data -- so this is not
+                    # just a cosmetic fidelity gap, do not reintroduce
+                    # truncation here without solid verification first.
                     def _fmt_elem_val(val):
                         if dt_base in ("BOOL", "BIT"):
                             return "1" if val else "0"
@@ -1234,7 +1232,7 @@ class Tag(L5xElement):
                     # _build_comments_xml), never embedded inline here
                     # (verified: zero such occurrences in a real project).
                     elems_parts = []
-                    for i in range(non_zero_end):
+                    for i in range(len(iv)):
                         val_attr = f'Value="{_fmt_elem_val(iv[i])}"'
                         elems_parts.append(
                             f'<Element Index="[{i}]" {val_attr}/>'

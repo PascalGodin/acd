@@ -78,19 +78,33 @@ def test_parse_tags_dat(controller):
 
 
 def test_scalar_primitive_tag_xml_shape(controller):
-    # Regression test for two bugs found while verifying export_routine()
+    # Regression test for bugs found while verifying export_routine()
     # against a real Studio 5000 "Export Routine" output: a scalar
-    # primitive tag with a known initial value (1) only emitted a
+    # primitive tag with a known initial value only emitted a
     # <Data Format="Decorated"> block, silently dropping the <Data
     # Format="L5K"> block a real tag always has alongside it, and (2) the
     # Decorated block used the DataType name as the XML element itself
     # (e.g. <BOOL Name="Tag" Value="1" Radix="Decimal"/>) instead of the
     # real <DataValue DataType="BOOL" Radix="Decimal" Value="1"/> shape.
+    #
+    # The expected value here is 0, not 1 -- a separate, much larger bug
+    # (fixed in the same investigation) turned out to affect which value
+    # this even is: _read_tag_initial_value() used the wrong offset (0x19E)
+    # for every scalar primitive tag project-wide. Verified against a real
+    # project: comparing 758 controller-scope scalar BOOL tags and 812 DINT
+    # tags against Studio 5000's own values, the old 0x19E offset matched
+    # only 21.4%/2.8% of the time, while the correct offset (0x1A2, the
+    # same one already used for arrays -- there never was a real
+    # scalar/array distinction) matched 100% for both. This test's own
+    # expected value (previously asserted as 1) was itself a casualty of
+    # that bug -- it was never independently verified against real ground
+    # truth for this small fixture, just whatever the wrong offset happened
+    # to produce.
     toggle = next((t for t in controller.tags if t.name == "Toggle"), None)
     assert toggle is not None, "Toggle tag not found"
     xml = toggle.to_xml()
     assert '<Data Format="L5K">' in xml
-    assert '<DataValue DataType="BOOL" Radix="Decimal" Value="1"/>' in xml
+    assert '<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>' in xml
     assert "<BOOL " not in xml
 
 

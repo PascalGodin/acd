@@ -825,8 +825,17 @@ def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
 
     raw_rec = bytes(rows[0][0])
 
-    # Determine read offset based on whether this is an array or scalar.
-    offset = 0x1A2 if n_elements > 1 else 0x19E
+    # The data-table blob's value region always starts at 0x1A2, for both
+    # scalar and array tags -- there is no separate "scalar offset".
+    # Verified against a real project: comparing every controller-scope
+    # scalar BOOL tag (758) and DINT tag (812) against Studio 5000's own
+    # values, the previously-used scalar offset 0x19E matched only 21.4%
+    # (BOOL) / 2.8% (DINT) of the time, while 0x1A2 matched 100% for both.
+    # 0x19E was apparently never actually verified against real ground
+    # truth for scalars -- it happened to coincidentally produce a
+    # plausible-looking nonzero byte for many BOOL tags (silently wrong)
+    # and equally-wrong garbage for DINT/other scalar types.
+    offset = 0x1A2
 
     # BOOL/BIT *arrays* are bit-packed by Rockwell -- 32 bits per 4-byte
     # DWORD, NOT one byte per element (a scalar BOOL, n_elements == 1, is

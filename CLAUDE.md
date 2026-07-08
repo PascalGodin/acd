@@ -253,6 +253,46 @@ the logs if you ever suspect a module's connection Type is wrong.
   limit at all. If you ever see a deeply-nested UDT's initial value silently come back empty,
   check this limit first.
 
+## Rung patch write-back (`patch_rungs`/`patch_sbregion_dat`)
+
+This path (`acd/zip/write_dat.py`) had **zero test coverage** until it was manually exercised
+against a real, large project and found to have two real bugs (both now fixed, with regression
+tests in `test/test_patch_rungs.py`):
+
+1. **Compression.** `patch_sbregion_dat()` used to return *decompressed* `SbRegion.Dat` bytes.
+   `build_acd_bytes()`/`save_acd()` never compresses anything — it writes whatever is in
+   `_raw_files` verbatim — so the patched file alone ballooned ~12x in a real project (1.08MB →
+   13.8MB decompressed) and was stored as a plain, non-gzip stream while every other internal
+   `.Dat`/`.Idx` file stays gzip-compressed. `patch_sbregion_dat()` now re-compresses before
+   returning. Rockwell's own encoder was reverse-engineered by trial: `gzip.compress(data,
+   compresslevel=1, mtime=0)` reproduces the **entire DEFLATE payload + CRC32 + ISIZE trailer
+   byte-for-byte** against a real project's original `SbRegion.Dat` — the only remaining
+   difference is the header's XFL/OS bytes (offsets 8-9 of the gzip stream), which are purely
+   informational per RFC 1952 and don't affect decompression; they're patched to Rockwell's
+   values anyway (`XFL=0x00`, `OS=0x0b`/NTFS) for a fully byte-identical no-op round-trip.
+2. **Hex-ref formatting.** `_restore_tag_refs()` re-encoded `@HEX_OBJECT_ID@` tag-reference
+   placeholders with `:X` (uppercase, no zero-padding). The real convention, verified by sampling
+   20,710 real `@...@` refs in one project's `SbRegion.Dat`, is **exactly 8 hex digits,
+   zero-padded, lowercase** (`:08x`), 0 of them uppercase. Using `:X` produced a
+   numerically-equivalent but textually different reference, so even a true no-op patch (rung
+   rewritten to its own existing text) silently produced different bytes.
+
+With both fixes, a no-op patch (rewrite a rung to its own current text) now reproduces the
+**exact original ACD container, byte-for-byte** — verified against both the small test fixture
+(`test_patch_rungs.py`) and a large real-world project manually. This is the strongest available
+confidence check for this write path, since it proves the full decompress → re-encode →
+recompress cycle is lossless and matches Rockwell's own encoding conventions closely enough to
+be indistinguishable from the source, without needing an actual Studio 5000 install to verify.
+
+**Still unverified: whether a real, non-no-op edit (i.e. actually different rung text) produces
+a file real Studio 5000 accepts.** Two separate open questions remain, neither resolved yet:
+- Without a registered `FileInfo.Dat` signing key (see `acd/integrity/`), any mutation leaves
+  the checksum stale; whether Studio 5000 actually enforces/checks this on open (as opposed to
+  only the SDK) is untested.
+- Even with a valid key, nobody has confirmed a `save_acd()`-produced, mutated ACD actually
+  opens correctly in real Studio 5000 — that would require an actual test against the real
+  software, which hasn't been done as of this writing.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests
@@ -261,7 +301,7 @@ the logs if you ever suspect a module's connection Type is wrong.
 - Some AB module DataType names contain `:` (e.g. `CHANNEL_DI_TIMESTAMP:O:0`), which is invalid
   in Windows paths — anything that turns a comp name into a filename/directory (see
   `DumpCompsRecords` in `elements.py`) needs to sanitize it first.
-- The full suite (`pytest` from repo root) should show `65 passed, 2 skipped, 0 failed`. If you
+- The full suite (`pytest` from repo root) should show `68 passed, 2 skipped, 0 failed`. If you
   see `FileNotFoundError`s or `PermissionError`s across many unrelated test files, first check
   you're not missing the `conftest.py` chdir behavior or that a previous test crashed and left
   a locked SQLite file/build artifact behind.

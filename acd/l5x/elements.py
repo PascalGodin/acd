@@ -3608,7 +3608,16 @@ class ProgramBuilder(L5xElementBuilder):
             self._cur.execute(
                 "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
                 + str(results[0][1])
+                + " AND record_type != 264"
             )
+            # record_type=264 marks internal AOI default-value bookkeeping entries
+            # (comp_name "__CONTAINER"/"__DEFVAL_XXXXXXXX") under RxTagCollection --
+            # verified against a real project: all 12 record_type=264 entries in the
+            # entire project are these, and none appear in that project's own Studio
+            # 5000 L5X export as a <Tag>. Real tags use several other record_type
+            # values (256 plain, 512 e.g. produced/consumed, 1280/1288 I/O -- already
+            # excluded separately via Tag._l5x_exclude), so this must be a narrow
+            # record_type exclusion, not a blanket "only 256" filter.
             results = self._cur.fetchall()
             for result in results:
                 tag = TagBuilder(self._cur, result[1]).build()
@@ -3844,7 +3853,10 @@ class ControllerBuilder(L5xElementBuilder):
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
             + str(_tag_collection_object_id)
+            + " AND record_type != 264"
         )
+        # record_type=264 marks internal AOI default-value bookkeeping entries -- see
+        # the identical filter (and full rationale) in ProgramBuilder's tag query above.
         results = self._cur.fetchall()
         tags: List[Tag] = []
         for result in results:
@@ -3967,7 +3979,13 @@ class ControllerBuilder(L5xElementBuilder):
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
             + str(_program_collection_object_id)
+            + " AND record_type=256"
         )
+        # record_type=256 matches every real Program seen in every local fixture and
+        # the Task filter above; a real project was found with one extra program-name
+        # comps record with record_type=512 under RxProgramCollection ("LuciGradeScan")
+        # that does not appear in that project's own Studio 5000 L5X export at all --
+        # excluded here the same way, rather than emitting a phantom <Program> element.
         results = self._cur.fetchall()
         programs: List[Program] = []
         for result in results:
@@ -4093,8 +4111,15 @@ class ControllerBuilder(L5xElementBuilder):
             self._cur.execute(
                 "SELECT comp_name, object_id, record FROM comps WHERE parent_id="
                 + str(coll_oid)
+                + " AND record_type=256"
                 + " ORDER BY seq_number"
             )
+            # record_type=256 matches every real Module seen in every local fixture and
+            # the Program/Task filter elsewhere in this method; a real project was found
+            # with three extra module-name comps records with record_type=512
+            # ("Grade_Deck", "Bridge", "MillTrak_VAB") that do not appear in that
+            # project's own Studio 5000 L5X export at all -- excluded here the same way,
+            # rather than emitting phantom <Module> elements.
             mod_rows = self._cur.fetchall()
 
             # First pass: build modid→name map so child modules can resolve their parent name.

@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import shutil
 import xml.dom.minidom
@@ -21,7 +22,13 @@ from acd.zip.write_acd import build_acd_bytes, write_acd
 from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
-from acd.l5x.elements import DumpCompsRecords, RSLogix5000Content, Routine, _escape_xml_attr
+from acd.l5x.elements import (
+    DumpCompsRecords,
+    RSLogix5000Content,
+    Routine,
+    _escape_xml_attr,
+    _multiline_xml_text,
+)
 
 
 # Clean top-level API
@@ -247,8 +254,32 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         "ForceProtectedEncoding AllProjDocTrans"
     )
 
-    referenced_names = _referenced_tag_names(routine.rungs)
-    program_tags = [t for t in program.tags if t.name in referenced_names]
+    referenced_names = set(_referenced_tag_names(routine.rungs))
+
+    # An Alias tag's target must also be included -- Studio 5000's own
+    # export does this too (e.g. a routine using alias "Sort_Enc_Calibrated"
+    # also includes its AliasFor target "HTV_ECal_SortPos" as its own <Tag>,
+    # even though the target's own name never literally appears in the rung
+    # text). Resolved iteratively since a target could itself be an alias
+    # (rare, but handled for robustness); target names are stripped of any
+    # trailing member/bit-index suffix (e.g. "Tag.Member" -> "Tag") to get
+    # the base tag name.
+    def _base_name(ref: str) -> str:
+        return re.split(r"[.\[]", ref, 1)[0]
+
+    while True:
+        program_tags = [t for t in program.tags if t.name in referenced_names]
+        controller_tags_all = [t for t in project.controller.tags if t.name in referenced_names]
+        new_names = set()
+        for t in program_tags + controller_tags_all:
+            if t.tag_type == "Alias" and t.target:
+                base = _base_name(t.target)
+                if base not in referenced_names:
+                    new_names.add(base)
+        if not new_names:
+            break
+        referenced_names |= new_names
+
     # Standard Logix scoping: a program-scope tag shadows a same-named
     # controller-scope tag for bare-name operand resolution within that
     # program. Verified against a real project: a routine's OTE(Flash)
@@ -286,8 +317,25 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
 
     owner_attr = f' Owner="{_escape_xml_attr(owner)}"' if owner else ""
 
+    # A real "Export Routine" output includes an XML comment right after the
+    # declaration, mirroring the routine's own <Description> (e.g. a routine
+    # named "Lug_Skip" with description "Shift the Data on the Grading Chain
+    # and Start a Skip if needed" gets that exact text as a leading
+    # "<!--...-->" comment). "--" is illegal inside an XML comment body, so
+    # it's split apart if present to keep the file well-formed.
+    leading_comment = ""
+    if routine._description:
+        # Normalize line endings to bare "\n" first -- Path.write_text()'s
+        # default text-mode newline translation on Windows blindly replaces
+        # every "\n" with "\r\n", including the "\n" half of an existing
+        # "\r\n" pair, which doubles up into "\r\r\n" (rendered as a blank
+        # line) if the raw \r\n from the ACD is left in as-is.
+        safe_comment = _multiline_xml_text(routine._description).replace("--", "- -")
+        leading_comment = f'<!--{safe_comment}-->\n'
+
     xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        f'{leading_comment}'
         f'<RSLogix5000Content SchemaRevision="{project.schema_revision}" '
         f'SoftwareRevision="{project.software_revision}" '
         f'TargetName="{_escape_xml_attr(routine.name)}" '

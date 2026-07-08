@@ -363,29 +363,6 @@ def _struct_members_xml(dt_name: str, data_types_map: Dict[str, "DataType"]) -> 
     return "".join(parts)
 
 
-def _build_elem_comments(tag_name: str, comments: List[Tuple[str, str]]) -> Dict[int, List[str]]:
-    """Build a mapping from array element index to list of comment texts.
-
-    Matches comment refs like ``tag_name[14]`` or ``tag_name[0].5``
-    to the element index (the ``N`` in ``[N]``).
-    """
-    result: Dict[int, List[str]] = {}
-    for ref, text in comments:
-        if not ref or ref == ".":
-            continue
-        if ref.startswith(tag_name):
-            suffix = ref[len(tag_name):]
-            if suffix.startswith("["):
-                end_bracket = suffix.find("]")
-                if end_bracket > 0:
-                    try:
-                        idx = int(suffix[1:end_bracket])
-                        result.setdefault(idx, []).append(text)
-                    except ValueError:
-                        pass
-    return result
-
-
 def _generate_decorated(dt_base: str, dimensions: Union[str, None],
                         data_types_map: Dict[str, "DataType"],
                         tag_name: str = "", comments: Union[List[Tuple[str, str]], None] = None) -> str:
@@ -478,24 +455,11 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             elems = _struct_elems([], dim_parts)
             body = f'<Array DataType="{display_name}" Dimensions="{dim_str}">{elems}</Array>'
 
-    # Inject <Comment> children for array elements that have inline comments.
-    elem_comments = _build_elem_comments(tag_name, comments) if comments else {}
-    if comments and tag_name and elem_comments:
-        def _inject_comment(m):
-            idx_str = m.group(1)
-            try:
-                idx = int(idx_str)
-                if idx in elem_comments:
-                    cxml = "".join(
-                        f'<Comment><![CDATA[{c}]]></Comment>' for c in elem_comments[idx]
-                    )
-                    return f'<Element Index="[{idx}]">{cxml}</Element>'
-            except ValueError:
-                pass
-            return m.group(0)
-
-        body = re.sub(r'<Element Index="\[(\d+)\]"\s*/>', _inject_comment, body)
-
+    # NOTE: array-element comments are never embedded inline as <Comment>
+    # children of <Element> (verified: zero such occurrences in a real
+    # project's L5X export) -- they always go in the tag's standalone
+    # <Comments><Comment Operand="..."> block instead (see
+    # _build_comments_xml, used by Tag.to_xml()).
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
@@ -1042,6 +1006,52 @@ def _count_array_elements(dimensions: Union[str, None]) -> int:
         return 1
 
 
+def _build_comments_xml(tag_name: str, comments: List[Tuple[str, str]]) -> str:
+    """Build the standalone ``<Comments>`` XML block for a tag.
+
+    Each entry in *comments* is a ``(path, text)`` pair as stored on
+    ``Tag._comments`` -- *path* is the fully-resolved address INCLUDING the
+    tag name prefix (e.g. ``"MyTag.Gain"``, ``"MyTag[2,2,1].BfrLug.Z5_SawPattern.3"``,
+    per ``TagBuilder``/``ControllerBuilder``'s normalization), except for the
+    empty-path entry which is the tag's own whole-tag description (handled
+    separately via ``<Description>``) and is skipped here. Any leftover
+    unresolved ``.!HEXOID``/``!HEXOID`` reference (data-type lookup failed)
+    is also skipped, since it can't be turned into a valid Operand.
+
+    Verified against a real Studio 5000 L5X export: the ``Operand=`` attribute
+    is the path suffix (tag name stripped) fully UPPERCASED (e.g.
+    ``Operand=".GAIN"``, ``Operand="[2,2,1].BFRLUG.Z5_SAWPATTERN.3"``), even
+    though member names keep their original casing everywhere else in the
+    document (e.g. ``StructureMember Name="BfrLug"``). The comment text
+    itself is NOT collapsed to a single line the way ``<Description>`` is --
+    multi-line text is preserved as-is inside the CDATA block.
+
+    Also verified: array-element / bit comments are never additionally
+    embedded inline as ``<Comment>`` children of an ``<Element>`` node --
+    this ``<Comments>`` block is their only representation in the L5X.
+
+    Returns ``""`` if there are no applicable comments.
+    """
+    parts = []
+    for ref, text in comments:
+        if not ref or ref == "." or not text:
+            continue
+        if ref.startswith(".!") or ref.startswith("!"):
+            # Unresolved hex-OID reference -- can't produce a valid Operand.
+            continue
+        if not ref.startswith(tag_name):
+            continue
+        operand = ref[len(tag_name):]
+        if not operand:
+            continue
+        operand = operand.upper()
+        safe_text = Tag._sanitize_xml_text(text.replace("\r\n", "\n").replace("\r", "\n"))
+        parts.append(f'<Comment Operand="{operand}">\n<![CDATA[{safe_text}]]>\n</Comment>\n')
+    if not parts:
+        return ""
+    return f'<Comments>\n{"".join(parts)}</Comments>\n'
+
+
 @dataclass
 class Tag(L5xElement):
     name: str
@@ -1205,26 +1215,16 @@ class Tag(L5xElement):
                             return f"{val:.6g}"
                         return str(int(val))
 
-                    _elem_comments = _build_elem_comments(self.name, self._comments) if self._comments else {}
-                    def _fmt_element_comment(c):
-                        c = " ".join(c.replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip()
-                        return self._sanitize_xml_text(c)
+                    # NOTE: array-element comments go in the tag's standalone
+                    # <Comments><Comment Operand="..."> block (see
+                    # _build_comments_xml), never embedded inline here
+                    # (verified: zero such occurrences in a real project).
                     elems_parts = []
                     for i in range(non_zero_end):
-                        comments = _elem_comments.get(i, [])
                         val_attr = f'Value="{_fmt_elem_val(iv[i])}"'
-                        if comments:
-                            comment_xml = "".join(
-                                f'<Comment><![CDATA[{_fmt_element_comment(c)}]]></Comment>'
-                                for c in comments
-                            )
-                            elems_parts.append(
-                                f'<Element Index="[{i}]" {val_attr}>{comment_xml}</Element>'
-                            )
-                        else:
-                            elems_parts.append(
-                                f'<Element Index="[{i}]" {val_attr}/>'
-                            )
+                        elems_parts.append(
+                            f'<Element Index="[{i}]" {val_attr}/>'
+                        )
                     elems = "".join(elems_parts)
                     dim_str = self.dimensions or "1"
                     data_xml = (
@@ -1267,12 +1267,18 @@ class Tag(L5xElement):
                 if decorated:
                     data_xml = decorated
 
-        if not desc_xml and not data_xml:
+        # --- Comments child element (element/member/bit descriptions) ---
+        # Verified against a real L5X export: appears after <Description>
+        # and before <Data>.
+        comments_xml = _build_comments_xml(self.name, self._comments) if self._comments else ""
+
+        if not desc_xml and not comments_xml and not data_xml:
             return base
 
-        # Insert Description (if any) then Data (if any) immediately after the opening tag.
+        # Insert Description (if any), then Comments (if any), then Data (if any)
+        # immediately after the opening tag.
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + data_xml + base[idx + 1:]
+        return base[:idx + 1] + desc_xml + comments_xml + data_xml + base[idx + 1:]
 
 
 @dataclass
@@ -3656,6 +3662,53 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _aoi_object_id = result[1]
             aois.append(AoiBuilder(self._cur, _aoi_object_id).build())
+
+        # Strip spurious "comments" that are really nested-AOI-instance InOut
+        # parameter binding metadata, not user-authored descriptions.
+        #
+        # When a UDT member's DataType is itself an AOI (e.g. a "VFD" member of
+        # type "VAB_PowerFlex_753"), Rockwell needs to record which of that
+        # AOI's InOut parameters is used, and stores it in Comments.Dat using
+        # the exact same (parent, scope_id) keyed record shape as a real
+        # per-element comment: ref resolves to the whole member (e.g. ".VFD"),
+        # text is literally the AOI's own InOut parameter name (e.g.
+        # "Ethernet_Module"). Verified against a real project: this exact
+        # shape recurs identically across every tag instance of several
+        # different UDTs (all containing an AOI-typed member), always with
+        # the same text for a given member/AOI pair regardless of the tag's
+        # own identity -- and it never appears in the real L5X's per-tag
+        # <Comments> block. A genuine user comment on a whole AOI-typed member
+        # would not coincidentally equal one of that AOI's own parameter names
+        # verbatim, so this is a safe, narrow filter.
+        _aoi_param_names = {
+            aoi.name.upper(): {p.name for p in aoi.parameters} for aoi in aois
+        }
+        if _aoi_param_names:
+            def _strip_aoi_binding_comments(tag_list: List[Tag]) -> None:
+                for _t in tag_list:
+                    if not _t.data_type or not _t._comments:
+                        continue
+                    _dt = all_data_types_map.get(_t.data_type.upper())
+                    if not _dt:
+                        continue
+                    _member_types = {m.name: m.data_type for m in _dt.members}
+                    _kept = []
+                    for _ref, _text in _t._comments:
+                        if _ref.startswith(_t.name):
+                            _suffix = _ref[len(_t.name):]
+                            if _suffix.startswith(".") and "." not in _suffix[1:] and "[" not in _suffix:
+                                _mname = _suffix[1:]
+                                _mtype = _member_types.get(_mname)
+                                if _mtype:
+                                    _param_names = _aoi_param_names.get(_mtype.upper())
+                                    if _param_names and _text in _param_names:
+                                        continue
+                        _kept.append((_ref, _text))
+                    _t._comments = _kept
+
+            _strip_aoi_binding_comments(tags)
+            for _p in programs:
+                _strip_aoi_binding_comments(_p.tags)
 
         # Get the Module (IO) Collection and build all Module elements.
         self._cur.execute(

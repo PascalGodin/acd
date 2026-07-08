@@ -242,12 +242,14 @@ the logs if you ever suspect a module's connection Type is wrong.
   are now **exact matches** (0 diff), joining `DataType`/`AddOnInstructionDefinition`. `Description`
   is also now much closer (was -40, now only short by the module-comment gap above plus a few
   `<Trend>`/`<Pen>` descriptions, since Trends aren't implemented at all — see above) after fixing
-  a real comment-dedup bug (see below). **`Comment` (rung-level specifically) is still a large,
-  currently-unsolved gap**: only 98 of 582 real rung comments are emitted for one real project —
-  see "Rung comments: multiple comments per routine cannot be attributed to the correct rung"
-  below for the full investigation. Don't assume whole-project L5X output is byte-identical to a
-  real Studio 5000 export just because a specific feature (like tag comments, or these
-  element counts) was verified exact — rung-comment content specifically is known-incomplete.
+  a real comment-dedup bug (see below). **`Comment` (rung-level specifically) is now mostly
+  solved**: went from only 98 of 582 real rung comments emitted (17%) to 522/582 (90%) for one
+  real project after reverse-engineering the `RegnLink.Dat` rung-attribution mechanism — see
+  "Rung comments: multi-comment-per-routine attribution via RegnLink.Dat" below for the full
+  investigation and the remaining ~10% gap (fragment drift in heavily-edited routines, not yet
+  solved). Don't assume whole-project L5X output is byte-identical to a real Studio 5000 export
+  just because a specific feature (like tag comments, or these element counts) was verified
+  exact — rung-comment content in old/heavily-edited routines can still be incomplete.
 - `_decode_udt_initial_value`/`_decode_single_udt_element` (initial-*value* decoding from the
   data-table blob, `elements.py`) has a hardcoded recursion depth limit of 3 nested structs —
   this is a generic safety cap (not tied to any specific type/module), separate from the
@@ -445,55 +447,73 @@ per-feature test had caught (see "Known limitations" for the ones still open):
   collision saved per (parent, tag_reference, scope_id, rung_content) tuple** — see the next
   section for a related, *unsolved* problem this investigation also uncovered.
 
-## Rung comments: multiple comments per routine cannot be attributed to the correct rung (unsolved)
+## Rung comments: multi-comment-per-routine attribution via RegnLink.Dat (mostly solved)
 
-**This is a known, currently-unsolved gap, not a bug with an identified fix** — documented here
-in detail so a future session doesn't repeat the same dead ends.
+**Historical bug** (now fixed): `RoutineBuilder.build()` used to assume a rung comment's
+`object_id` (the comments table column, from the `AsciiRecord` body's own dedicated `object_id`
+field, distinct from `rung_content`) directly encoded `rung_index = object_id - 1`. This is wrong
+for any routine with more than one rung comment: `object_id` (and `member_ref`) are identical
+across *every* rung-comment row sharing the same routine's `(parent, scope_id)` key — e.g. all 26
+of one real `Main` routine's rung comments had `object_id=1, member_ref=3866099821`, both
+constant — so every comment in a routine mapped to the same wrong slot, and only whichever one
+`RoutineBuilder.build()`'s dict-building loop processed first for that slot survived. A whole
+project's rung-comment count came out to only 98 of 582 real ones because of this.
 
-`RoutineBuilder.build()` currently assumes a rung comment's `object_id` (the comments table
-column, read from the `AsciiRecord` body's own dedicated `object_id` field, distinct from
-`rung_content`) directly encodes `rung_index = object_id - 1` (rung 0 → object_id 1). **This is
-wrong for any routine with more than one rung comment**: verified against a real project that
-`object_id` (and `member_ref`) are identical across *every* rung-comment row sharing the same
-routine's `(parent, scope_id)` key — e.g. all 26 of one real `Main` routine's rung comments had
-`object_id=1, member_ref=3866099821`, both constant. The only per-comment-varying field is
-`rung_content` itself (`AsciiRecord` body bytes `[4:8]` of `unknown_1`), currently only used as a
-boolean "is this a rung comment vs. the whole-routine description" flag (`if rung_content:` in
-`RoutineBuilder.build()`) — its actual *value* was assumed to be irrelevant. Whole-project
-verification exposed the real consequence: a project with 582 real rung comments (per its own
-Studio 5000 L5X export) only produced 98 via our code — every routine with 2+ rung comments
-collapses down to just one (whichever `RoutineBuilder.build()`'s dict-building loop happens to
-process for that `rung_index` slot first, since every comment maps to the same wrong index).
+**The real mechanism** (found via a series of purpose-built, incrementally-staged test ACD/L5X
+pairs created in Studio 5000 specifically to isolate this — export a small routine, add one rung
+comment, re-export, add another on a different rung, re-export, etc., diffing the raw
+`Comments.Dat` bytes between each stage): a comment's `rung_content` field's **upper 16 bits** is
+a "fragment" value that is specific to whichever rung the comment is attached to. This fragment is
+independently readable from **`RegnLink.Dat`** — a per-`.Dat`-file linked list (one per routine)
+of that routine's own rungs, previously never examined at all. See `populate_regnlink()` in
+`export_l5x.py` for the full 22-byte record layout and the scan/lookup mechanism, and
+`RoutineBuilder.build()` for how a comment's `rung_content >> 16` is resolved through it to a
+rung index. Verified **byte-exact** (0 errors) against a real Studio 5000 "Export Routine" ground
+truth for a small, freshly-created test routine with 3 rung comments in 3 different (non-
+adjacent) positions.
 
-**What was tried and ruled out** (verified against the real "Main" routine's 26 rung comments,
-cross-referenced against that routine's real rung numbers from its own Studio 5000 L5X export):
-- `rung_content`'s raw bytes do not appear *anywhere* else in the ACD, searched as a raw
-  little-endian `u32` across `Comps.Dat`, `SbRegion.Dat` (including the currently-unused
-  `"REGION LE UID"` record type's trailing UID field — a promising-looking lead that turned out
-  not to match), `Nameless.Dat`, `XRefs.Dat`, and `RegnLink.Dat`. If it's an object reference at
-  all, it isn't a direct/literal one.
-- Not a `float`/`double` reinterpretation (decoded values are nonsensical, e.g. `1.68e-26`,
-  `-157837967360.0`) — not any kind of position/ordering hint either (sorting by the raw integer
-  value does not reproduce the real rung order).
-- Not simple file/record enumeration order in `Comments.Dat` either (the raw `DbExtract` record
-  index order for these 26 comments does not match their real rung-number order).
-- Every one of the 26 values shares `0xFF` in exactly the same byte position (the second-least-
-  significant byte, e.g. `0xD212FF81`, `0xE735FF84`, ...) — a real, non-coincidental pattern
-  (looks like a tagged/flagged reference scheme of some kind), but no further meaning was found;
-  masking/dropping that byte doesn't yield a value found anywhere else either.
+**Two real parsing pitfalls found and handled**, both via the same staged-test-project method:
+- `RegnLink.Dat`'s link records are **not reliably contiguous** in the file for a real,
+  long-lived project (fragmented across years of edits) — a naive "records for one routine are
+  22 bytes apart, contiguous" assumption (which happened to hold for the small, freshly-created
+  test project, since nothing had fragmented it yet) breaks on a real project's data. Fixed by
+  scanning the *entire* file for every occurrence of a known comps object_id as the 4-byte owner
+  field, rather than assuming/requiring physical adjacency between a routine's own records.
+- A rung can have **two link records**: a stale/deleted one (type `0xFFFF0000`, dead-ending with
+  `next_id=0`) alongside the real current one (type `0x00020000`) — found via a real routine
+  whose first rung's stale record, if not filtered out, truncated the entire chain to just one
+  link. Filtered by requiring `type == 0x00020000` (well, `!= 0xFFFF0000`).
 
-**Practical impact**: a routine with exactly one rung comment works correctly today (no
-ambiguity to resolve, since there's only one candidate for the one dict slot). Any routine with
-two or more rung comments will silently show only one of them (and it may be attributed to the
-wrong rung number). This is a strictly bigger real-world gap than the Description-dedup bug
-above (582 vs. 98 rung comments in one real project) but has no identified root cause yet.
+**Remaining, real limitation (not yet solved): fragment drift after later structural edits.**
+Verified against the real `Main` routine (26 rung comments): most resolved to the *wrong* rung by
+a small, consistent offset (+2, with one +3) even with the mechanism above fully correct and
+byte-exact for a fresh test case. Root cause, inferred from the pattern (a uniform small offset
+across most comments, with a bigger offset appearing only after a specific point in the routine):
+`RegnLink.Dat`'s per-rung fragment values appear to be **reassigned whenever the routine's rung
+list is later structurally edited** (rungs inserted/deleted). A comment created *before* such a
+later edit retains the fragment value that was correct *at the time*, which no longer matches
+that rung's *current* fragment after the edit — there is no stored "edit history" we've found
+that would let us compensate for this drift. This was independently reproduced in a deliberately
+staged test (delete a rung comment, immediately recreate a new one elsewhere) and confirmed via a
+real Studio 5000 "Export Routine" — the new comment's rung_content fragment pointed to a
+different, unrelated rung than the one the user actually typed it on.
 
-**Suggested next step if revisited**: export several minimal, purpose-built ACD/L5X pairs (via
-Studio 5000 directly) with a small number of *known* rung comments in *known* rung positions —
-e.g. a routine with exactly 2 rung comments a few rungs apart, then one with 3, then one with a
-comment on rung 0 specifically — and diff the raw `Comments.Dat` bytes between each variant to
-isolate exactly which bytes change as comments are added/moved, rather than continuing to
-pattern-match against one large, already-existing project's data.
+**Practical impact**: whole-project rung-comment coverage went from 98/582 (17%) to 522/582 (90%)
+for one real project after this fix. The remaining ~10% gap is concentrated in older comments in
+heavily-edited routines (drift, as above) — a comment whose fragment can't be resolved to any of
+the routine's own current rungs is simply dropped (not guessed at / not misattributed) rather
+than risk showing it on the wrong rung. **Comments added freshly and never followed by a
+structural edit to the same routine should resolve correctly** — this is the common case for the
+motivating use case (an LLM or a user adding new rung comments to an existing, otherwise-stable
+routine), verified byte-exact in the staged tests above.
+
+**If revisited to close the remaining gap**: the drift-detection idea most likely to work is
+tracking each rung's *own* current fragment (already available, see `regnlink` table) against
+whatever partial ordering information a comment's stale fragment implies, and searching nearby
+rungs for the best match rather than requiring an exact fragment hit — not yet attempted; no
+strong evidence yet for what a reliable proximity/tie-breaking rule would look like without more
+staged test data specifically isolating rung insertion/deletion events (as opposed to comment
+add/delete events, which is what the current staged tests isolate).
 
 ## UDT L5K rendering (`_l5k_udt_literal`)
 

@@ -252,17 +252,16 @@ the logs if you ever suspect a module's connection Type is wrong.
   *structure*-generation recursion (`_struct_members_xml` and friends), which has no depth
   limit at all. If you ever see a deeply-nested UDT's initial value silently come back empty,
   check this limit first.
-- **`<Description>` may need to preserve multi-line text, not collapse to one line.** Every
-  `.description`/`<Description>` renderer currently does
-  `' '.join(text.replace('\r\n','\n').split('\n')).strip()` to collapse multi-line text to a
-  single line. A real Studio 5000 "Export Routine" output (verified while calibrating
-  `export_routine()`, see below) showed a tag's `<Description>` preserved as genuinely
-  multi-line CDATA (`"Program \nBit \nFlags"`, 3 lines), not collapsed. This directly
-  contradicts the collapsing behavior and hasn't been reconciled yet — it's possible earlier
-  verification passes only checked short, single-line descriptions and never actually tested a
-  multi-line one end-to-end. Don't assume the collapsing behavior is correct without checking a
-  real multi-line description case specifically; this could affect the whole-project L5X export
-  too, not just `export_routine()`.
+- ~~`<Description>` may need to preserve multi-line text~~ — **fixed.** Confirmed via a real
+  Studio 5000 Import Routine diff: a tag's existing `<Description>` was genuinely multi-line
+  (`"Program \nBit \nFlags"`, 3 lines), and our collapsed single-line rendering
+  (`"Program  Bit  Flags"`) was flagged by Studio 5000's own import comparison as a real
+  difference, not just cosmetic. `_multiline_xml_text()` now preserves line breaks in every
+  `to_xml()` Description/RevisionNote renderer (Member, DataType, Tag, LocalTag, Parameter,
+  Module, AOI) — verified byte-for-byte identical to the real export afterward. The
+  `.description` **Python property** (`Member.description`/`Tag.description`) still
+  deliberately collapses to one line — that's documented, existing convenience-API behavior,
+  separate from XML fidelity.
 
 ## Partial/context L5X exports (`export_routine()`)
 

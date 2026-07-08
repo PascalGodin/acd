@@ -45,6 +45,23 @@ def test_parse_rungs_dat(controller):
     )
 
 
+def test_rung_comment_scoped_correctly(controller):
+    # Regression test for a scope_id collision bug: rung comments were
+    # fetched by (comment_id, cip_type) "parent" key alone, without also
+    # matching scope_id -- in a real large project this caused a routine to
+    # pick up a completely unrelated routine's rung comment (e.g. a simple
+    # "Flasher" routine showing a comment that actually belonged to a
+    # tally/sorting routine). This fixture is too small to exercise an
+    # actual collision, but this still guards against a regression in the
+    # basic rung-comment lookup itself.
+    for p in controller.programs:
+        for r in p.routines:
+            if r.name == "R020_Program_Control":
+                assert r._rung_comments.get(0) == "Add JXR when you figure it out."
+                return
+    pytest.fail("R020_Program_Control routine not found")
+
+
 def test_parse_datatypes_dat(controller):
     # Look up by name rather than position — list order may vary across parser versions
     string20 = next((dt for dt in controller.data_types if dt.name == "STRING20"), None)

@@ -2937,13 +2937,22 @@ class RoutineBuilder(L5xElementBuilder):
         # where rung_content != 0 (distinguishes user rung comments from internal
         # metadata strings like FBDRoutineDescription which have rung_content=0).
         # The object_id field is the 1-based rung index (rung 0 -> object_id=1).
+        #
+        # scope_id (2-byte discriminator at absolute byte offset 16 of the
+        # routine's own raw record, same field used for tag comments) MUST also
+        # be matched -- verified against a real project that many *unrelated*
+        # routines share the exact same (comment_id, cip_type) parent key, so
+        # without this filter a routine can silently pick up another routine's
+        # rung comments entirely (e.g. "Flasher" showing a comment that was
+        # actually written for a completely different tally/sorting routine).
         rung_comments: Dict[int, str] = {}
         try:
+            own_scope_id = struct.unpack_from("<H", record, 16)[0] if len(record) >= 18 else 0
             comment_parent = (r.comment_id * 0x10000) + r.cip_type
             self._cur.execute(
                 "SELECT object_id, record_string FROM comments "
-                "WHERE parent=? AND record_type=1 AND rung_content!=0",
-                (comment_parent,),
+                "WHERE parent=? AND scope_id=? AND record_type=1 AND rung_content!=0",
+                (comment_parent, own_scope_id),
             )
             for obj_id, rec_str in self._cur.fetchall():
                 rung_index = obj_id - 1  # convert 1-based to 0-based

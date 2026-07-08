@@ -252,6 +252,42 @@ the logs if you ever suspect a module's connection Type is wrong.
   *structure*-generation recursion (`_struct_members_xml` and friends), which has no depth
   limit at all. If you ever see a deeply-nested UDT's initial value silently come back empty,
   check this limit first.
+- **`<Description>` may need to preserve multi-line text, not collapse to one line.** Every
+  `.description`/`<Description>` renderer currently does
+  `' '.join(text.replace('\r\n','\n').split('\n')).strip()` to collapse multi-line text to a
+  single line. A real Studio 5000 "Export Routine" output (verified while calibrating
+  `export_routine()`, see below) showed a tag's `<Description>` preserved as genuinely
+  multi-line CDATA (`"Program \nBit \nFlags"`, 3 lines), not collapsed. This directly
+  contradicts the collapsing behavior and hasn't been reconciled yet — it's possible earlier
+  verification passes only checked short, single-line descriptions and never actually tested a
+  multi-line one end-to-end. Don't assume the collapsing behavior is correct without checking a
+  real multi-line description case specifically; this could affect the whole-project L5X export
+  too, not just `export_routine()`.
+
+## Partial/context L5X exports (`export_routine()`)
+
+`export_routine()` (`acd/api.py`) exports a single routine as a standalone partial L5X file for
+Studio 5000's native "Import Routine" feature, sidestepping the `save_acd()`/`patch_rungs()`
+limitations entirely for the common case of editing/adding rungs (including rung comments) in
+an existing routine — Studio 5000 itself handles all the internal consistency (cross-reference
+index, object database, re-signing) that a raw binary write would otherwise require.
+
+The wrapper shape was calibrated against one real Studio 5000 "Export Routine" output (a 2-rung
+routine referencing one controller-scope tag and two program-scope tags) and matches it
+structurally: `<DataTypes Use="Context">` (always present, even empty), `<Tags Use="Context">`
+at both Controller and Program scope (full `<Tag>` definitions, reusing `Tag.to_xml()`, for
+every tag the routine's rung text references — found via a simple identifier scan intersected
+against the project's known tag names, not a real ladder-logic parser), `<Programs
+Use="Context">`, and `<Routines Use="Context">` wrapping `<Routine Use="Target" ...>`. A real
+scoping bug was found and fixed in the process: a program-scope tag must shadow/exclude a
+same-named but unrelated controller-scope tag (standard Logix bare-name resolution), not include
+both.
+
+**Not yet verified**: whether Studio 5000 actually *accepts* an `export_routine()`-produced file
+via its native Import Routine feature — only the XML *shape* has been calibrated against a real
+export, not a real *import*. Also unverified: multi-rung-referencing-a-custom-UDT scenarios
+(only tested with plain BOOL tags so far), and whether the `Owner` attribute is actually required
+for import to succeed (included as an optional parameter, omitted by default).
 
 ## Rung patch write-back (`patch_rungs`/`patch_sbregion_dat`)
 

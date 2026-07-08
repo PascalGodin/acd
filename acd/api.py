@@ -21,7 +21,7 @@ from acd.zip.write_acd import build_acd_bytes, write_acd
 from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
-from acd.l5x.elements import DumpCompsRecords, RSLogix5000Content
+from acd.l5x.elements import DumpCompsRecords, RSLogix5000Content, Routine, _escape_xml_attr
 
 
 # Clean top-level API
@@ -131,6 +131,88 @@ def patch_rungs(project: RSLogix5000Content, changes: dict) -> None:
         changes,
         project._id_to_name,
     )
+
+
+def export_routine(project: RSLogix5000Content, routine: Routine, output_path) -> None:
+    """Export a single routine as a standalone, partial L5X file.
+
+    Unlike ConvertAcdToL5x (which serialises the whole project), this is
+    meant to be imported into an *existing* Studio 5000 project via its
+    native "Import Routine" feature -- Studio 5000 itself then handles all
+    the internal consistency (cross-reference index, object database,
+    re-signing) that a raw ACD binary write would otherwise require. This
+    sidesteps the save_acd()/patch_rungs() limitations entirely for the
+    common case of editing/adding rungs (including rung comments) in an
+    already-existing routine.
+
+    CAUTION: the outer <RSLogix5000Content>/<Controller>/<Program> wrapper
+    this produces has NOT yet been verified against a real Studio 5000
+    "Export Routine" output -- only the inner <Routine>/<RLLContent>
+    rendering (rung text + rung comments) has been exercised. Treat the
+    wrapper shape as a best-effort placeholder until cross-checked against
+    a real exported routine L5X from the same Studio 5000 version.
+
+    Args:
+        project: The loaded project (from load_acd()) that owns `routine`
+            -- used to find which Program contains it, and to source the
+            SoftwareRevision/SchemaRevision/Controller name for the wrapper.
+        routine: The Routine object to export (e.g.
+            project.controller.programs[0].routines[0]). Edit its `.rungs`
+            (append new rung text, or edit existing entries) and/or
+            `._rung_comments` (dict of {rung_index: comment_text}) before
+            calling this to include those changes in the export.
+        output_path: Destination .L5X file path.
+
+    Raises:
+        ValueError: if `routine` isn't found in any program of `project`.
+
+    Example:
+        project = load_acd("MyController.ACD")
+        routine = project.controller.programs[0].routines[0]
+        routine.rungs.append("XIC(NewTag)OTE(AnotherTag);")
+        routine._rung_comments[0] = "Explains what this rung does"
+        export_routine(project, routine, "MyRoutine_export.L5X")
+        # Then, in Studio 5000: right-click the Routines folder ->
+        # Import Routine... -> select MyRoutine_export.L5X
+    """
+    import datetime
+
+    program = next(
+        (p for p in project.controller.programs if any(r is routine for r in p.routines)),
+        None,
+    )
+    if program is None:
+        raise ValueError(
+            "routine not found in any program of this project -- pass the "
+            "same Routine object obtained from project.controller.programs[i].routines[j]"
+        )
+
+    controller_name = project.controller.name
+    export_date = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+
+    routine_xml = routine.to_xml()
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        f'<RSLogix5000Content SchemaRevision="{project.schema_revision}" '
+        f'SoftwareRevision="{project.software_revision}" '
+        f'TargetName="{_escape_xml_attr(routine.name)}" '
+        f'TargetType="Routine" TargetSubType="Ladder" TargetClass="Standard" '
+        f'ContainsContext="true" ExportDate="{export_date}" '
+        f'ExportOptions="{project.export_options}">\n'
+        f'<Controller Use="Context" Name="{_escape_xml_attr(controller_name)}">\n'
+        f'<Programs>\n'
+        f'<Program Use="Context" Name="{_escape_xml_attr(program.name)}">\n'
+        f'<Routines>\n'
+        f'{routine_xml}\n'
+        f'</Routines>\n'
+        f'</Program>\n'
+        f'</Programs>\n'
+        f'</Controller>\n'
+        f'</RSLogix5000Content>\n'
+    )
+
+    Path(output_path).write_text(xml, encoding="utf-8")
 
 
 # Returned Project Structures

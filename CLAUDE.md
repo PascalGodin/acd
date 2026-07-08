@@ -322,10 +322,64 @@ once an actual *import* (not just an export/shape comparison) was attempted:
    incorrectly — see "BOOL array bit-packing" below. This affects every BOOL array tag's decoded
    value project-wide, not just `export_routine()`.
 
-Still open / not yet verified: multi-rung-referencing-a-custom-UDT scenarios (only tested with
-plain BOOL tags and one BOOL array so far), and whether the `Owner` attribute is actually
-required for import to succeed (included as an optional parameter, omitted by default; the
-successful test included it, so its necessity hasn't been isolated).
+**Confirmed importing a real edit succeeds**: after fix #3, importing an `export_routine()` file
+with a genuinely new rung instruction (referencing a controller-scope tag and two program-scope
+tags, one an array) into a real Studio 5000 project completed with zero errors.
+
+Verified against a **second**, more complex real routine (`Lug_Skip`: 6 rungs, a UDT array tag
+`To_Skip[25]`, two Alias tags) by diffing against a real Studio 5000 export of the identical
+routine, unmodified — 0 remaining differences (attributes and children) across every element.
+This round found and fixed several more real gaps:
+7. **`Routine._description`** — routines can have their own whole-routine description, rendered
+   as a `<Description>` child of `<Routine>` before `<RLLContent>`, AND as a leading XML comment
+   (`<!--description text-->`) right after the `<?xml ...?>` declaration in the partial-export
+   wrapper. Root-caused via the comments table: the routine's own comment parent/scope_id key has
+   an `AsciiRecord` (record_type=1) entry with `rung_content==0`, previously only understood as
+   "internal metadata to exclude" — it's actually this description. See "Routine-level
+   Description" below for the leading-XML-comment newline-doubling pitfall found along the way.
+8. **UDT scalar/array tags were also missing their `<Data Format="L5K">` block** — same class of
+   bug as the primitive scalar/array cases (fix #4 above), just not yet applied to UDTs. Verified
+   against the real `To_Skip[25]` tag. See "UDT L5K rendering" below.
+9. **A latent bug this exposed**: a raw NUL byte could end up inside a decoded string member's
+   own text (not just its computed padding), producing non-well-formed XML when rendered via L5K.
+   Fixed `_l5k_string_padded()` to escape any embedded NUL the same way as padding (`"$00"`).
+10. **`Member.byte_offset` leaked into L5X output** as an unintended `ByteOffset="..."` XML
+    attribute (real Studio 5000 output never has this) — it was a plain, non-underscore dataclass
+    field used only for internal UDT decode offset calculations, and `L5xElement.to_xml()`
+    auto-serializes any non-underscore field. Renamed to `_byte_offset`.
+11. **An Alias tag's target must also be included as its own context `<Tag>`** — a routine using
+    alias `Sort_Enc_Calibrated` (→ `HTV_ECal_SortPos`) needs the target tag's own full definition
+    included too, even though the target's name never literally appears in the rung text (only
+    the alias name does). Resolved iteratively in `export_routine()` (a target could itself be
+    an alias) with the target name stripped of any trailing member/bit-index suffix.
+
+Still open / not yet verified: whether the `Owner` attribute is actually required for import to
+succeed (included as an optional parameter, omitted by default; both successful tests included
+it, so its necessity hasn't been isolated), and scenarios beyond a single UDT array level
+(nested UDTs within UDTs, AOI-typed members, multi-dimensional UDT arrays) haven't been
+exercised through `export_routine()` specifically yet (though the underlying `_l5k_udt_literal`/
+`_udt_scalar_to_xml` recursion has been separately verified for nested cases in other contexts).
+
+## Routine-level Description (leading XML comment newline pitfall)
+
+The leading `<!--description-->` XML comment `export_routine()` emits (see item 7 above) must
+have its line endings normalized to bare `"\n"` *before* being embedded, using the same
+`_multiline_xml_text()` already used for `<Description>` child elements — NOT the raw
+`routine._description` string as-is. `Path.write_text()`'s default text-mode newline translation
+on Windows blindly replaces every `"\n"` with `"\r\n"`, including the `"\n"` half of an
+already-present `"\r\n"` pair from the ACD's own raw text, which doubles into `"\r\r\n"` (renders
+as a spurious blank line) if left un-normalized. Caught by comparing byte-for-byte against a real
+export where line breaks were single, not doubled.
+
+## UDT L5K rendering (`_l5k_udt_literal`)
+
+Mirrors `_udt_scalar_to_xml`'s own member-iteration rules (skip hidden and `BIT` members, same
+declaration order) but emits an L5K array literal instead of XML: `"[1,0,0,...]"` for a scalar
+struct, `"[[...],[...],...]"` for an array of structs, recursing into nested
+structs/arrays/string-family members. Shares `_l5k_prim_literal()` (BOOL/BIT → `"2#0"`/`"2#1"`,
+REAL/LREAL → `_l5k_real_literal()`, else plain decimal) with the primitive-array literal builder.
+Verified against a real 25-element UDT array tag (`To_Skip[25]`): every element's L5K literal
+matches Studio 5000's own `<Data Format="L5K">` content exactly.
 
 ## Initial-value decoding offset bugs (`_read_tag_initial_value`)
 

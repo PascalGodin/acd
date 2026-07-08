@@ -148,6 +148,32 @@ L5X, or the tag's `<Description>`). Getting the full address (`Tag[3].Flags.2`, 
      content is further wrapped as `<![CDATA['text']]>` (quoted L5K-style literal) when
      non-empty, or bare `<![CDATA[]]>` (no quotes) when empty — see `_string_literal_cdata()`.
 
+6. **L5X `<Comments>` emission** (`_build_comments_xml()` in `elements.py`, called from
+   `Tag.to_xml()`): renders every non-empty-path entry in `tag._comments` as a standalone
+   `<Comments><Comment Operand="...">` block, positioned after `<Description>` and before
+   `<Data>` — verified against a real project to be the correct position/shape. `Operand=` is
+   the path with the tag name prefix stripped and the remainder **fully upper-cased** (e.g.
+   `Operand=".GAIN"`, `Operand="[2,2,1].BFRLUG.Z5_SAWPATTERN.3"`), even though member names keep
+   their original casing everywhere else in the document. The comment text itself is **not**
+   collapsed to one line the way `.description`/`<Description>` is — multi-line text is
+   preserved as-is inside the CDATA. There used to be a second, separate mechanism
+   (`_build_elem_comments`) that embedded `<Comment>` as an inline child of an array `<Element>`
+   node; it was removed after confirming **zero** such occurrences in a real project's L5X —
+   array-element/bit comments only ever appear in the standalone `<Comments>` block.
+7. **AOI InOut-parameter binding metadata masquerading as a comment.** When a UDT member's
+   DataType is itself an AOI (e.g. a `VFD` member typed as AOI `VAB_PowerFlex_753`), Rockwell
+   records which of that AOI's InOut parameters is wired up using the *exact same* Comments.Dat
+   record shape as a real per-element comment: the ref resolves to the whole member (e.g.
+   `.VFD`), and the text is literally the AOI's own parameter name (e.g. `"Ethernet_Module"`).
+   This is not a user-authored description — verified against a real project, the same text
+   recurs identically across every tag instance of several different UDTs, regardless of the
+   owning tag's own identity, and it never appears in Studio 5000's own L5X `<Comments>` output.
+   `ControllerBuilder.build()` strips these (after `aois`/`data_types` are both available) with
+   a narrow rule: a comment is dropped only if it's a whole-member reference (no bit/array
+   suffix) **and** that member's own DataType is an AOI **and** the text exactly matches one of
+   that AOI's own parameter names verbatim. If you ever see a real user comment go missing on an
+   AOI-typed member, check whether it happens to collide with that AOI's parameter names first.
+
 **When verifying comment/description output, don't trust any pre-built "reference" JSON/index
 a downstream project might hand you** (e.g. something like `ref.json` derived from an L5X/CSV
 by another script) **blindly** — it's typically hand-built by a separate AI/script pass and can
@@ -158,6 +184,23 @@ Studio 5000 "Export Tags" CSV's `COMMENT`/`TAG` rows. Don't assume either is alr
 the working directory — if you need to verify comment/description output and don't have one,
 ask the user to export a fresh L5X (File > Save As / Export) and/or tag CSV report from Studio
 5000 for the specific ACD under test.
+
+**Pitfalls when writing your own script to diff generated output against a real L5X** (all
+caused three false "bugs" in one verification pass before being caught):
+- `comp_name` is **not unique** in `Comps.Dat` — a `<Tag>` and a `<Routine>` (or other object)
+  can share the exact same name. `SELECT ... WHERE comp_name=?` can silently grab the wrong
+  object entirely. Always resolve by `object_id` (from the already-built `Controller`/`Program`
+  object graph) or by `parent_id`/collection membership, never by name alone.
+- Self-closing `<Tag Name="..." .../>` elements (e.g. Alias tags with no children) have no
+  `</Tag>` to search for — a naive `content.index('</Tag>', start)` after matching `<Tag
+  Name="...">` will walk past the self-close and grab the **next** tag's content instead. Match
+  `(?:/>|>)` and branch on which one matched before searching for a closing tag.
+- I/O tags (`":" in tag.name`) are already correctly excluded from the real `<Tags>` XML section
+  via `Tag._l5x_exclude` — that exclusion only takes effect when a *parent* element serializes
+  its `tags` list (see `_LIST_SECTION_NAMES`/`_l5x_exclude` handling in `L5xElement.to_xml()`).
+  Calling `tag.to_xml()` directly on an I/O tag bypasses that filter and will make it look like
+  I/O tags are wrongly emitting `<Tag>`/`<Comments>` content when they never actually would be
+  in a real full-project export — filter by `not tag._l5x_exclude` first when spot-checking.
 
 ## Connection Type / RPI (Module builder)
 
@@ -184,6 +227,25 @@ the logs if you ever suspect a module's connection Type is wrong.
   information isn't stored as strings in the ACD binary. Only relevant for **new hardware
   module models**, not new UDTs/tags/AOIs.
 - Module (I/O) metadata is not fully round-tripped to L5X (opaque CIP identity records).
+- **Module/Connection-level comments are not implemented at all.** Studio 5000 stores per-bit
+  descriptions for I/O module connection points inside
+  `<Module><Connections><Connection><InputTag>/<OutputTag><Comments>` (a completely different
+  XML location from a regular `<Tag>`'s `<Comments>` block, with its own comment_id/scope_id
+  resolution scheme that hasn't been reverse-engineered yet). Verified on one large real project:
+  570 `<Comment Operand="...">` entries live there — 0 of them are currently emitted. This is
+  separate from (and larger than) the regular per-`<Tag>` `<Comments>` block, which **is**
+  implemented and was verified byte-exact against that same project (see comment-resolution
+  section above).
+- **Whole-project L5X fidelity has only been spot-checked, not fully verified.** A structural
+  element-count comparison against one real project's own Studio 5000 L5X export
+  (`<Tag>`/`<DataType>`/`<Module>`/`<AOI>`/`<Routine>`/`<Rung>`/`<Program>`/`<Comment
+  Operand=`/`<Description>` counts) found `DataType` and `AddOnInstructionDefinition` counts
+  match exactly, but `Tag` (+12), `Module` (+3), `Routine` (+9), `Program` (+1), `Rung` (-1), and
+  `Description` (-40) do not, and none of these have been root-caused yet. These are being left
+  as open items to resolve opportunistically (e.g. while implementing/verifying a specific
+  routine or UDT export) rather than as a dedicated investigation — don't assume whole-project
+  L5X output is byte-identical to a real Studio 5000 export just because a specific feature
+  (like tag comments) was verified exact.
 - `_decode_udt_initial_value`/`_decode_single_udt_element` (initial-*value* decoding from the
   data-table blob, `elements.py`) has a hardcoded recursion depth limit of 3 nested structs —
   this is a generic safety cap (not tied to any specific type/module), separate from the

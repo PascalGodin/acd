@@ -77,6 +77,23 @@ def test_parse_tags_dat(controller):
     assert toggle.data_type == "BOOL"
 
 
+def test_scalar_primitive_tag_xml_shape(controller):
+    # Regression test for two bugs found while verifying export_routine()
+    # against a real Studio 5000 "Export Routine" output: a scalar
+    # primitive tag with a known initial value (1) only emitted a
+    # <Data Format="Decorated"> block, silently dropping the <Data
+    # Format="L5K"> block a real tag always has alongside it, and (2) the
+    # Decorated block used the DataType name as the XML element itself
+    # (e.g. <BOOL Name="Tag" Value="1" Radix="Decimal"/>) instead of the
+    # real <DataValue DataType="BOOL" Radix="Decimal" Value="1"/> shape.
+    toggle = next((t for t in controller.tags if t.name == "Toggle"), None)
+    assert toggle is not None, "Toggle tag not found"
+    xml = toggle.to_xml()
+    assert '<Data Format="L5K">' in xml
+    assert '<DataValue DataType="BOOL" Radix="Decimal" Value="1"/>' in xml
+    assert "<BOOL " not in xml
+
+
 def test_parse_comments_dat():
     db: DbExtract = DbExtract("build/Comments.Dat")
 

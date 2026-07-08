@@ -182,6 +182,20 @@ _PRIMITIVE_L5K_ZERO: Dict[str, str] = {
     "LREAL": "0.00000000e+000",
 }
 
+
+def _l5k_real_literal(value: float) -> str:
+    """Format a REAL/LREAL value in Rockwell's L5K scientific-notation
+    convention: 8 decimal digits, 3-digit zero-padded exponent, e.g.
+    1.0 -> "1.00000000e+000", -0.5 -> "-5.00000000e-001".
+    """
+    if value == 0.0:
+        return "0.00000000e+000"
+    formatted = f"{value:.8e}"  # e.g. "1.00000000e+00" or "-5.00000000e-01"
+    mantissa, exp = formatted.split("e")
+    sign = exp[0]
+    exp_digits = exp[1:].zfill(3)
+    return f"{mantissa}e{sign}{exp_digits}"
+
 # Radix string used in Decorated DataValueMember for each numeric primitive.
 # BOOL and BIT use no Radix attribute; REAL/LREAL use "Float"; all integers use "Decimal".
 _PRIMITIVE_RADIX: Dict[str, str] = {
@@ -1234,29 +1248,58 @@ class Tag(L5xElement):
                         f'</Data>'
                     )
                 else:
-                    # Scalar primitive
+                    # Scalar primitive. Verified against a real project: a
+                    # scalar tag with a known non-zero/non-default initial
+                    # value gets BOTH a <Data Format="L5K"> block (like the
+                    # zero-value fallback below already does) AND the
+                    # <Data Format="Decorated"> block -- previously only the
+                    # Decorated block was emitted, silently dropping L5K.
+                    # The Decorated element itself is a <DataValue
+                    # DataType="..." Radix="..." Value="..."/> -- previously
+                    # this used the DataType name as the element name
+                    # itself (e.g. <BOOL Name="Tag" .../>), which doesn't
+                    # match Studio 5000's actual output at all.
                     if dt_base in ("BOOL", "BIT"):
                         val_str = "1" if iv else "0"
+                        l5k_val = val_str
                     elif isinstance(iv, float):
                         val_str = f"{iv:.6g}"
+                        l5k_val = _l5k_real_literal(iv)
                     else:
                         val_str = str(int(iv))
+                        l5k_val = val_str
 
                     data_xml = (
+                        f'<Data Format="L5K">\n<![CDATA[{l5k_val}]]>\n</Data>'
                         f'<Data Format="Decorated">\n'
-                        f'<{dt_base} Name="{self.name}" Value="{val_str}" '
-                        f'Radix="{radix_attr}"/>\n'
+                        f'<DataValue DataType="{dt_base}" Radix="{radix_attr}" '
+                        f'Value="{val_str}"/>\n'
                         f'</Data>'
                     )
 
         if not data_xml and not is_alias:
-            # Scalar primitives get Format="L5K" only.
+            # Scalar primitives with no successfully-decoded initial value
+            # (rare -- normally the branch above handles scalar primitives)
+            # still get BOTH Format="L5K" and Format="Decorated" blocks at
+            # the zero/default value, matching the pattern verified above
+            # for the known-value case (e.g. a real scalar BOOL tag with
+            # value 0 still shows both blocks, not just L5K).
             # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
             # nothing here — Decorated is not used for scalar STRING tags).
             # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
             dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
             l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
-            data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+            if l5k_zero is not None:
+                zero_radix = _PRIMITIVE_RADIX.get(dt_base, "Decimal")
+                data_xml = (
+                    f'<Data Format="L5K">\n<![CDATA[{l5k_zero}]]>\n</Data>'
+                    f'<Data Format="Decorated">\n'
+                    f'<DataValue DataType="{dt_base}" Radix="{zero_radix}" '
+                    f'Value="{l5k_zero}"/>\n'
+                    f'</Data>'
+                )
+            else:
+                data_xml = ""
 
             if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
                 # Generate Decorated data for non-primitive / array types

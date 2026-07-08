@@ -327,25 +327,46 @@ plain BOOL tags and one BOOL array so far), and whether the `Owner` attribute is
 required for import to succeed (included as an optional parameter, omitted by default; the
 successful test included it, so its necessity hasn't been isolated).
 
-## BOOL array bit-packing (initial value decoding)
+## Initial-value decoding offset bugs (`_read_tag_initial_value`)
 
-`_read_tag_initial_value()` (`elements.py`) read every array element's initial value at its own
-naive per-element byte offset (`offset + i * elem_size`). This is correct for every primitive
-type *except* BOOL/BIT arrays, which Rockwell bit-packs 32 bits per 4-byte DWORD — the same
-packing `_get_type_size()` already accounts for when *sizing* a `BOOL[N]` array (`ceil(N/32)*4`),
-but this function was never updated to match, and silently returned a raw packed byte value
-(e.g. `32`) instead of the correct `0`/`1` bit for every element of every BOOL array tag in every
-project. Since any non-zero "value" renders as BOOL `True` in the generated XML, this corrupted
-the Decorated output for any BOOL array with a non-trivial bit pattern — found by comparing an
-`export_routine()`-imported tag's value against the project's actual live value (a genuine
-mismatch, not a stale-snapshot artifact, since the comparison was against an offline copy of the
-exact same ACD). Fixed by reading the correct DWORD (`offset + (i // 32) * 4`) and extracting bit
-`i % 32` for BOOL/BIT arrays specifically; scalar BOOL tags (`n_elements == 1`) are unaffected —
-they're read as a plain byte at a different, unpacked offset and were already correct, which is
-why this went unnoticed for so long. Verified against a real 256-element array tag: all 256
-values now match Studio 5000's own export exactly (previously many silently wrong). The small
-test fixture has no BOOL array tags at all, so this is covered by a synthetic unit test
-(`test_read_tag_initial_value_bool_array_bit_packing`) instead of a real-fixture test.
+Two separate, serious bugs were found here in the same investigation (verifying `export_routine()`
+imports against a project's actual tag values) — both affected the decoded initial value of
+primitive tags, one for arrays and one for scalars. **If you ever see a primitive tag's decoded
+value look wrong, this function is the first place to check**, and don't trust a "looks
+plausible" value without comparing against real Studio 5000 ground truth — both of these bugs
+produced plausible-looking (but wrong) values for many tags before being caught.
+
+**1. BOOL array bit-packing.** Every array element was read at its own naive per-element byte
+offset (`offset + i * elem_size`). This is correct for every primitive type *except* BOOL/BIT
+arrays, which Rockwell bit-packs 32 bits per 4-byte DWORD — the same packing `_get_type_size()`
+already accounts for when *sizing* a `BOOL[N]` array (`ceil(N/32)*4`), but this function was
+never updated to match, and silently returned a raw packed byte value (e.g. `32`) instead of the
+correct `0`/`1` bit for every element of every BOOL array tag. Fixed by reading the correct DWORD
+(`offset + (i // 32) * 4`) and extracting bit `i % 32` for BOOL/BIT arrays specifically. Verified
+against a real 256-element array tag: all 256 values now match Studio 5000's own export exactly.
+Covered by a synthetic unit test (`test_read_tag_initial_value_bool_array_bit_packing`) since the
+small fixture has no BOOL array tags.
+
+**2. Scalar offset was simply wrong (0x19E instead of 0x1A2).** This was caught as a *direct
+follow-on* to fix #1 above, and turned out to be much bigger: after fixing the array case,
+`SecFlasher` (a scalar BOOL) still decoded as `1` when the real project value is `0` (confirmed
+consistently across two real Studio 5000 exports taken hours apart from an offline, unchanging
+project copy). Root-caused by comparing raw bytes for `SecFlasher` against `Always_Off` (a tag
+that by convention must always be `0`) — both shared an *identical* 419-byte boilerplate
+data-table record, with byte `0x19E == 1` for **both**, proving `0x19E` was never actually each
+tag's own value at all, just incidental template/boilerplate data that happens to often be
+nonzero. Systematically verified against the real project: comparing all 758 controller-scope
+scalar BOOL tags and 812 scalar DINT tags against Studio 5000's own values (from a real
+full-project L5X export), the old offset (`0x19E`) matched only 21.4% (BOOL) / 2.8% (DINT) of the
+time, while the array offset (`0x1A2`) matched **100% for both** — there was never a real
+scalar/array distinction; `0x1A2` is simply where the data-table's value region always starts.
+This affected the decoded initial value of every scalar primitive tag project-wide (BOOL, DINT,
+REAL, etc.), not something specific to one tag or type. Fixed by removing the scalar/array offset
+distinction entirely — always read from `0x1A2`. Covered by
+`test_read_tag_initial_value_scalar_uses_0x1a2_offset` (a decoy-vs-real value at each offset in a
+synthetic blob) plus a correction to `test_scalar_primitive_tag_xml_shape`'s own expected value,
+which was itself a casualty of this bug (never independently verified against real ground truth
+for the small fixture, just whatever the wrong offset happened to produce).
 
 ## Rung patch write-back (`patch_rungs`/`patch_sbregion_dat`)
 

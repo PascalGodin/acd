@@ -262,6 +262,47 @@ the logs if you ever suspect a module's connection Type is wrong.
   `.description` **Python property** (`Member.description`/`Tag.description`) still
   deliberately collapses to one line — that's documented, existing convenience-API behavior,
   separate from XML fidelity.
+- FBD and SFC routine content is still not decoded — only `RLL` (ladder, via `SbRegion.Dat`) and
+  `ST` (structured text, via `Nameless.Dat`, see below) routine bodies are exported; an FBD/SFC
+  routine still exports as an empty `<Routine Type="FBD"/>`/`<Routine Type="SFC"/>` with no
+  `<SheetContent>`/`<STContent>`-equivalent — nobody has reverse-engineered their storage format
+  yet (adapted from an upstream `hutcheb/acd` PR that only covered ST).
+
+## Structured Text (ST) routine content (`_st_routine_lines`)
+
+ST routine bodies are **not** stored in `SbRegion.Dat` like ladder rungs — they live in
+`Nameless.Dat`, one record per source line, found by walking the nameless `parent_id` tree
+breadth-first from the routine's own object id (routine → map → region → line, up to 6 levels).
+A source-line record is identified by record type `0x01000002` (u32 at offset 4) — other record
+types under the same subtree (`0x7d6` compiled neutral text, `0x7d2` region stubs, `0x8a4`
+bookkeeping, in Kaitai node-kind terms) are *not* source lines and must be filtered out; the
+sequence number (u32 at offset 20) gives source order, and the line text itself is `fffeff`-encoded
+UTF-16 starting at offset 24 (`_parse_fffeff`, extended to handle the long-line form where the
+one-byte length is `0xFF` and the real length follows as a u16). `@hexid@` placeholders (an
+object-id-in-hex tag reference, distinct from rung text's `&hexid:` form) are batch-resolved to
+comp names the same way rung text resolves module references. Rendered as `<STContent><Line
+Number="N"><![CDATA[...]]></Line>...</STContent>` — verified line-for-line against the
+`ACDTestsNonRedundant.ACD`/`ACDTestsWithAOI.ACD`/`ACDTestsFilledRedundant.ACD` fixtures' own
+`STRoutine`, including preserved blank lines and resolved tag references
+(`test_st_routine_content`). AOI logic routines store ST the same way and are picked up
+automatically wherever `RoutineBuilder` runs. Adapted from an open, unmerged PR against
+`hutcheb/acd` (our upstream) after independently re-verifying the layout against our own fixtures.
+
+## Ingestion robustness (`_parse_records` in `export_l5x.py`)
+
+`Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*
+import if a single record failed to parse (one `UnicodeDecodeError`/`struct.error` on newer
+firmware, e.g. V33+, previously made a whole ACD unloadable — matches symptoms reported against
+upstream `hutcheb/acd` issues #14/#15). `_parse_records()` now parses each `.Dat` file's records
+one at a time, skipping (and counting) any record whose parser raises, logging a single
+`log.warning("<Table>: skipped N unparseable record(s) of M")` instead of propagating — a missing
+or wholly unreadable `.Dat` file degrades to an empty table the same way rather than raising.
+`TaskBuilder`'s scheduled-program list is also bounds-checked against the record buffer (a
+firmware-version-dependent layout could otherwise read a garbage count past the end of the
+buffer), and a single task that still can't decode is skipped with a warning rather than aborting
+`ControllerBuilder.build()` entirely. Adapted from an open, unmerged PR against `hutcheb/acd`;
+existing test suite (which only exercises files that already parse cleanly) is unaffected by
+design — this only changes behavior on records/files that previously would have raised.
 
 ## Partial/context L5X exports (`export_routine()`)
 

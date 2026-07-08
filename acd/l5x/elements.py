@@ -1734,6 +1734,7 @@ class Routine(L5xElement):
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
     _description: Union[str, None] = field(default=None)
+    _st_lines: List[str] = field(default_factory=list)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -1741,7 +1742,7 @@ class Routine(L5xElement):
             desc = _multiline_xml_text(self._description)
             desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
 
-        rll_content = ""
+        content = ""
         if self.type == "RLL" and self.rungs:
             rung_xmls = []
             for i, rung_text in enumerate(self.rungs):
@@ -1759,8 +1760,14 @@ class Routine(L5xElement):
                     f'</Rung>'
                 )
             if rung_xmls:
-                rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
-        return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{rll_content}</Routine>'
+                content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
+        elif self.type == "ST" and self._st_lines:
+            line_xmls = [
+                f'<Line Number="{i}"><![CDATA[{text}]]></Line>'
+                for i, text in enumerate(self._st_lines)
+            ]
+            content = f'<STContent>{"".join(line_xmls)}</STContent>'
+        return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
 
 
 @dataclass
@@ -3159,16 +3166,102 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
-        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments, description)
+        st_lines: List[str] = []
+        if routine_type == "ST":
+            st_lines = _st_routine_lines(self._cur, self._object_id)
+
+        return Routine(
+            name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines
+        )
 
 
 def _parse_fffeff(data: bytes, offset: int):
-    """Parse one fffeff-encoded string at offset. Returns (str, new_offset)."""
-    if offset + 3 > len(data) or not (data[offset] == 0xFF and data[offset+1] == 0xFE and data[offset+2] == 0xFF):
+    """Parse one fffeff-encoded string at offset. Returns (str, new_offset).
+
+    Handles the extended-length form: a length byte of 0xFF is followed by
+    the real length as a u16 (used e.g. by long Structured Text lines)."""
+    if offset + 4 > len(data) or not (data[offset] == 0xFF and data[offset+1] == 0xFE and data[offset+2] == 0xFF):
         return "", offset
     length = data[offset+3]
-    s = data[offset+4:offset+4+length*2].decode("utf-16-le", errors="replace")
-    return s, offset + 4 + length * 2
+    offset += 4
+    if length == 0xFF:
+        if offset + 2 > len(data):
+            return "", offset
+        length = struct.unpack_from("<H", data, offset)[0]
+        offset += 2
+    s = data[offset:offset+length*2].decode("utf-16-le", errors="replace")
+    return s, offset + length * 2
+
+
+# Record type (u32 at offset 4) of a Structured Text source-line record in
+# the nameless table.
+_ST_LINE_RECORD_TYPE = 0x01000002
+
+
+def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
+    """Extract a Structured Text routine's source lines.
+
+    ST bodies are not stored in SbRegion like ladder rungs; they live in
+    Nameless.Dat, one record per source line. A line record carries:
+
+      offset 0x04  u32  record type -- ``_ST_LINE_RECORD_TYPE``
+      offset 0x14  u32  sequence number -- source order within the routine
+      offset 0x18       fffeff-encoded UTF-16 line text
+
+    Line records hang a few levels below the routine in the nameless
+    parent tree (routine -> map -> region -> line), so walk it
+    breadth-first from the routine's object id and collect every line
+    record encountered, then sort by sequence number.
+
+    Tag references appear as ``@hexid@`` placeholders (the referenced
+    comps object id in hex); they are batch-resolved to component names,
+    mirroring how rung text resolves ``&hexid:`` module references."""
+    lines: List[Tuple[int, str]] = []
+    frontier: List[int] = [routine_object_id]
+    for _depth in range(6):
+        if not frontier:
+            break
+        qmarks = ",".join("?" * len(frontier))
+        cur.execute(
+            f"SELECT object_id, record FROM nameless WHERE parent_id IN ({qmarks})",
+            frontier,
+        )
+        rows = cur.fetchall()
+        frontier = []
+        for oid, rec in rows:
+            frontier.append(oid)
+            if len(rec) < 24:
+                continue
+            if struct.unpack_from("<I", rec, 4)[0] != _ST_LINE_RECORD_TYPE:
+                continue
+            seq = struct.unpack_from("<I", rec, 20)[0]
+            text, _ = _parse_fffeff(rec, 24)
+            lines.append((seq, text))
+    if not lines:
+        return []
+    lines.sort()
+    texts = [text for _seq, text in lines]
+
+    # Batch-resolve @hexid@ tag references to comp names.
+    all_hex = set(re.findall(r"@([0-9a-fA-F]{1,8})@", " ".join(texts)))
+    if all_hex:
+        id_to_name: Dict[str, str] = {}
+        for hex_id in all_hex:
+            cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=?", (int(hex_id, 16),)
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                id_to_name[hex_id] = row[0]
+        if id_to_name:
+            def _resolve(line: str) -> str:
+                return re.sub(
+                    r"@([0-9a-fA-F]{1,8})@",
+                    lambda m: id_to_name.get(m.group(1), m.group(0)),
+                    line,
+                )
+            texts = [_resolve(t) for t in texts]
+    return texts
 
 
 def _filetime_to_iso(ft: int) -> str:
@@ -3518,11 +3611,17 @@ class TaskBuilder(L5xElementBuilder):
         rate_str = str(rate_us // 1000) if task_type != "CONTINUOUS" else None
 
         # Scheduled programs: ext[0x01] value starts at BLOB offset 0x5A.
-        # Format: u16 count followed by N u32 comment_ids.
+        # Format: u16 count followed by N u32 comment_ids. The count is
+        # bounds-checked against the record: some firmware versions lay the
+        # record out differently and a garbage count must not read past the
+        # end of the buffer.
         prog_count = struct.unpack_from("<H", record, 0x5A)[0]
         scheduled_programs = []
         for i in range(prog_count):
-            cid = struct.unpack_from("<I", record, 0x5A + 2 + i * 4)[0]
+            offset = 0x5A + 2 + i * 4
+            if offset + 4 > len(record):
+                break
+            cid = struct.unpack_from("<I", record, offset)[0]
             prog_name = comment_id_to_program.get(cid)
             if prog_name:
                 scheduled_programs.append(ScheduledProgram(prog_name, prog_name))
@@ -3847,7 +3946,14 @@ class ControllerBuilder(L5xElementBuilder):
                 + " AND record_type=256"
             )
             for task_result in self._cur.fetchall():
-                tasks.append(TaskBuilder(self._cur, task_result[1]).build(comment_id_to_program))
+                try:
+                    tasks.append(
+                        TaskBuilder(self._cur, task_result[1]).build(comment_id_to_program)
+                    )
+                except Exception as e:
+                    # Task config offsets are firmware-version dependent; a
+                    # task that can't decode shouldn't abort the whole import.
+                    log.warning(f"Skipping undecodable task '{task_result[0]}': {e!r}")
 
         # Get the AOI Collection and get the AOIs
         self._cur.execute(

@@ -176,9 +176,21 @@ class ExportL5x:
         # (parent) container key while having identical-looking tag_reference suffixes
         # (e.g. two different array tags both having a "[0].DN" element) — scope_id is
         # what actually distinguishes them (see TagBuilder / _build_hex_oid_map usage).
+        #
+        # rung_content (t[7]) is also included: a routine's own whole-routine Description
+        # and one of its rung comments can share the exact same (parent, tag_reference="",
+        # scope_id, object_id) -- verified against a real project where a "Get_Bin"
+        # routine's real Description ("Find bin for current set") and an unrelated rung
+        # comment ("****Get_BIN\nSearch for available bin...") both had object_id=1 under
+        # the same parent/scope_id, distinguished *only* by rung_content (0 for the
+        # description, nonzero for the rung comment -- the same field
+        # RoutineBuilder.build() already uses to tell them apart). Without rung_content in
+        # this key, the dedup step silently discarded whichever of the two had the shorter
+        # text -- not just a missing Description, but a risk of *also* dropping a real rung
+        # comment in the reverse case.
         seen: Dict[tuple, tuple] = {}
         for t in comment_tuples:
-            key = (t[5], t[6], t[9])
+            key = (t[5], t[6], t[9], t[7])
             if key not in seen or len(t[3]) > len(seen[key][3]):
                 seen[key] = t
         self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?)", seen.values())

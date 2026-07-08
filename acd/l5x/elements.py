@@ -1888,6 +1888,16 @@ class Program(L5xElement):
     use_as_folder: str
     tags: List[Tag]        # Tags section before Routines (matches L5X export order)
     routines: List[Routine]
+    _description: Union[str, None] = field(default=None)
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        if not self._description:
+            return base
+        idx = base.index(">")
+        desc = _multiline_xml_text(self._description)
+        inject = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
+        return base[: idx + 1] + inject + base[idx + 1 :]
 
 
 @dataclass
@@ -1955,6 +1965,7 @@ class Controller(L5xElement):
     # _redundancy_enabled is NOT serialised as a regular XML attribute (underscore prefix
     # skips it in the base to_xml()); it is used only to build the <RedundancyInfo> element.
     _redundancy_enabled: bool = field(default=False)
+    _description: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1983,6 +1994,10 @@ class Controller(L5xElement):
         idx = base.index(">")
         open_tag = base[: idx + 1]
         inner = base[idx + 1 : -len("</Controller>")]
+        desc_xml = ""
+        if self._description:
+            desc = _multiline_xml_text(self._description)
+            desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         # RedundancyInfo: Enabled comes from binary; no pad attributes in golden.
         redundancy_enabled_str = "true" if self._redundancy_enabled else "false"
         redundancy_info = (
@@ -1990,6 +2005,7 @@ class Controller(L5xElement):
         )
         return (
             open_tag
+            + desc_xml
             + inner
             + redundancy_info
             + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
@@ -3352,6 +3368,35 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
     return texts
 
 
+def _lookup_object_description(cur: Cursor, r, record: bytes) -> Union[str, None]:
+    """Look up a comps object's own whole-object Description via the comments
+    table, using the same comment_id/cip_type "parent" key + scope_id
+    resolution already used for tag and routine descriptions (see the
+    "Comment / description resolution" notes and RoutineBuilder.build()).
+
+    Used for Program and Controller, which -- like Routine -- can have their
+    own <Description> rendered as a direct child of the element, found as a
+    record_type=1 (AsciiRecord) comments entry under the object's own
+    parent/scope_id key. Multiple candidate rows can exist (rung comments
+    share this same shape for Routine, though Program/Controller have no
+    rungs of their own); the longest candidate is taken, matching the same
+    heuristic RoutineBuilder already uses.
+    """
+    try:
+        own_scope_id = struct.unpack_from("<H", record, 16)[0] if len(record) >= 18 else 0
+        comment_parent = (r.comment_id * 0x10000) + r.cip_type
+        cur.execute(
+            "SELECT record_string FROM comments WHERE parent=? AND scope_id=? AND record_type=1",
+            (comment_parent, own_scope_id),
+        )
+        candidates = [row[0] for row in cur.fetchall() if row[0]]
+        if candidates:
+            return max(candidates, key=len)
+    except Exception:
+        pass
+    return None
+
+
 def _filetime_to_iso(ft: int) -> str:
     """Convert a Windows FILETIME (100-ns units since 1601-01-01) to ISO8601.
 
@@ -3532,8 +3577,19 @@ class AoiBuilder(L5xElementBuilder):
         revision_note = ""
         if _r_aoi is not None:
             aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
+            # record_type=1 (AsciiRecord) is required: the AOI's own whole-object
+            # comment "parent" key also carries other member_ref=0 entries that are
+            # NOT the description -- e.g. record_type=13 (DI_EXT_HELP, extended
+            # instruction help text) and record_type=19 (UDI_LAST_EDITED_BY revision
+            # metadata). Without this filter, an unordered "LIMIT 1" could pick
+            # whichever of these happened to come back first instead of the real
+            # description -- found via a real project where two AOIs' own
+            # Descriptions ("VAB PowerFlex 525/700 Drive Instruction for
+            # EtherNet/IP") were missing from the export entirely because this
+            # query silently grabbed one of the other member_ref=0 rows instead.
             self._cur.execute(
-                "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+                "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 "
+                "AND record_type=1 LIMIT 1",
                 (aoi_comment_parent,),
             )
             desc_row = self._cur.fetchone()
@@ -3684,8 +3740,13 @@ class ProgramBuilder(L5xElementBuilder):
         # for all programs in a redundant controller project.
         sync_redundancy = "true" if self._redundancy_enabled else None
 
+        # A Program can have its own whole-program Description, found the same way as a
+        # Routine's (see RoutineBuilder.build()/_lookup_object_description) -- verified
+        # against a real project ("_2_TONGLOADER" -> "Tong Loader Master Control").
+        description = _lookup_object_description(self._cur, r, prog_record)
+
         return Program(name, name, "false", main_routine_name, fault_routine_name,
-                       disabled, sync_redundancy, "false", tags, routines)
+                       disabled, sync_redundancy, "false", tags, routines, description)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
@@ -3761,6 +3822,11 @@ class ControllerBuilder(L5xElementBuilder):
             + str((r.comment_id * 0x10000) + r.cip_type)
         )
         comment_results = self._cur.fetchall()
+
+        # A Controller can have its own whole-project Description, found the same way
+        # as a Routine's/Program's (see RoutineBuilder.build()/_lookup_object_description)
+        # -- verified against a real project ("Dry Sorter program for Hancock Lumber\nBethel, Maine").
+        controller_description = _lookup_object_description(self._cur, r, results[0][4])
 
         extended_records: Dict[int, bytes] = {}
         for extended_record in r.extended_records:
@@ -4255,6 +4321,7 @@ class ControllerBuilder(L5xElementBuilder):
             tasks,
             aois,
             redundancy_enabled,
+            controller_description,
         )
 
 

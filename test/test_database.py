@@ -54,10 +54,24 @@ def test_rung_comment_scoped_correctly(controller):
     # tally/sorting routine). This fixture is too small to exercise an
     # actual collision, but this still guards against a regression in the
     # basic rung-comment lookup itself.
+    #
+    # This routine actually has three rung comments (rungs 3, 8, 9 -- each a
+    # placeholder NOP() noting a different instruction to fill in later: JXR,
+    # SFR, SFP respectively). A previous version of this test only checked
+    # rung 0 because the old (buggy) rung-attribution logic collapsed every
+    # rung comment in a routine onto the same wrong slot (see "Rung comments"
+    # in CLAUDE.md) -- rung 0's real content is a populated SBR() instruction,
+    # not a placeholder, so "Add JXR when you figure it out" on rung 0 never
+    # actually made semantic sense; it was simply the first comment processed
+    # winning an always-computed-as-0 slot.
     for p in controller.programs:
         for r in p.routines:
             if r.name == "R020_Program_Control":
-                assert r._rung_comments.get(0) == "Add JXR when you figure it out."
+                assert r._rung_comments == {
+                    3: "Add JXR when you figure it out.",
+                    8: "Add SFR when you figure it out",
+                    9: "Add SFP when you figure it out",
+                }
                 return
     pytest.fail("R020_Program_Control routine not found")
 

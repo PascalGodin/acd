@@ -3230,7 +3230,6 @@ class RoutineBuilder(L5xElementBuilder):
         # (comment_id * 0x10000 + cip_type), as AsciiRecord (record_type=1) entries
         # where rung_content != 0 (distinguishes user rung comments from internal
         # metadata strings like FBDRoutineDescription which have rung_content=0).
-        # The object_id field is the 1-based rung index (rung 0 -> object_id=1).
         #
         # scope_id (2-byte discriminator at absolute byte offset 16 of the
         # routine's own raw record, same field used for tag comments) MUST also
@@ -3239,34 +3238,61 @@ class RoutineBuilder(L5xElementBuilder):
         # without this filter a routine can silently pick up another routine's
         # rung comments entirely (e.g. "Flasher" showing a comment that was
         # actually written for a completely different tally/sorting routine).
+        #
+        # Which specific rung a comment belongs to is resolved via rung_content's
+        # upper 16 bits, looked up against the `regnlink` table (see
+        # populate_regnlink() in export_l5x.py for the full mechanism) -- NOT via
+        # the comment's own object_id field, which was previously (wrongly)
+        # assumed to be a 1-based rung index ("object_id - 1 = rung_index"). That
+        # assumption only ever worked by coincidence for a routine with exactly
+        # one rung comment (object_id is constant -- always 1 -- across every
+        # rung comment in a routine, verified against a real routine with 26
+        # rung comments, all object_id=1): with only one candidate there's no
+        # wrong-slot collision to expose the bug. Verified byte-exact against a
+        # real Studio 5000 "Export Routine" ground truth for a fresh routine's
+        # comments; for a long-lived, heavily-edited real routine, resolution
+        # can still drift for comments predating a later rung insertion/deletion
+        # elsewhere in the routine (regnlink's per-rung fragment values appear to
+        # be reassigned when the rung list structurally changes) -- see
+        # "Rung comments" in CLAUDE.md for the full investigation. A comment
+        # whose fragment can't be resolved to any of this routine's own rungs is
+        # dropped rather than guessed at.
         rung_comments: Dict[int, str] = {}
-        # The routine's own whole-routine description shares the exact same
-        # record shape as rung comments (record_type=1, same parent/scope_id)
-        # but with rung_content==0 -- previously treated purely as "internal
-        # metadata to exclude" (per the note above), but verified against a
-        # real project that this is actually the routine's own Description
-        # (e.g. "Shift the Data on the Grading Chain and Start a Skip if
-        # needed" for a real "Lug_Skip" routine) -- rendered by Studio 5000
-        # as a <Description> child of <Routine>, before <RLLContent>.
         description: Union[str, None] = None
         try:
             own_scope_id = struct.unpack_from("<H", record, 16)[0] if len(record) >= 18 else 0
             comment_parent = (r.comment_id * 0x10000) + r.cip_type
             self._cur.execute(
-                "SELECT object_id, record_string, rung_content FROM comments "
+                "SELECT record_string, rung_content FROM comments "
                 "WHERE parent=? AND scope_id=? AND record_type=1",
                 (comment_parent, own_scope_id),
             )
             desc_candidates = []
-            for obj_id, rec_str, rung_content in self._cur.fetchall():
+            rung_content_rows = []
+            for rec_str, rung_content in self._cur.fetchall():
                 if rung_content:
-                    rung_index = obj_id - 1  # convert 1-based to 0-based
-                    if rung_index >= 0 and rec_str and rung_index not in rung_comments:
-                        rung_comments[rung_index] = rec_str
+                    rung_content_rows.append((rung_content, rec_str))
                 elif rec_str:
                     desc_candidates.append(rec_str)
             if desc_candidates:
                 description = max(desc_candidates, key=len)
+
+            if rung_content_rows:
+                rung_id_to_index = {oid: i for i, oid in enumerate(rung_ids)}
+                for rung_content, rec_str in rung_content_rows:
+                    if not rec_str:
+                        continue
+                    fragment = rung_content >> 16
+                    self._cur.execute(
+                        "SELECT rung_object_id FROM regnlink WHERE routine_id=? AND fragment=?",
+                        (self._object_id, fragment),
+                    )
+                    row = self._cur.fetchone()
+                    if row is None:
+                        continue
+                    rung_index = rung_id_to_index.get(row[0])
+                    if rung_index is not None and rung_index not in rung_comments:
+                        rung_comments[rung_index] = rec_str
         except Exception:
             pass
 

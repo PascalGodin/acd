@@ -247,7 +247,9 @@ the logs if you ever suspect a module's connection Type is wrong.
   real project after reverse-engineering the `RegnLink.Dat` rung-attribution mechanism — see
   "Rung comments: multi-comment-per-routine attribution via RegnLink.Dat" below for the full
   investigation and the remaining ~10% gap (fragment drift in heavily-edited routines, not yet
-  solved). Don't assume whole-project L5X output is byte-identical to a real Studio 5000 export
+  solved — traced to a real Rockwell editor quirk when a comment is deleted and a new one created
+  afterward, not a flaw in our own resolution logic). Don't assume whole-project L5X output is
+  byte-identical to a real Studio 5000 export
   just because a specific feature (like tag comments, or these element counts) was verified
   exact — rung-comment content in old/heavily-edited routines can still be incomplete.
 - `_decode_udt_initial_value`/`_decode_single_udt_element` (initial-*value* decoding from the
@@ -484,36 +486,48 @@ adjacent) positions.
   whose first rung's stale record, if not filtered out, truncated the entire chain to just one
   link. Filtered by requiring `type == 0x00020000` (well, `!= 0xFFFF0000`).
 
-**Remaining, real limitation (not yet solved): fragment drift after later structural edits.**
-Verified against the real `Main` routine (26 rung comments): most resolved to the *wrong* rung by
-a small, consistent offset (+2, with one +3) even with the mechanism above fully correct and
-byte-exact for a fresh test case. Root cause, inferred from the pattern (a uniform small offset
-across most comments, with a bigger offset appearing only after a specific point in the routine):
-`RegnLink.Dat`'s per-rung fragment values appear to be **reassigned whenever the routine's rung
-list is later structurally edited** (rungs inserted/deleted). A comment created *before* such a
-later edit retains the fragment value that was correct *at the time*, which no longer matches
-that rung's *current* fragment after the edit — there is no stored "edit history" we've found
-that would let us compensate for this drift. This was independently reproduced in a deliberately
-staged test (delete a rung comment, immediately recreate a new one elsewhere) and confirmed via a
-real Studio 5000 "Export Routine" — the new comment's rung_content fragment pointed to a
-different, unrelated rung than the one the user actually typed it on.
+**Remaining, real limitation (not yet solved): Studio 5000 itself appears to write a stale
+fragment when a comment is deleted and a new one created afterward** — this is not drift in our
+own resolution logic, it's Rockwell's own editor writing the wrong value into `Comments.Dat` at
+creation time. Isolated via two independent, carefully-redone staged tests (delete an existing
+rung comment, create a brand new one on a *different* rung, changing nothing else structurally)
+and confirmed against real Studio 5000 "Export Routine" ground truth both times: the new
+comment's `rung_content` fragment did **not** match its real target rung's current fragment (per
+`RegnLink.Dat`, read from the very same file) — it matched a completely unrelated rung that never
+had any comment in the test at all, both times reproducing the identical wrong rung. This rules
+out drift-over-time as the mechanism (there's no "old" structural state to drift from in a single
+edit within one Studio 5000 session) — it looks like Rockwell's own comment-creation code path
+reuses/derives from some stale internal allocator state (plausibly related to the free-list-reuse
+behavior also observed in `Comments.Idx`'s own per-comment slot ID, see the dedup-bug section
+above) rather than freshly computing the actual target rung's fragment.
+
+**Structural rung insertions elsewhere in the routine are, by contrast, tracked correctly**:
+verified via a staged test that inserted a brand-new rung in the *middle* of a routine that
+already had comments on rungs before and after the insertion point — the existing comment on the
+rung *after* the insertion point correctly followed its own rung's new, shifted position (e.g.
+from rung 7 to rung 8 after one rung was inserted earlier in the routine), with no drift at all.
+So the "reassigned on structural edit" theory from the real `Main` routine's own +2/+3 offset
+(see below) is likely explained by this same delete/recreate quirk having happened to some of
+those comments at some point in the routine's own long edit history, not by mere insertion of
+unrelated rungs elsewhere.
 
 **Practical impact**: whole-project rung-comment coverage went from 98/582 (17%) to 522/582 (90%)
-for one real project after this fix. The remaining ~10% gap is concentrated in older comments in
-heavily-edited routines (drift, as above) — a comment whose fragment can't be resolved to any of
-the routine's own current rungs is simply dropped (not guessed at / not misattributed) rather
-than risk showing it on the wrong rung. **Comments added freshly and never followed by a
-structural edit to the same routine should resolve correctly** — this is the common case for the
-motivating use case (an LLM or a user adding new rung comments to an existing, otherwise-stable
-routine), verified byte-exact in the staged tests above.
+for one real project after the core fix. The remaining ~10% gap is concentrated in comments that
+were at some point deleted and recreated (this quirk) in heavily-edited real routines — a comment
+whose fragment can't be resolved to any of the routine's own current rungs is simply dropped (not
+guessed at / not misattributed) rather than risk showing it on the wrong rung. **The common case
+for the motivating use case is unaffected**: an LLM (or a user) adding a brand-new comment to an
+existing, previously-uncommented rung — verified byte-exact and reproducible across every staged
+test where no comment was ever deleted-and-recreated. The danger zone specifically is *editing/
+replacing* an existing rung comment (delete + recreate), which should be flagged as unreliable if
+this library is ever used to help *write* comments back into an ACD.
 
-**If revisited to close the remaining gap**: the drift-detection idea most likely to work is
-tracking each rung's *own* current fragment (already available, see `regnlink` table) against
-whatever partial ordering information a comment's stale fragment implies, and searching nearby
-rungs for the best match rather than requiring an exact fragment hit — not yet attempted; no
-strong evidence yet for what a reliable proximity/tie-breaking rule would look like without more
-staged test data specifically isolating rung insertion/deletion events (as opposed to comment
-add/delete events, which is what the current staged tests isolate).
+**If revisited to close the remaining gap**: since the wrong fragment doesn't correspond to
+either the deleted comment's own rung or the new target rung, a value-based fix seems unlikely;
+the more promising angle would be trying to identify what Rockwell's own "most recently freed
+slot" bookkeeping looks like (a free-list of some kind, given the parallel with `Comments.Idx`'s
+slot-ID reuse) well enough to recognize and discard/flag likely-stale fragments rather than trust
+them at face value — not yet attempted.
 
 ## UDT L5K rendering (`_l5k_udt_literal`)
 

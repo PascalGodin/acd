@@ -272,22 +272,81 @@ limitations entirely for the common case of editing/adding rungs (including rung
 an existing routine — Studio 5000 itself handles all the internal consistency (cross-reference
 index, object database, re-signing) that a raw binary write would otherwise require.
 
-The wrapper shape was calibrated against one real Studio 5000 "Export Routine" output (a 2-rung
-routine referencing one controller-scope tag and two program-scope tags) and matches it
-structurally: `<DataTypes Use="Context">` (always present, even empty), `<Tags Use="Context">`
-at both Controller and Program scope (full `<Tag>` definitions, reusing `Tag.to_xml()`, for
-every tag the routine's rung text references — found via a simple identifier scan intersected
-against the project's known tag names, not a real ladder-logic parser), `<Programs
-Use="Context">`, and `<Routines Use="Context">` wrapping `<Routine Use="Target" ...>`. A real
-scoping bug was found and fixed in the process: a program-scope tag must shadow/exclude a
-same-named but unrelated controller-scope tag (standard Logix bare-name resolution), not include
-both.
+**Confirmed working end-to-end**: a real, edited `export_routine()` output (a routine with a new
+rung instruction added, referencing one controller-scope and two program-scope tags, including
+one array tag) was successfully imported into a real Studio 5000 project via native Import
+Routine, with zero errors. This took several rounds of real-data verification to get right —
+see below for the full list of bugs found and fixed along the way, most of which only surfaced
+once an actual *import* (not just an export/shape comparison) was attempted:
 
-**Not yet verified**: whether Studio 5000 actually *accepts* an `export_routine()`-produced file
-via its native Import Routine feature — only the XML *shape* has been calibrated against a real
-export, not a real *import*. Also unverified: multi-rung-referencing-a-custom-UDT scenarios
-(only tested with plain BOOL tags so far), and whether the `Owner` attribute is actually required
-for import to succeed (included as an optional parameter, omitted by default).
+1. **The wrapper shape** was calibrated against a real Studio 5000 "Export Routine" output (a
+   2-rung routine referencing one controller-scope tag and two program-scope tags):
+   `<DataTypes Use="Context">` (always present, even empty), `<Tags Use="Context">` at both
+   Controller and Program scope (full `<Tag>` definitions, reusing `Tag.to_xml()`, for every tag
+   the routine's rung text references — found via a simple identifier scan intersected against
+   the project's known tag names, not a real ladder-logic parser), `<Programs Use="Context">`,
+   and `<Routines Use="Context">` wrapping `<Routine Use="Target" ...>`.
+2. **Program-scope tag shadowing.** A program-scope tag must shadow/exclude a same-named but
+   unrelated controller-scope tag (standard Logix bare-name resolution) when resolving which
+   tags a routine's rung text actually references — previously both were incorrectly included.
+3. **THE actual crash root cause** (`0x80004003` "Invalid pointer" in Logix Designer, confirmed
+   via the app's own fatal-error log): individual `<Tag>` elements must **never** carry a
+   `Use=` attribute themselves — only the wrapping container elements (`<Controller
+   Use="Context">`, `<Tags Use="Context">`, `<DataTypes Use="Context">`, `<Programs
+   Use="Context">`, `<Routines Use="Context">`, `<Program Use="Context">`) and the routine
+   actually being targeted (`<Routine Use="Target">`) do. This was found by the most reliable
+   method available: making the identical edit directly in Studio 5000, exporting it natively,
+   confirming *that* file imports successfully, then diffing our file against it
+   attribute-by-attribute (not just child-element shape, which had already matched) — the one
+   remaining difference was `Use="Context"` present on every `<Tag>` in ours, absent in the real
+   one. This exactly explained every earlier experimental result: an empty `<Tags
+   Use="Context"></Tags>` never crashed, but *any* populated `<Tag>` did, regardless of whether
+   it was a scalar or array, regardless of whether it had `<Data>` content at all (even
+   attributes-only `<Tag>` elements crashed) — because the bad attribute was on the Tag element
+   itself in every case.
+4. **Two more bugs found along the way, both affecting `Tag.to_xml()` generally (not specific to
+   `export_routine()`)**, uncovered because building real context tags for this feature was the
+   first time this session's verification touched a scalar-with-known-value tag and a real
+   populated array tag: scalar primitive tags were missing their `<Data Format="L5K">` block
+   entirely and used the wrong Decorated element shape (`<BOOL Name=...>` instead of `<DataValue
+   DataType="BOOL"...>`), and primitive *array* tags were also missing their entire L5K block —
+   see the "Rung patch write-back" section's sibling fixes below for `Tag.to_xml()` details, and
+   the dedicated "BOOL array bit-packing" fix a few paragraphs down.
+5. **Array trailing-zero truncation was removed entirely** (`Tag.to_xml()`'s primitive array
+   branch and `_udt_array_to_xml`) — it was never actually verified against real Studio 5000
+   output despite an existing docstring claiming otherwise, directly contradicted by a real
+   Export Routine sample (a 256-element array shown in full, not truncated), and strongly
+   suspected (though not proven, since fix #3 above turned out to be the actual root cause) as a
+   contributing crash risk before that was found.
+6. **A serious, unrelated data-correctness bug found while checking the imported tag's actual
+   value against the project's live value**: BOOL *array* initial values were bit-unpacked
+   incorrectly — see "BOOL array bit-packing" below. This affects every BOOL array tag's decoded
+   value project-wide, not just `export_routine()`.
+
+Still open / not yet verified: multi-rung-referencing-a-custom-UDT scenarios (only tested with
+plain BOOL tags and one BOOL array so far), and whether the `Owner` attribute is actually
+required for import to succeed (included as an optional parameter, omitted by default; the
+successful test included it, so its necessity hasn't been isolated).
+
+## BOOL array bit-packing (initial value decoding)
+
+`_read_tag_initial_value()` (`elements.py`) read every array element's initial value at its own
+naive per-element byte offset (`offset + i * elem_size`). This is correct for every primitive
+type *except* BOOL/BIT arrays, which Rockwell bit-packs 32 bits per 4-byte DWORD — the same
+packing `_get_type_size()` already accounts for when *sizing* a `BOOL[N]` array (`ceil(N/32)*4`),
+but this function was never updated to match, and silently returned a raw packed byte value
+(e.g. `32`) instead of the correct `0`/`1` bit for every element of every BOOL array tag in every
+project. Since any non-zero "value" renders as BOOL `True` in the generated XML, this corrupted
+the Decorated output for any BOOL array with a non-trivial bit pattern — found by comparing an
+`export_routine()`-imported tag's value against the project's actual live value (a genuine
+mismatch, not a stale-snapshot artifact, since the comparison was against an offline copy of the
+exact same ACD). Fixed by reading the correct DWORD (`offset + (i // 32) * 4`) and extracting bit
+`i % 32` for BOOL/BIT arrays specifically; scalar BOOL tags (`n_elements == 1`) are unaffected —
+they're read as a plain byte at a different, unpacked offset and were already correct, which is
+why this went unnoticed for so long. Verified against a real 256-element array tag: all 256
+values now match Studio 5000's own export exactly (previously many silently wrong). The small
+test fixture has no BOOL array tags at all, so this is covered by a synthetic unit test
+(`test_read_tag_initial_value_bool_array_bit_packing`) instead of a real-fixture test.
 
 ## Rung patch write-back (`patch_rungs`/`patch_sbregion_dat`)
 

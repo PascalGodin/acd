@@ -133,7 +133,41 @@ def patch_rungs(project: RSLogix5000Content, changes: dict) -> None:
     )
 
 
-def export_routine(project: RSLogix5000Content, routine: Routine, output_path) -> None:
+def _inject_use_attr(xml_str: str, element_name: str, use_value: str) -> str:
+    """Insert Use="value" as the first attribute of <element_name ...>.
+
+    e.g. _inject_use_attr('<Tag Name="Foo">...', 'Tag', 'Context')
+      -> '<Tag Use="Context" Name="Foo">...'
+    """
+    marker = f"<{element_name} "
+    idx = xml_str.index(marker)
+    insert_at = idx + len(marker)
+    return xml_str[:insert_at] + f'Use="{use_value}" ' + xml_str[insert_at:]
+
+
+_TAG_TOKEN_RE = None  # compiled lazily to avoid importing re at module load if unused
+
+
+def _referenced_tag_names(rung_texts) -> set:
+    """Extract candidate tag-name tokens referenced in rung text.
+
+    A simple identifier scan, not a real ladder-logic parser: it grabs every
+    identifier-like token (letters/digits/underscore) and lets the caller
+    intersect against the project's actual known tag names -- instruction
+    mnemonics (XIC, OTE, TON, ...) are harmless false positives here since
+    they simply won't match any real tag name afterward.
+    """
+    import re
+    token_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    names = set()
+    for text in rung_texts:
+        if not text:
+            continue
+        names.update(token_re.findall(text))
+    return names
+
+
+def export_routine(project: RSLogix5000Content, routine: Routine, output_path, owner: str = None) -> None:
     """Export a single routine as a standalone, partial L5X file.
 
     Unlike ConvertAcdToL5x (which serialises the whole project), this is
@@ -145,23 +179,42 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path) -
     common case of editing/adding rungs (including rung comments) in an
     already-existing routine.
 
-    CAUTION: the outer <RSLogix5000Content>/<Controller>/<Program> wrapper
-    this produces has NOT yet been verified against a real Studio 5000
-    "Export Routine" output -- only the inner <Routine>/<RLLContent>
-    rendering (rung text + rung comments) has been exercised. Treat the
-    wrapper shape as a best-effort placeholder until cross-checked against
-    a real exported routine L5X from the same Studio 5000 version.
+    Verified against a real Studio 5000 "Export Routine" output (a 2-rung
+    routine referencing a controller-scope tag and two program-scope tags):
+    the wrapper needs, in order: an empty <DataTypes Use="Context"> section
+    (present even when no custom UDTs are referenced), a <Tags Use="Context">
+    section under <Controller> with the full <Tag> definition (current
+    value, description, comments -- reusing Tag.to_xml()) of every
+    controller-scope tag the routine's rung text references, a
+    <Programs Use="Context"> wrapper (the plain <Programs> this used to
+    emit was wrong -- missing Use="Context"), a per-program
+    <Tags Use="Context"> section the same way for program-scope tags, and
+    a <Routines Use="Context"> wrapper around <Routine Use="Target" ...>
+    (both Use= attributes were previously missing entirely). ExportOptions
+    for a partial/context export also differs from a full project export --
+    it includes extra "References Context Dependencies" tokens.
+
+    Referenced tags/data types are found with a simple identifier scan of
+    the rung text intersected against the project's actual known tag names
+    (see _referenced_tag_names) -- not a full ladder-logic parser, but
+    correct for plain tag-name operands (which is what matters for
+    instruction operands). Custom UDTs used by any referenced tag are
+    included in <DataTypes Use="Context"> automatically.
 
     Args:
         project: The loaded project (from load_acd()) that owns `routine`
-            -- used to find which Program contains it, and to source the
-            SoftwareRevision/SchemaRevision/Controller name for the wrapper.
+            -- used to find which Program contains it, resolve referenced
+            tags/data types, and source SoftwareRevision/SchemaRevision.
         routine: The Routine object to export (e.g.
             project.controller.programs[0].routines[0]). Edit its `.rungs`
             (append new rung text, or edit existing entries) and/or
             `._rung_comments` (dict of {rung_index: comment_text}) before
             calling this to include those changes in the export.
         output_path: Destination .L5X file path.
+        owner: Optional "Owner" attribute value (the registered Studio 5000
+            license owner, e.g. "MyCompany, MyCompany" -- a real export
+            included this attribute, but it's not clear whether Studio 5000
+            requires it to import; omitted entirely if not supplied).
 
     Raises:
         ValueError: if `routine` isn't found in any program of `project`.
@@ -189,21 +242,58 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path) -
 
     controller_name = project.controller.name
     export_date = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    export_options = (
+        "References NoRawData L5KData DecoratedData Context Dependencies "
+        "ForceProtectedEncoding AllProjDocTrans"
+    )
 
-    routine_xml = routine.to_xml()
+    referenced_names = _referenced_tag_names(routine.rungs)
+    program_tags = [t for t in program.tags if t.name in referenced_names]
+    # Standard Logix scoping: a program-scope tag shadows a same-named
+    # controller-scope tag for bare-name operand resolution within that
+    # program. Verified against a real project: a routine's OTE(Flash)
+    # resolves to the *program*-scope BOOL tag "Flash", not an unrelated
+    # controller-scope tag also named "Flash" (a custom UDT) -- so a
+    # controller-scope tag must be excluded here if a program-scope tag of
+    # the same name is also referenced, or the export includes a completely
+    # wrong, irrelevant tag.
+    program_tag_names = {t.name for t in program_tags}
+    controller_tags = [
+        t for t in project.controller.tags
+        if t.name in referenced_names and t.name not in program_tag_names
+    ]
+
+    referenced_type_names = {t.data_type.upper() for t in controller_tags + program_tags if t.data_type}
+    referenced_data_types = [
+        dt for dt in project.controller.data_types if dt.name.upper() in referenced_type_names
+    ]
+
+    data_types_xml = "".join(dt.to_xml() for dt in referenced_data_types)
+    controller_tags_xml = "".join(
+        _inject_use_attr(t.to_xml(), "Tag", "Context") for t in controller_tags
+    )
+    program_tags_xml = "".join(
+        _inject_use_attr(t.to_xml(), "Tag", "Context") for t in program_tags
+    )
+    routine_xml = _inject_use_attr(routine.to_xml(), "Routine", "Target")
+
+    owner_attr = f' Owner="{_escape_xml_attr(owner)}"' if owner else ""
 
     xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         f'<RSLogix5000Content SchemaRevision="{project.schema_revision}" '
         f'SoftwareRevision="{project.software_revision}" '
         f'TargetName="{_escape_xml_attr(routine.name)}" '
-        f'TargetType="Routine" TargetSubType="Ladder" TargetClass="Standard" '
-        f'ContainsContext="true" ExportDate="{export_date}" '
-        f'ExportOptions="{project.export_options}">\n'
+        f'TargetType="Routine" TargetSubType="{_escape_xml_attr(routine.type)}"'
+        f'{owner_attr} ContainsContext="true" ExportDate="{export_date}" '
+        f'ExportOptions="{export_options}">\n'
         f'<Controller Use="Context" Name="{_escape_xml_attr(controller_name)}">\n'
-        f'<Programs>\n'
+        f'<DataTypes Use="Context">\n{data_types_xml}\n</DataTypes>\n'
+        f'<Tags Use="Context">\n{controller_tags_xml}\n</Tags>\n'
+        f'<Programs Use="Context">\n'
         f'<Program Use="Context" Name="{_escape_xml_attr(program.name)}">\n'
-        f'<Routines>\n'
+        f'<Tags Use="Context">\n{program_tags_xml}\n</Tags>\n'
+        f'<Routines Use="Context">\n'
         f'{routine_xml}\n'
         f'</Routines>\n'
         f'</Program>\n'

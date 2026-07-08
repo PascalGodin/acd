@@ -39,6 +39,27 @@ def _escape_xml_attr(value: object) -> str:
     return text.replace("\t", "&#x9;").replace("\r", "&#xD;").replace("\n", "&#xA;")
 
 
+def _multiline_xml_text(raw: str) -> str:
+    """Normalize line endings for an XML/CDATA text block, PRESERVING
+    multi-line structure.
+
+    Used for <Description>/<RevisionNote> element content in to_xml()
+    renderers. Verified against a real Studio 5000 export: a tag's
+    <Description> was genuinely multi-line CDATA ("Program \nBit \nFlags",
+    3 lines), not collapsed to one line -- confirmed as a real discrepancy
+    (not just a cosmetic difference) when Studio 5000's own Import Routine
+    flagged our collapsed single-line version as different from the
+    project's existing (correctly multi-line) description for the same tag.
+
+    This is deliberately separate from the `.description` Python property
+    (which DOES collapse multi-line text to one line with spaces, e.g.
+    Member.description/Tag.description) -- that collapsing is documented,
+    existing behavior for the convenience Python API and must not change;
+    only the XML rendering needed fixing.
+    """
+    return raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 @dataclass
 class L5xElementBuilder:
     _cur: Cursor
@@ -131,9 +152,9 @@ class Member(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        desc = self.description
-        if not desc:
+        if not self._description:
             return base
+        desc = _multiline_xml_text(self._description)
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
@@ -159,7 +180,7 @@ class DataType(L5xElement):
         base = super().to_xml()
         if not self._description:
             return base
-        desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+        desc = _multiline_xml_text(self._description)
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
@@ -1175,7 +1196,7 @@ class Tag(L5xElement):
         candidates = [text for ref, text in self._comments if ref in ("", ".") and text]
         desc_raw = max(candidates, key=len) if candidates else None
         if desc_raw is not None:
-            desc_raw = ' '.join(desc_raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+            desc_raw = _multiline_xml_text(desc_raw)
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
@@ -1388,7 +1409,7 @@ class LocalTag(L5xElement):
         base = super().to_xml()
         if not self._description:
             return base
-        desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+        desc = _multiline_xml_text(self._description)
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
@@ -1424,7 +1445,7 @@ class Parameter(L5xElement):
         base = super().to_xml()
         if not self._description:
             return base
-        desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+        desc = _multiline_xml_text(self._description)
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
@@ -1482,7 +1503,7 @@ class Module(L5xElement):
         # Optional <Description>
         desc_xml = ""
         if self._description:
-            desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+            desc = _multiline_xml_text(self._description)
             desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
 
         ekey = f'<EKey State="{self._ekey_state}"/>'
@@ -1687,10 +1708,10 @@ class AOI(L5xElement):
         idx = base.index(">")
         inject = ""
         if self._description:
-            desc = ' '.join(self._description.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+            desc = _multiline_xml_text(self._description)
             inject += f'<Description>\n<![CDATA[{desc}]]>\n</Description>'
         if self._revision_note:
-            note = ' '.join(self._revision_note.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+            note = _multiline_xml_text(self._revision_note)
             inject += f'<RevisionNote>\n<![CDATA[{note}]]>\n</RevisionNote>'
         return base[:idx + 1] + inject + base[idx + 1:]
 

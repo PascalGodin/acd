@@ -319,11 +319,11 @@ edit into a project is to hand Studio 5000 a file it imports through its own UI 
 does the binary write + re-sign. **`export_routine()` (partial L5X via "Import Routine") is the
 one actively-developed, verified-end-to-end mechanism** — it now covers both rung edits (its
 original purpose) and tag-level edits (description/value), the latter via the routine-carrier
-trick below, per user direction. A standalone `export_tag()` (single-tag partial L5X via "Import
-Component") and CSV "Import Tags" were both explored as alternatives and are kept below for
-reference, but **deprioritized**: the user does not want to rely on CSV, and `export_tag()`'s
-wrapper was never calibrated against a real Studio single-tag export before the routine-carrier
-approach superseded the need for it.
+trick below, per user direction. CSV "Import Tags" was explored as an alternative and is kept
+below for reference, but **deprioritized**: the user does not want to rely on CSV. A standalone
+single-tag partial-L5X exporter (via Studio's "Import Component") was also drafted early in this
+investigation but removed before merging — its wrapper was never calibrated against a real
+Studio single-tag export, and the routine-carrier approach superseded the need for it entirely.
 
 ### Tag CSV import format (Rockwell "CSV-Import-Export")
 

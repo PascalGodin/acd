@@ -52,7 +52,8 @@ acd/
 
 **Data flow:** `ExportL5x.__init__` unzips the ACD, reads each `.Dat` file via `DbExtract`,
 runs each raw record through its `record/*.py` parser, and bulk-inserts the normalized tuples
-into an in-memory-ish SQLite DB (`comps`, `rungs`, `region_map`, `comments`, `nameless` tables).
+into an in-memory-ish SQLite DB (`comps`, `rungs`, `region_map`, `comments`, `nameless`,
+`regnlink`, `regnlink_idx` tables).
 `ControllerBuilder` (in `elements.py`) then queries that SQLite DB to build the full object
 graph. Builder classes (`TagBuilder`, `ProgramBuilder`, `DataTypeBuilder`, `AoiBuilder`, ...)
 all follow the same pattern: take a cursor + `object_id`, `SELECT` the raw record, parse fixed
@@ -242,16 +243,16 @@ the logs if you ever suspect a module's connection Type is wrong.
   are now **exact matches** (0 diff), joining `DataType`/`AddOnInstructionDefinition`. `Description`
   is also now much closer (was -40, now only short by the module-comment gap above plus a few
   `<Trend>`/`<Pen>` descriptions, since Trends aren't implemented at all — see above) after fixing
-  a real comment-dedup bug (see below). **`Comment` (rung-level specifically) is now mostly
-  solved**: went from only 98 of 582 real rung comments emitted (17%) to 522/582 (90%) for one
-  real project after reverse-engineering the `RegnLink.Dat` rung-attribution mechanism — see
-  "Rung comments: multi-comment-per-routine attribution via RegnLink.Dat" below for the full
-  investigation and the remaining ~10% gap (fragment drift in heavily-edited routines, not yet
-  solved — traced to a real Rockwell editor quirk when a comment is deleted and a new one created
-  afterward, not a flaw in our own resolution logic). Don't assume whole-project L5X output is
-  byte-identical to a real Studio 5000 export
-  just because a specific feature (like tag comments, or these element counts) was verified
-  exact — rung-comment content in old/heavily-edited routines can still be incomplete.
+  a real comment-dedup bug (see below). **`Comment` (rung-level specifically) is now fully
+  solved**: went from only 98 of 582 real rung comments emitted (17%), through 522/582 via a
+  `RegnLink.Dat` chain reading that later turned out to only *approximate* the real mechanism,
+  to **582/582 exact — every comment on exactly the right rung, verified against that project's
+  own Studio 5000 L5X export** — after finding the authoritative fragment→rung mapping in
+  **`RegnLink.Idx`**. See "Rung comments: attribution via RegnLink.Idx" below for the full
+  investigation (including the retraction of an earlier "Rockwell editor quirk" theory that
+  turned out to be our own misreading). Don't assume whole-project L5X output is byte-identical
+  to a real Studio 5000 export just because a specific feature (like tag comments, or these
+  element counts) was verified exact.
 - `_decode_udt_initial_value`/`_decode_single_udt_element` (initial-*value* decoding from the
   data-table blob, `elements.py`) has a hardcoded recursion depth limit of 3 nested structs —
   this is a generic safety cap (not tied to any specific type/module), separate from the
@@ -449,85 +450,72 @@ per-feature test had caught (see "Known limitations" for the ones still open):
   collision saved per (parent, tag_reference, scope_id, rung_content) tuple** — see the next
   section for a related, *unsolved* problem this investigation also uncovered.
 
-## Rung comments: multi-comment-per-routine attribution via RegnLink.Dat (mostly solved)
+## Rung comments: attribution via RegnLink.Idx (SOLVED — 582/582 exact on a real project)
 
-**Historical bug** (now fixed): `RoutineBuilder.build()` used to assume a rung comment's
-`object_id` (the comments table column, from the `AsciiRecord` body's own dedicated `object_id`
-field, distinct from `rung_content`) directly encoded `rung_index = object_id - 1`. This is wrong
-for any routine with more than one rung comment: `object_id` (and `member_ref`) are identical
-across *every* rung-comment row sharing the same routine's `(parent, scope_id)` key — e.g. all 26
-of one real `Main` routine's rung comments had `object_id=1, member_ref=3866099821`, both
-constant — so every comment in a routine mapped to the same wrong slot, and only whichever one
-`RoutineBuilder.build()`'s dict-building loop processed first for that slot survived. A whole
-project's rung-comment count came out to only 98 of 582 real ones because of this.
+**The mechanism, in one paragraph**: a rung comment's `rung_content` upper 16 bits are a
+"fragment" ID. The authoritative fragment→rung mapping lives in **`RegnLink.Idx`** (never
+examined until this was solved): B-tree-style index pages containing dense 16-byte entries,
+all little-endian — `[0:2] fragment` (same value as a `RegnLink.Dat` record's `[18:20]`),
+`[2:3]` the same 7-bit value as the `.Dat` record's `[20:22]` "unknown", `[3:4]` always `0x00`
+(used as a validation byte when scanning), `[4:8] routine_id` (comps object_id), **`[8:12]
+rung_object_id` — directly names the comment's target rung**, `[12:16] ptr` = file offset + 12
+of the paired `RegnLink.Dat` record carrying the same fragment (used as a validation bound:
+must be ≤ the `.Dat` size, which filters false-positive scan matches). Resolution:
+`fragment = rung_content >> 16` → look up `(routine_id, fragment)` in these entries → that
+entry's `rung_object_id`'s position in the routine's region_map-ordered rung list. Stale
+entries from old/free index pages survive the file scan (a fragment can appear twice with
+different rung UIDs — observed in a real project), so prefer the entry whose `rung_object_id`
+is one of the routine's own live rungs; if Idx entries exist but none names a live rung, drop
+the comment (genuinely stale) rather than falling back. See `populate_regnlink()` in
+`export_l5x.py` and `RoutineBuilder.build()`.
 
-**The real mechanism** (found via a series of purpose-built, incrementally-staged test ACD/L5X
-pairs created in Studio 5000 specifically to isolate this — export a small routine, add one rung
-comment, re-export, add another on a different rung, re-export, etc., diffing the raw
-`Comments.Dat` bytes between each stage): a comment's `rung_content` field's **upper 16 bits** is
-a "fragment" value that is specific to whichever rung the comment is attached to. This fragment is
-independently readable from **`RegnLink.Dat`** — a per-`.Dat`-file linked list (one per routine)
-of that routine's own rungs, previously never examined at all. See `populate_regnlink()` in
-`export_l5x.py` for the full 22-byte record layout and the scan/lookup mechanism, and
-`RoutineBuilder.build()` for how a comment's `rung_content >> 16` is resolved through it to a
-rung index. Verified **byte-exact** (0 errors) against a real Studio 5000 "Export Routine" ground
-truth for a small, freshly-created test routine with 3 rung comments in 3 different (non-
-adjacent) positions.
+**Verified**: 582/582 rung comments on exactly the right rung for a real, decades-old production
+project, against that project's own Studio 5000 full L5X export (including AOI logic-routine rung
+comments — remember AOIs when parsing L5X ground truth), plus every purpose-built staged edit test
+(fresh comments, delete-then-recreate, rung inserted mid-routine shifting comments below it).
 
-**Two real parsing pitfalls found and handled**, both via the same staged-test-project method:
-- `RegnLink.Dat`'s link records are **not reliably contiguous** in the file for a real,
-  long-lived project (fragmented across years of edits) — a naive "records for one routine are
-  22 bytes apart, contiguous" assumption (which happened to hold for the small, freshly-created
-  test project, since nothing had fragmented it yet) breaks on a real project's data. Fixed by
-  scanning the *entire* file for every occurrence of a known comps object_id as the 4-byte owner
-  field, rather than assuming/requiring physical adjacency between a routine's own records.
-- A rung can have **two link records**: a stale/deleted one (type `0xFFFF0000`, dead-ending with
-  `next_id=0`) alongside the real current one (type `0x00020000`) — found via a real routine
-  whose first rung's stale record, if not filtered out, truncated the entire chain to just one
-  link. Filtered by requiring `type == 0x00020000` (well, `!= 0xFFFF0000`).
+**History — how this was misunderstood twice, kept so nobody re-treads it**:
+1. First theory: comment `object_id` − 1 = rung index. Wrong (`object_id` is constant 1 across
+   every rung comment in a routine); only 98/582 of a real project's comments were emitted.
+2. Second theory ("the chain reading", previously documented here as the real mechanism):
+   resolve the fragment against **`RegnLink.Dat`** — a per-routine linked list of rungs
+   (22-byte records: `[0:4]` routine, `[4:8]` own rung, `[8:12]` next rung, `[12:16]` type,
+   `[16:18]` flags, `[18:20]` fragment, `[20:22]` unk) — as "the fragment belongs to the rung
+   in `next_id`". This is only *coincidentally* correct, for routines whose rungs were never
+   reordered/relinked (true of freshly-created test projects, which is why it verified clean at
+   the time): 522/582 of the real project's comments were *emitted*, but that number hid that
+   the fragment→`next_id` association is wrong whenever the chain was ever edited — scored for
+   *placement* against Studio's own export, only 113/533 landed on the right rung (317 were off
+   by exactly +2). A fragment sticks to its 22-byte *link record*, not to the rung: verified by
+   a staged rung-insertion test where the record `own=rung3` had its `next_id` redirected to the
+   new rung while keeping its old fragment. `RegnLink.Idx`'s `rung_object_id` is the field that
+   tracks the *current* rung for each fragment.
+3. The "Rockwell editor quirk" theory (four staged reproductions of delete-a-comment-then-
+   create-one appearing to write the *preceding rung's* fragment) — **retracted, it was our own
+   misreading**. The written fragment was correct all along per `RegnLink.Idx`; it merely looked
+   like rung 2's fragment under the broken chain reading (in that test routine the rungs had
+   been created out of order, so chain order ≠ link-record order for exactly three fragments).
+   The user's observation that Studio 5000 shows the comment on the correct rung after a full
+   close/reopen was the decisive clue that the answer had to be recoverable from disk.
 
-**Remaining, real limitation (not yet solved): Studio 5000 itself appears to write a stale
-fragment when a comment is deleted and a new one created afterward** — this is not drift in our
-own resolution logic, it's Rockwell's own editor writing the wrong value into `Comments.Dat` at
-creation time. Isolated via two independent, carefully-redone staged tests (delete an existing
-rung comment, create a brand new one on a *different* rung, changing nothing else structurally)
-and confirmed against real Studio 5000 "Export Routine" ground truth both times: the new
-comment's `rung_content` fragment did **not** match its real target rung's current fragment (per
-`RegnLink.Dat`, read from the very same file) — it matched a completely unrelated rung that never
-had any comment in the test at all, both times reproducing the identical wrong rung. This rules
-out drift-over-time as the mechanism (there's no "old" structural state to drift from in a single
-edit within one Studio 5000 session) — it looks like Rockwell's own comment-creation code path
-reuses/derives from some stale internal allocator state (plausibly related to the free-list-reuse
-behavior also observed in `Comments.Idx`'s own per-comment slot ID, see the dedup-bug section
-above) rather than freshly computing the actual target rung's fragment.
+**`RegnLink.Dat` facts worth keeping** (the `.Dat` chain reading is retained only as a fallback
+when a fragment has no Idx entry at all, e.g. missing `RegnLink.Idx`):
+- Records are **not reliably contiguous** for a long-lived project — scan the whole file for
+  known comps object_ids in the `[0:4]` slot rather than assuming adjacency.
+- Type `0xFFFF0000` marks a stale/deleted link (filter it); additionally the physically-last
+  record of a routine's block can carry type `0xFFFFFFFF` with fragment `0xFFFF` — it is not
+  dead, it's the not-yet-finalized tail link (its own/next fields are still live chain data;
+  observed getting a real fragment assigned only when a later edit appended another record).
+- Physical record order = rung *creation* order (independently confirmed by `SbRegion.Dat`
+  record order), not current rung order.
 
-**Structural rung insertions elsewhere in the routine are, by contrast, tracked correctly**:
-verified via a staged test that inserted a brand-new rung in the *middle* of a routine that
-already had comments on rungs before and after the insertion point — the existing comment on the
-rung *after* the insertion point correctly followed its own rung's new, shifted position (e.g.
-from rung 7 to rung 8 after one rung was inserted earlier in the routine), with no drift at all.
-So the "reassigned on structural edit" theory from the real `Main` routine's own +2/+3 offset
-(see below) is likely explained by this same delete/recreate quirk having happened to some of
-those comments at some point in the routine's own long edit history, not by mere insertion of
-unrelated rungs elsewhere.
-
-**Practical impact**: whole-project rung-comment coverage went from 98/582 (17%) to 522/582 (90%)
-for one real project after the core fix. The remaining ~10% gap is concentrated in comments that
-were at some point deleted and recreated (this quirk) in heavily-edited real routines — a comment
-whose fragment can't be resolved to any of the routine's own current rungs is simply dropped (not
-guessed at / not misattributed) rather than risk showing it on the wrong rung. **The common case
-for the motivating use case is unaffected**: an LLM (or a user) adding a brand-new comment to an
-existing, previously-uncommented rung — verified byte-exact and reproducible across every staged
-test where no comment was ever deleted-and-recreated. The danger zone specifically is *editing/
-replacing* an existing rung comment (delete + recreate), which should be flagged as unreliable if
-this library is ever used to help *write* comments back into an ACD.
-
-**If revisited to close the remaining gap**: since the wrong fragment doesn't correspond to
-either the deleted comment's own rung or the new target rung, a value-based fix seems unlikely;
-the more promising angle would be trying to identify what Rockwell's own "most recently freed
-slot" bookkeeping looks like (a free-list of some kind, given the parallel with `Comments.Idx`'s
-slot-ID reuse) well enough to recognize and discard/flag likely-stale fragments rather than trust
-them at face value — not yet attempted.
+**Comments.Dat deletion/reuse facts** (corrects an earlier claim that deletion changes no
+bytes): deleting a comment flips its record marker `fa fa` → `fd fd` and zeroes a constant
+`0x3A` u32 at body offset 0 (a live-record tag shared by every live comment record); the text
+and the rest of the body stay intact. Deletion also appends a free-list entry in the `0xFF`
+free space after the last record, containing the freed record's offset and length as
+**big-endian** u32s; creating a new comment physically reuses the freed slot and zeroes parts
+of that free-list entry. None of this carries rung-attribution information.
 
 ## UDT L5K rendering (`_l5k_udt_literal`)
 

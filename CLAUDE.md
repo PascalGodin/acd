@@ -451,6 +451,18 @@ A regenerated file (`LIVE_TEST_LsRead_Start_desc_v5.L5X`, same project/tag/routi
 applied) is ready for a final real-Studio retest as of this writing — expected to succeed cleanly
 based on the exact-match comparison above, but not yet confirmed by an actual import.
 
+**Confirmed normal, not a gap**: Studio's own Import Routine comparison shows "tag exists in
+project only" for `IO042:I` and `Remote_TrimmerIO:0:I` (I/O tags backed by `AB:` module-defined
+datatypes) when importing our file — but the user independently confirmed Studio's own *native*
+export of `LS_Read` produces the **identical** message when imported back. This isn't something
+our exporter is missing; it's inherent to how Studio's own partial/context export mechanism
+handles these tags — the `<Module Use="Reference">` stub (name only, no definition) is all that's
+needed, since Studio regenerates the I/O tag itself from the *live project's own* already-existing
+Module/connection configuration on import, rather than needing an explicit `<Tag>` or full
+`<Module>` definition in the partial file. Confirms `Tag._l5x_exclude` correctly keeping these out
+of the `<Tags>` section entirely (see the "I/O tag exclusion" fix above) matches real Studio
+behavior, not just avoids an error.
+
 ## Partial/context L5X exports (`export_routine()`)
 
 `export_routine()` (`acd/api.py`) exports a single routine as a standalone partial L5X file for

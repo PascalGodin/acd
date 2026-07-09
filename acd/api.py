@@ -7,6 +7,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
+from typing import Dict
 
 from acd.integrity import (
     FILEINFO_LENGTH,
@@ -174,6 +175,140 @@ def _referenced_tag_names(rung_texts) -> set:
     return names
 
 
+def _referenced_modules(rung_texts, project: RSLogix5000Content) -> list:
+    """Resolve which Module dependencies a routine's rung text needs, the
+    same way Studio's own "Export Routine" does (confirmed against a real
+    export of Motors/Main_Motors in BPM_TrimmerSorter_20260709.ACD, whose
+    rung text references "Local:12:I.Data.0"/"Local:12:I.Data.1" and
+    "VFD_P_INTBL2:I.OutputFreq" -- Studio's own <Modules Use="Context">
+    section included exactly {"AC_IN_12", "Local", "VFD_P_INTBL2"}).
+
+    Standard Logix I/O tag addressing has two shapes: "ModuleName:Type..."
+    (a directly-addressed module, e.g. an Ethernet-connected drive) needs
+    only that module; "ModuleName:SlotNumber:Type..." (rack/chassis-slot
+    addressing, e.g. a local-chassis input card) needs BOTH the chassis
+    module itself (here "Local") AND whichever module actually occupies
+    that slot (found via Module.parent_module == chassis name and
+    Module._slot == the slot number -- here that's "AC_IN_12", slot 12 of
+    "Local") -- confirmed exactly against the real export above (it
+    included "AC_IN_12" and "Local" for the 3-part reference, but did NOT
+    include "Ethernet2", the parent of the 2-part-addressed
+    "VFD_P_INTBL2" -- so a directly-addressed module's own parent is NOT
+    walked, only a slot occupant's rack).
+
+    Caveat: verified against exactly one real project's one rack (a local
+    chassis) plus one direct Ethernet device -- topologies with bridged/
+    remote racks (ControlNet, DeviceNet, remote Ethernet chassis reached
+    through an adapter) haven't been exercised and may need this extended.
+    """
+    import re
+    io_ref_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*):(\d+:)?([A-Za-z]\w*)")
+    modules_by_name = {m.name: m for m in project.controller.modules}
+    found: Dict[str, object] = {}
+    for text in rung_texts:
+        if not text:
+            continue
+        for m in io_ref_re.finditer(text):
+            base, slot_part, _typ = m.group(1), m.group(2), m.group(3)
+            base_module = modules_by_name.get(base)
+            if base_module is None:
+                continue
+            found[base] = base_module
+            if slot_part:
+                slot_num = int(slot_part.rstrip(":"))
+                occupant = next(
+                    (mod for mod in project.controller.modules
+                     if mod.parent_module == base and mod._slot == slot_num),
+                    None,
+                )
+                if occupant is not None:
+                    found[occupant.name] = occupant
+    return list(found.values())
+
+
+def _referenced_called_routines(rung_texts, program) -> list:
+    """Resolve which OTHER routines in the same program a routine's rung
+    text calls via JSR (subroutine calls can't cross program boundaries in
+    native ladder logic), so they can be included as empty
+    <Routine Use="Reference"> stubs the way Studio's own "Export Routine"
+    does -- confirmed against a real export: Motors/Main_Motors calls
+    "JSR(Infeed_LandingTable,0);", and the real export included an empty
+    <Routine Use="Reference" Name="Infeed_LandingTable"></Routine> alongside
+    the actual <Routine Use="Target" Name="Main_Motors">.
+    """
+    import re
+    jsr_re = re.compile(r"\bJSR\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)")
+    routines_by_name = {r.name: r for r in (program.routines or [])}
+    found: Dict[str, object] = {}
+    for text in rung_texts:
+        if not text:
+            continue
+        for m in jsr_re.finditer(text):
+            name = m.group(1)
+            r = routines_by_name.get(name)
+            if r is not None:
+                found[name] = r
+    return list(found.values())
+
+
+def _resolve_type_closure(initial_type_names: set, project: RSLogix5000Content):
+    """Recursively resolve a set of DataType/AOI names to every DataType and
+    AOI they transitively depend on, so a partial export is self-consistent
+    the same way Studio's own "Export Routine"/"Export Component" is meant to
+    be (per the user: it "only includes what is referenced ... including
+    UDT, AOI, Modules, etc").
+
+    Expands the closure through: a UDT's own members' data types (so a UDT
+    containing another project UDT pulls that one in too -- e.g. a member
+    whose data_type is itself a UDT name), and an AOI's own parameters' and
+    local tags' data types (so an AOI using a project UDT, or nesting another
+    AOI as a parameter type, pulls those in too). Order names never seen
+    before are processed in a simple worklist so the recursion terminates
+    even with cyclic-looking (but not actually cyclic, Logix disallows UDT
+    self-reference) dependency graphs.
+
+    Returns (data_types, aois) -- each a list in the project's own
+    declaration order, filtered to the resolved closure.
+
+    NOTE: only the "which UDTs/AOIs get included" computation is exercised
+    against real data (mirrors the already-verified single-level UDT
+    resolution, generalized into a transitive closure and extended to also
+    search project.controller.aois, which the single-level version never
+    did). The AOI wrapper's XML *placement* in export_routine() is still
+    unverified -- see the comment at its one call site.
+    """
+    resolved_types: set = set()
+    resolved_aois: set = set()
+    worklist = set(initial_type_names)
+    data_types_by_name = {dt.name.upper(): dt for dt in project.controller.data_types}
+    aois_by_name = {a.name.upper(): a for a in (project.controller.aois or [])}
+
+    while worklist:
+        name = worklist.pop()
+        if name in resolved_types or name in resolved_aois:
+            continue
+        dt = data_types_by_name.get(name)
+        if dt is not None:
+            resolved_types.add(name)
+            for member in dt.members:
+                if member.data_type:
+                    worklist.add(member.data_type.upper())
+            continue
+        aoi = aois_by_name.get(name)
+        if aoi is not None:
+            resolved_aois.add(name)
+            for p in aoi.parameters:
+                if p.data_type:
+                    worklist.add(p.data_type.upper())
+            for lt in aoi.local_tags:
+                if lt.data_type:
+                    worklist.add(lt.data_type.upper())
+
+    data_types = [dt for dt in project.controller.data_types if dt.name.upper() in resolved_types]
+    aois = [a for a in (project.controller.aois or []) if a.name.upper() in resolved_aois]
+    return data_types, aois
+
+
 def export_routine(project: RSLogix5000Content, routine: Routine, output_path, owner: str = None) -> None:
     """Export a single routine as a standalone, partial L5X file.
 
@@ -206,7 +341,26 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     (see _referenced_tag_names) -- not a full ladder-logic parser, but
     correct for plain tag-name operands (which is what matters for
     instruction operands). Custom UDTs used by any referenced tag are
-    included in <DataTypes Use="Context"> automatically.
+    included in <DataTypes Use="Context"> automatically, expanded to a full
+    transitive closure (a UDT containing another project UDT, or an AOI
+    parameter/local tag typed with a project UDT or a nested AOI, pulls in
+    that dependency too -- see _resolve_type_closure()). AOI dependencies
+    (a routine calling an AOI instruction, whose instance tag's data_type is
+    the AOI's own name) are resolved the same way and emitted under
+    <AddOnInstructionDefinitions Use="Context">, placed right after
+    <Modules Use="Context"> and before <Tags Use="Context"> -- this whole
+    section's placement/shape IS now verified against a real Studio export
+    (Motors/Main_Motors, which calls AOI_RPMtoFPM -- see CLAUDE.md "Native-
+    import escape hatches"). Module dependencies (a routine referencing an
+    I/O tag, e.g. "Local:12:I.Data.0" or a direct-addressed
+    "VFD_P_INTBL2:I.OutputFreq") are resolved via _referenced_modules() and
+    emitted as empty <Module Use="Reference" Name="..."> stubs under
+    <Modules Use="Context"> -- also verified against that same real export.
+    Routine dependencies (the target routine calling another routine in the
+    same program via JSR) are resolved via _referenced_called_routines() and
+    emitted as an empty <Routine Use="Reference" Name="..."> stub alongside
+    the real <Routine Use="Target">-- also verified against that same
+    export (Main_Motors calls JSR(Infeed_LandingTable,0)).
 
     Args:
         project: The loaded project (from load_acd()) that owns `routine`
@@ -295,9 +449,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     ]
 
     referenced_type_names = {t.data_type.upper() for t in controller_tags + program_tags if t.data_type}
-    referenced_data_types = [
-        dt for dt in project.controller.data_types if dt.name.upper() in referenced_type_names
-    ]
+    referenced_data_types, referenced_aois = _resolve_type_closure(referenced_type_names, project)
 
     # NOTE: individual <Tag>/<DataType> elements never carry a Use= attribute
     # themselves -- only the wrapping container elements (<Tags Use="Context">,
@@ -311,6 +463,37 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # importing Studio 5000's own (Use=-free) export of the identical edit
     # successfully, then diffing it attribute-by-attribute against ours.
     data_types_xml = "".join(dt.to_xml() for dt in referenced_data_types)
+
+    # Modules: verified against the real Motors/Main_Motors export -- see
+    # _referenced_modules() for the rack/slot-vs-direct-addressing rule.
+    # Each <Module> is an empty Use="Reference" stub (just a name), not a
+    # full definition -- confirmed against the real export.
+    referenced_modules = _referenced_modules(routine.rungs, project)
+    modules_xml = "".join(
+        f'<Module Use="Reference" Name="{_escape_xml_attr(m.name)}">\n</Module>\n'
+        for m in referenced_modules
+    )
+    modules_section = (
+        f'<Modules Use="Context">\n{modules_xml}</Modules>\n' if referenced_modules else ""
+    )
+
+    # AOIs: placement (right after </Modules>, before <Tags>) and the
+    # Use="Context" wrapper are now verified against that same real export.
+    aois_xml = "".join(aoi.to_xml() for aoi in referenced_aois)
+    aois_section = (
+        f'<AddOnInstructionDefinitions Use="Context">\n{aois_xml}\n</AddOnInstructionDefinitions>\n'
+        if referenced_aois else ""
+    )
+
+    # Routines called via JSR within the same program: empty Use="Reference"
+    # stubs alongside the real Use="Target" routine -- verified against that
+    # same real export (Main_Motors calls JSR(Infeed_LandingTable,0)).
+    referenced_routines = _referenced_called_routines(routine.rungs, program)
+    called_routines_xml = "".join(
+        f'<Routine Use="Reference" Name="{_escape_xml_attr(r.name)}">\n</Routine>\n'
+        for r in referenced_routines
+    )
+
     controller_tags_xml = "".join(t.to_xml() for t in controller_tags)
     program_tags_xml = "".join(t.to_xml() for t in program_tags)
     routine_xml = _inject_use_attr(routine.to_xml(), "Routine", "Target")
@@ -344,11 +527,14 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         f'ExportOptions="{export_options}">\n'
         f'<Controller Use="Context" Name="{_escape_xml_attr(controller_name)}">\n'
         f'<DataTypes Use="Context">\n{data_types_xml}\n</DataTypes>\n'
+        f'{modules_section}'
+        f'{aois_section}'
         f'<Tags Use="Context">\n{controller_tags_xml}\n</Tags>\n'
         f'<Programs Use="Context">\n'
         f'<Program Use="Context" Name="{_escape_xml_attr(program.name)}">\n'
         f'<Tags Use="Context">\n{program_tags_xml}\n</Tags>\n'
         f'<Routines Use="Context">\n'
+        f'{called_routines_xml}'
         f'{routine_xml}\n'
         f'</Routines>\n'
         f'</Program>\n'

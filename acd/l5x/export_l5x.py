@@ -114,6 +114,10 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE regnlink(routine_id int, fragment int, rung_object_id int)"
         )
+        log.debug("Create Regnlink_idx table in sqllite db")
+        self._cur.execute(
+            "CREATE TABLE regnlink_idx(routine_id int, fragment int, rung_object_id int)"
+        )
 
         log.info("Extracting ACD database file")
         unzip = Unzip(self.input_filename)
@@ -329,8 +333,24 @@ class ExportL5x:
         self._db.commit()
 
     def populate_regnlink(self, known_object_ids: set) -> None:
-        """Parse RegnLink.Dat and build a (routine_id, fragment) -> rung_object_id
-        lookup used to resolve which rung a rung-level comment belongs to.
+        """Parse RegnLink.Dat *and RegnLink.Idx* and build two
+        (routine_id, fragment) -> rung_object_id lookups used to resolve which
+        rung a rung-level comment belongs to.
+
+        IMPORTANT -- which lookup is authoritative: **RegnLink.Idx** (the
+        `regnlink_idx` table built at the bottom of this function) stores an
+        explicit fragment -> rung_object_id mapping and is what Studio 5000
+        itself agrees with (verified 582/582 rung comments exact against a real
+        project's own full L5X export, plus every staged edit-history test).
+        The RegnLink.Dat chain reading below (fragment belongs to the rung
+        identified by the link record's next_id) is only correct for routines
+        whose rungs were never reordered/relinked -- in a real long-lived
+        project it was wrong for ~75% of comments (usually off by exactly +2),
+        because a link record keeps its fragment when its next pointer is
+        redirected (verified: inserting a rung rewrites next_id but not the
+        fragment). Kept as a fallback for files with a missing/corrupt Idx.
+        See RoutineBuilder.build() for the lookup order and CLAUDE.md ("Rung
+        comments") for the full investigation.
 
         RegnLink.Dat stores, per routine, a linked list of that routine's rungs.
         Each 22-byte link record has the shape (all little-endian):
@@ -399,6 +419,52 @@ class ExportL5x:
             self._cur.executemany("INSERT INTO regnlink VALUES (?,?,?)", rows)
             self._cur.execute(
                 "CREATE INDEX idx_regnlink_routine_fragment ON regnlink(routine_id, fragment)"
+            )
+            self._db.commit()
+
+        # RegnLink.Idx: the authoritative fragment -> rung map. B-tree-style
+        # index pages contain dense 16-byte entries of the shape (all LE):
+        #
+        #   [0:2]   fragment   -- same 16-bit value as the .Dat record's [18:20]
+        #   [2:3]   unk        -- same 7-bit value as the .Dat record's [20:22]
+        #   [3:4]   0x00       -- always zero (used as a validation byte here)
+        #   [4:8]   routine_id -- the owning routine's comps object_id
+        #   [8:12]  rung_object_id -- THE rung this fragment belongs to (this is
+        #                             the field the .Dat chain reading only
+        #                             approximates)
+        #   [12:16] ptr        -- file offset + 12 of the paired RegnLink.Dat
+        #                          record carrying the same fragment (used as a
+        #                          validation bound here: must be <= dat size)
+        #
+        # Like the .Dat scan above, entries are found by scanning the whole
+        # file for any known comps object_id in the routine_id slot rather than
+        # by walking the page structure -- stale entries from old/free pages do
+        # survive this scan (a fragment can appear twice with different
+        # rung_object_ids), so RoutineBuilder prefers the entry whose
+        # rung_object_id is one of the routine's own live rungs.
+        idx_path = os.path.join(self._temp_dir, "RegnLink.Idx")
+        if not os.path.exists(idx_path):
+            return
+        with open(idx_path, "rb") as f:
+            idx_data = f.read()
+
+        dat_len = len(data)
+        idx_rows: List[tuple] = []
+        limit = len(idx_data) - 16
+        i = 0
+        while i <= limit:
+            routine_id = struct.unpack_from("<I", idx_data, i + 4)[0]
+            if routine_id in known_object_ids and idx_data[i + 3] == 0:
+                fragment = struct.unpack_from("<H", idx_data, i)[0]
+                rung_object_id, ptr = struct.unpack_from("<II", idx_data, i + 8)
+                if fragment != 0xFFFF and ptr <= dat_len:
+                    idx_rows.append((routine_id, fragment, rung_object_id))
+            i += 1
+
+        if idx_rows:
+            self._cur.executemany("INSERT INTO regnlink_idx VALUES (?,?,?)", idx_rows)
+            self._cur.execute(
+                "CREATE INDEX idx_regnlink_idx_routine_fragment ON regnlink_idx(routine_id, fragment)"
             )
             self._db.commit()
 

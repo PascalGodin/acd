@@ -641,6 +641,25 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
+def _decorated_binary_literal(value: int, bit_width: int) -> str:
+    """Format an integer value as Rockwell's Radix="Binary" literal:
+    "2#" followed by the value's two's-complement bits at the type's full
+    bit width, grouped into 4-digit chunks separated by underscores (e.g.
+    "2#0000_0000_0000_0000_0000_0000_0000_0000" for a 32-bit DINT zero).
+
+    Verified against a real project's own Studio 5000 export for exactly
+    one case: a DINT UDT member declared Radix="Binary" with value 0
+    (8 groups of 4 = 32 bits). Non-zero and negative values are inferred
+    by symmetry with the documented Rockwell binary-literal convention,
+    not independently verified -- revisit if a real non-zero sample
+    disagrees.
+    """
+    mask = (1 << bit_width) - 1
+    bits = format(value & mask, f"0{bit_width}b")
+    groups = [bits[i:i + 4] for i in range(0, len(bits), 4)]
+    return "2#" + "_".join(groups)
+
+
 def _udt_scalar_to_xml(dt_name: str, values: dict,
                         data_types_map: Dict[str, 'DataType']) -> str:
     """Generate inner member XML for a decoded UDT scalar.
@@ -737,12 +756,24 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
             )
 
         else:
-            radix = _PRIMITIVE_RADIX.get(mdt_upper, "Decimal")
-            member_val = (
-                _decorated_real_literal(val, in_array=False)
-                if isinstance(val, float)
-                else val
+            # A member's OWN declared radix (e.g. "Binary" for a UDT member
+            # meant to be read as bit flags) must be honored over the
+            # generic per-type default -- verified against a real project's
+            # "NETrimPB" member (DINT, Radix="Binary"), which a prior
+            # version rendered as plain Radix="Decimal" Value="0" instead
+            # of "2#0000_0000_0000_0000_0000_0000_0000_0000".
+            radix = (
+                member.radix
+                if member.radix and member.radix != "NullType"
+                else _PRIMITIVE_RADIX.get(mdt_upper, "Decimal")
             )
+            if radix == "Binary" and isinstance(val, int):
+                elem_size = _PRIM.get(mdt_upper, (None, 4))[1]
+                member_val = _decorated_binary_literal(val, elem_size * 8)
+            elif isinstance(val, float):
+                member_val = _decorated_real_literal(val, in_array=False)
+            else:
+                member_val = val
             parts.append(
                 f'<DataValueMember Name="{mname}" DataType="{mdt}" '
                 f'Radix="{radix}" Value="{member_val}"/>'
@@ -751,7 +782,7 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
     return "".join(parts)
 
 
-def _udt_array_to_xml(tag_name: str, dt_base: str, values: List[dict],
+def _udt_array_to_xml(dt_base: str, values: List[dict],
                        dim_str: str,
                        data_types_map: Dict[str, 'DataType']) -> str:
     """Generate an ``<Array>`` XML fragment for a decoded UDT array tag.
@@ -799,8 +830,14 @@ def _udt_array_to_xml(tag_name: str, dt_base: str, values: List[dict],
                 f'<Structure DataType="{display_name}">{struct}</Structure>'
                 f'</Element>'
             )
+        # A top-level tag's own <Array> Decorated element has no Name=
+        # attribute (unlike a nested ArrayMember inside a Structure, which
+        # does carry one) -- already correctly handled for primitive arrays
+        # in Tag.to_xml(), but this UDT-array path still included one until
+        # a real project's own "ToTrim"/"ToTrim_Luci" (both TrimButtons[50])
+        # tags showed real Studio 5000 output has no Name= here either.
         return (
-            f'<Array Name="{tag_name}" DataType="{display_name}" Dimensions="{dim_str}">'
+            f'<Array DataType="{display_name}" Dimensions="{dim_str}">'
             f'{"".join(elems)}</Array>'
         )
 
@@ -814,7 +851,7 @@ def _udt_array_to_xml(tag_name: str, dt_base: str, values: List[dict],
         )
 
     return (
-        f'<Array Name="{tag_name}" DataType="{display_name}" Dimensions="{dim_str}">'
+        f'<Array DataType="{display_name}" Dimensions="{dim_str}">'
         f'{"".join(elems)}</Array>'
     )
 
@@ -1465,9 +1502,20 @@ class Tag(L5xElement):
                 # same as every other known-value tag shape (scalar
                 # primitives, primitive arrays) -- previously only
                 # Decorated was emitted here.
+                #
+                # <Structure DataType="..."> must preserve the real
+                # DataType's own declared casing (e.g. "Timing", a project
+                # UDT), not the all-uppercase dt_base used internally for
+                # dict lookups -- verified against a real project's own
+                # export of a "Timing"-typed tag, which a prior version
+                # rendered as "TIMING". _udt_array_to_xml already got this
+                # right (via its own display_name lookup); the scalar case
+                # here never did.
+                display_name = self._data_types_map.get(dt_base.upper())
+                display_name = display_name.name if display_name is not None else dt_base
                 l5k_udt_val = _l5k_udt_literal(dt_base, iv, self._data_types_map)
                 body = (
-                    f'<Structure DataType="{dt_base}">'
+                    f'<Structure DataType="{display_name}">'
                     f'{_udt_scalar_to_xml(dt_base, iv, self._data_types_map)}'
                     f'</Structure>'
                 )
@@ -1483,7 +1531,7 @@ class Tag(L5xElement):
                 # Decorated blocks, previously only Decorated was emitted.
                 dim_str = self.dimensions or "1"
                 body = _udt_array_to_xml(
-                    self.name, dt_base, iv, dim_str, self._data_types_map
+                    dt_base, iv, dim_str, self._data_types_map
                 )
                 if body:
                     l5k_udt_val = _l5k_udt_literal(dt_base, iv, self._data_types_map)

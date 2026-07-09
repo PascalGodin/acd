@@ -387,12 +387,13 @@ references — a tag with no logic reference wouldn't be in Studio's own export 
 this category are simply out of scope for the routine-carrier mechanism; no fallback (like
 synthesizing a dead-code reference) has been built, pending a decision on whether one is wanted.
 
-**First real, live end-to-end tests — two rounds so far, third attempt pending the user's retest.**
-Editing `LsRead_Start`'s description (a controller-scope tag, referenced in `Continuous/LS_Read`)
-and importing the exported routine via Studio's real Import Routine feature has twice failed so
-far, both times on an unrelated context tag swept in only because `LS_Read`'s own rung text (or an
-alias chain from it) also references it — nothing to do with the intended edit itself. Both
-rounds found real, general, previously-undiscovered bugs, not edge cases specific to one tag:
+**First real, live end-to-end tests — two rounds of real Studio import failures, then a full
+ground-truth comparison that closed out every remaining gap.** Editing `LsRead_Start`'s
+description (a controller-scope tag, referenced in `Continuous/LS_Read`) and importing the
+exported routine via Studio's real Import Routine feature failed twice, both times on an
+unrelated context tag swept in only because `LS_Read`'s own rung text (or an alias chain from it)
+also references it — nothing to do with the intended edit itself. Both rounds found real,
+general, previously-undiscovered bugs, not edge cases specific to one tag:
 
 - **Round 1**: `Error: ... Failed to set the 'Data' property (Data type mismatch...)` on
   `Test_Bit_DINT`, plus a warning on `Luci_NOBRD`. See "Initial-value decoding offset bugs" below
@@ -403,23 +404,52 @@ rounds found real, general, previously-undiscovered bugs, not edge cases specifi
   `AliasFor="Remote_TrimmerIO:0:I.Data.7"` — an I/O tag target. The existing alias-target
   base-name resolution correctly identified `Remote_TrimmerIO:0:I` as "referenced," but
   `export_routine()` then rendered that literal I/O `Tag` object as its own `<Tag>` element.
-  `Tag._l5x_exclude` already encodes the right rule (I/O tags never appear as standalone `<Tag>`
-  elements in a real full-project export either — see the "I/O tags" bullet in "Pitfalls when
-  diffing against a real L5X" further up), but `export_routine()` builds its own ad-hoc
-  `controller_tags`/`program_tags` lists rather than going through the generic list-section
-  serialization that normally applies that exclusion. Fixed by filtering both lists through
-  `_l5x_exclude`. The legitimate alias tag itself (`LngthLmt_16ft`) and its
-  `AliasFor="Remote_TrimmerIO:..."` attribute (just a string, not a separate element) are
-  unaffected — verified the regenerated file has zero standalone
-  `<Tag Name="Remote_TrimmerIO...">` elements. **Not yet resolved**: whether the I/O tag's
-  *owning* `<Module>` needs to be included instead (the way a direct rung reference to an I/O tag
-  already triggers via `_referenced_modules()` — but an alias's I/O target doesn't go through that
-  path today, so this specific case still doesn't reference `Remote_TrimmerIO` at the Module level
-  at all). Whether that omission matters in practice is untested.
+  Fixed by filtering `controller_tags`/`program_tags` through the existing `Tag._l5x_exclude`
+  rule (I/O tags never appear as standalone `<Tag>` elements in a real full-project export
+  either), which `export_routine()`'s own ad-hoc tag-list building had never applied.
 
-A regenerated file (`LIVE_TEST_LsRead_Start_desc_v3.L5X`, same project/tag/routine) has all three
-fixes and is structurally verified locally, but **has not yet been re-tested against real Studio**
-as of this writing — that's the immediate next step once available.
+**After round 2 succeeded, the user provided a real Studio 5000 "Export Routine" of `LS_Read`
+itself** — ground truth for the exact same routine, letting every remaining discrepancy be found
+by direct comparison rather than waiting for the next import attempt. A naive string diff falsely
+flagged all 64 common tags as different (attribute order and `<Comments>` child order aren't
+semantically significant but a plain text diff treats them as such); a proper XML-tree-based,
+attribute-order/comment-order/L5K-whitespace-independent comparison found five more real,
+previously-undiscovered bugs, all now fixed and reverified to an **exact match — zero differences
+across every Tag/DataType/Module/AddOnInstructionDefinition/Routine**:
+
+1. A UDT tag's `<Structure DataType="...">` used the internal all-uppercase lookup key directly
+   instead of the real DataType's own declared casing (a project UDT named `Timing` rendered as
+   `TIMING`) — `_udt_array_to_xml` already looked this up correctly; the scalar-UDT branch in
+   `Tag.to_xml()` never did.
+2. A top-level UDT-array tag's own `<Array>` element incorrectly carried a `Name="..."`
+   attribute — real Studio never has one there (only nested `ArrayMember`s do), the same
+   already-fixed convention for primitive arrays, never applied to `_udt_array_to_xml`.
+3. A UDT member's own declared `Radix` (e.g. `"Binary"`) was ignored in favor of a generic
+   per-type default, and `Radix="Binary"` members never got Rockwell's `"2#0000_..._0000"`
+   grouped-binary-literal formatting at all.
+4. `_referenced_tag_names()` wrongly matched a token immediately followed by `"("` as a tag name
+   (that position is always an instruction/AOI/JSR mnemonic in RLL syntax) — a real tag literally
+   named `AFI` collided with the `AFI()` (Always False Instruction) mnemonic used elsewhere in the
+   same routine, pulling in an unrelated tag as context.
+5. The same function wrongly matched a token immediately preceded by `"."` (Rockwell address
+   syntax: `.` always introduces a MEMBER name, e.g. `Length_In` in
+   `ToTrim[Timing.Length_Lug].Length_In`, never a fresh tag reference) — a real, unrelated tag
+   named `Length_In` got the same treatment.
+6. An Alias's own I/O-tag target needs its *owning Module(s)* referenced too (the rack
+   `Remote_TrimmerIO` AND the module occupying its slot 0, `Trimmer_Inputs`) — resolved via the
+   same rack/slot rule already verified for direct rung references, just never fed the
+   alias-resolved I/O tag names before.
+
+See "Initial-value decoding offset bugs" and "UDT L5K rendering" below for full detail on each.
+This routine happens to exercise nearly every dependency class at once (tags, UDTs, TIMER/COUNTER
+built-ins, aliases, I/O tags via both direct and alias-target reference, Modules via both direct
+and rack/slot addressing), so this is a strong verification result — but it's still one routine;
+treat "verified" as "verified for the patterns this routine exercises," not "every possible RLL
+construct."
+
+A regenerated file (`LIVE_TEST_LsRead_Start_desc_v5.L5X`, same project/tag/routine, all fixes
+applied) is ready for a final real-Studio retest as of this writing — expected to succeed cleanly
+based on the exact-match comparison above, but not yet confirmed by an actual import.
 
 ## Partial/context L5X exports (`export_routine()`)
 

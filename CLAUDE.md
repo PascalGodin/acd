@@ -387,6 +387,20 @@ references — a tag with no logic reference wouldn't be in Studio's own export 
 this category are simply out of scope for the routine-carrier mechanism; no fallback (like
 synthesizing a dead-code reference) has been built, pending a decision on whether one is wanted.
 
+**First real, live end-to-end test — first attempt failed, second attempt is pending the user's
+retest.** Editing `LsRead_Start`'s description (a controller-scope tag, referenced in
+`Continuous/LS_Read`) and importing the exported routine via Studio's real Import Routine feature
+was rejected: `Error: ... Failed to set the 'Data' property (Data type mismatch...)` on an
+unrelated tag (`Test_Bit_DINT`) plus a warning on another (`Luci_NOBRD`) — both swept in as
+context only because `LS_Read`'s own rung text also references them, nothing to do with the
+intended edit. Both were real, general, previously-undiscovered bugs (not edge cases specific to
+these two tags) — see "Initial-value decoding offset bugs" below for the full root-cause and fix
+of both (a genuine one-element-array collapsing to a scalar, and TIMER/COUNTER-style built-in
+structs losing their BIT-overlay status members). A regenerated file
+(`LIVE_TEST_LsRead_Start_desc_v2.L5X`, same project/tag/routine) has both fixes and is
+structurally verified locally, but **has not yet been re-tested against real Studio** as of this
+writing — that's the immediate next step once available.
+
 ## Partial/context L5X exports (`export_routine()`)
 
 `export_routine()` (`acd/api.py`) exports a single routine as a standalone partial L5X file for
@@ -742,6 +756,56 @@ distinction entirely — always read from `0x1A2`. Covered by
 synthetic blob) plus a correction to `test_scalar_primitive_tag_xml_shape`'s own expected value,
 which was itself a casualty of this bug (never independently verified against real ground truth
 for the small fixture, just whatever the wrong offset happened to produce).
+
+**3. A genuine one-element array (`Dimensions="1"`) silently collapsed to a scalar**, causing a
+real, reproducible Studio 5000 import rejection ("Data type mismatch") — found via the first
+actual live end-to-end test of the routine-carrier write-back mechanism (see "Native-import
+escape hatches" above): editing `LsRead_Start`'s description and importing the carrying routine
+via Studio's real Import Routine failed, not on the intended edit, but on an unrelated context
+tag (`Test_Bit_DINT`) swept in because the routine's own rung text also references it.
+`_read_tag_initial_value`/`_decode_udt_initial_value` both collapsed to a bare scalar whenever
+`n_elements == 1`, unable to distinguish "no dimensions declared at all" (a true scalar) from
+"genuinely declared as a 1-element array" (`Dimensions="1"`, `n_elements` also 1) — both cases
+hit the same `if n_elements == 1: return values[0]`. This produced an internally inconsistent
+`<Tag>`: `Dimensions="1"` in the attributes (correctly derived from the raw record) alongside a
+scalar `<DataValue>` in `<Data Format="Decorated">` (from the collapsed value) instead of the
+`<Array><Element Index="[0]" .../></Array>` shape Studio expects for a declared array — exactly
+the mismatch Studio's importer rejected. Fixed by threading an explicit `is_array` flag (derived
+by the caller from `dimensions is not None`, not from `n_elements`) through both functions, only
+collapsing to scalar when `not is_array`. Verified: `Test_Bit_DINT` (a real project tag with this
+exact shape) now renders as `<Array Dimensions="1">...<Element Index="[0]".../></Array>`.
+
+**4. Rockwell built-in structured types with BIT-overlay status members (TIMER, COUNTER, likely
+CONTROL) were missing those members entirely from both `<Data Format="L5K">` and
+`<Data Format="Decorated">` whenever the tag had a real decoded value** — the second bug the same
+live import test surfaced: a `COUNTER`-typed tag (`Luci_NOBRD`) got a hard Studio import **error**
+("Data does not have enough data type members"), not just a warning, because its `<Structure
+DataType="COUNTER">` showed only `PRE`/`ACC`, missing `CU`/`CD`/`DN`/`OV`/`UN` entirely.
+Root cause, found by comparing member metadata: TIMER/COUNTER's own hidden `Control` DINT member
+(`hidden=True`) is where `EN`/`TT`/`DN` (or `CU`/`CD`/`DN`/`OV`/`UN`) actually live, as BIT-overlay
+pseudo-members (`data_type=="BIT"`, `hidden=False`, `bit_number`+`target="Control"`) — but the
+generic decode/render skip rule (`if member.hidden or member.data_type == "BIT": continue`),
+correct for a UDT's own genuine bit-overlay members that shouldn't be independently serialized,
+was ALSO unconditionally dropping BOTH the hidden backing value (needed for L5K) AND the BIT
+pseudo-members themselves (needed for Decorated) for these built-in types. **This also falsified
+last session's own "exact match" claim for the AOI/Module/JSR dependency-closure verification** —
+that check only compared element vocabulary and top-level section order, never this deep into a
+specific tag's own member content, so it did not catch that a TIMER tag in that very same
+calibration file (`DelayedControlPowe`) was already missing `EN`/`TT`/`DN` the whole time; a
+narrower "vocabulary + order" diff is not sufficient evidence for "byte-exact," a lesson worth
+remembering for future verification passes. Fixed across four call sites with a decode/render
+split, not a single shared skip rule: `_decode_single_udt_element` now decodes hidden non-BIT
+members normally (first pass) and derives each BIT-overlay member's own value by extracting its
+`bit_number` from the already-decoded `target` sibling (second pass) — Python's `>>` on a negative
+int is sign-extending, so this works correctly for a negative packed `Control` value without special-
+casing; `_l5k_udt_literal` now skips only BIT members (hidden members' raw value IS part of the L5K
+literal); `_udt_scalar_to_xml` now skips only hidden members (BIT-overlay members DO get their own
+`<DataValueMember DataType="BOOL">`); `_get_type_size` now skips only BIT members when computing a
+struct's total byte size (a hidden member's own byte extent still counts). Verified against real
+Studio ground truth for two different built-in types: `DelayedControlPowe` (TIMER) now renders L5K
+`[-1607863227,3000,3000]` and Decorated `PRE/ACC/EN=1/TT=0/DN=1`, matching a real Studio export
+exactly; `Luci_NOBRD` (COUNTER) now renders all 5 status bits (structurally verified, though no
+independent real-Studio ground truth exists for this specific tag's own `Control` value).
 
 ## REAL/LREAL NaN and Infinity rendering (`_l5k_real_literal`/`_decorated_real_literal`)
 

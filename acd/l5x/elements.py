@@ -257,7 +257,16 @@ def _l5k_udt_literal(dt_name: str, values, data_types_map: Dict[str, 'DataType']
 
     parts: List[str] = []
     for member in dt_obj.members:
-        if member.hidden or member.data_type == "BIT":
+        # Skip only BIT-overlay pseudo-members (no storage of their own --
+        # aliased into a sibling's raw value, see _decode_single_udt_element).
+        # A HIDDEN non-BIT member (e.g. TIMER/COUNTER's own "Control" DINT)
+        # must still be included here: L5K encodes the raw backing value
+        # even though it isn't shown as its own named Decorated member --
+        # verified against a real TIMER tag's L5K literal
+        # "[-1607863227,3000,3000]" (Control, PRE, ACC in declaration
+        # order), which a prior version of this function silently dropped
+        # down to "[3000,3000]" by skipping hidden members entirely.
+        if member.data_type == "BIT":
             continue
         val = values.get(member.name)
         if val is None:
@@ -649,7 +658,17 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
 
     parts: List[str] = []
     for member in dt_obj.members:
-        if member.hidden or member.data_type == "BIT":
+        # Skip only genuinely hidden members (e.g. TIMER/COUNTER's own
+        # "Control" DINT, which has no visible Decorated representation of
+        # its own). A BIT-overlay pseudo-member (e.g. TIMER.EN/TT/DN,
+        # COUNTER.CU/CD/DN/OV/UN) DOES get its own <DataValueMember> here --
+        # it falls through to the BOOL/BIT branch below, which renders its
+        # already bit-extracted value (see _decode_single_udt_element).
+        # Verified against a real TIMER tag's Decorated output, which shows
+        # EN/TT/DN as real members alongside PRE/ACC -- a prior version of
+        # this function silently dropped all three by skipping any
+        # data_type=="BIT" member unconditionally.
+        if member.hidden:
             continue
         mname = member.name
         mdt = member.data_type
@@ -914,7 +933,12 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
         return 0
     max_end = 0
     for m in dt.members:
-        if m.hidden or m.data_type == "BIT":
+        # Skip only BIT-overlay pseudo-members (no storage of their own).
+        # A hidden non-BIT member (e.g. TIMER/COUNTER's own "Control" DINT)
+        # still occupies real bytes in the struct and must count toward the
+        # total size, or a struct whose hidden member happens to be its
+        # largest-offset field would be undersized.
+        if m.data_type == "BIT":
             continue
         if m.data_type.upper() == "BOOL" and m.dimension > 0:
             # BOOL arrays are bit-packed into DINT-sized (4-byte) words, 32
@@ -935,12 +959,26 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
 
 
 def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
-                            data_type: str, n_elements: int):
+                            data_type: str, n_elements: int,
+                            is_array: bool = False):
     """Read the initial value(s) of a tag from its data-table blob in the comps table.
 
     Returns None if the type is not supported or the blob cannot be read.
-    For scalar tags (n_elements <= 1), returns a single Python int/float.
-    For array tags (n_elements > 1), returns a list of values.
+    For a genuine scalar (no dimensions declared at all), returns a single
+    Python int/float. For an array tag -- including a *genuine one-element
+    array* (Dimensions="1", not merely "no dimensions declared") -- returns
+    a list of values.
+
+    `is_array` (derived by the caller from whether the tag actually has a
+    `dimensions` string, not from `n_elements`) is what distinguishes these
+    two cases; `n_elements == 1` alone is ambiguous between them. This
+    caught a real, reproducible Studio 5000 import failure ("Data type
+    mismatch") for a real tag declared `Dimensions="1"`: the old code
+    collapsed a 1-element array's value to a bare scalar whenever
+    n_elements == 1 regardless of `is_array`, so `Tag.to_xml()` rendered a
+    scalar `<DataValue>` for a tag whose `<Tag Dimensions="1">` attribute
+    told Studio to expect an `<Array>` -- an internal inconsistency in our
+    own output that a real Studio import correctly rejected.
     """
     dt_upper = data_type.upper() if data_type else ""
     # Strip array brackets for type lookup, but keep n_elements from caller.
@@ -1010,7 +1048,7 @@ def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
             else:
                 values.append(0)
 
-    if n_elements == 1:
+    if n_elements == 1 and not is_array:
         return values[0]
     return values
 
@@ -1021,6 +1059,7 @@ def _decode_udt_initial_value(
     data_type_name: str,
     n_elements: int,
     data_types_map: Dict[str, 'DataType'],
+    is_array: bool = False,
 ) -> Union[dict, list, None]:
     """Decode initial values for a struct-typed tag from the data table blob.
 
@@ -1032,8 +1071,12 @@ def _decode_udt_initial_value(
     same data-table blob layout (verified against real project data,
     including a real non-blank custom string-family array tag).
 
-    Returns a dict for scalar structs, a list of dicts for struct arrays,
-    or None if the type is unknown or cannot be decoded.
+    Returns a dict for a genuine scalar struct, a list of dicts for struct
+    arrays -- including a genuine one-element array (`is_array=True`, e.g.
+    Dimensions="1"), which must NOT collapse to a bare dict even though
+    n_elements == 1 (see the identical, verified-via-real-Studio-import-
+    failure fix in _read_tag_initial_value for why this distinction
+    matters) -- or None if the type is unknown or cannot be decoded.
     """
     if not data_type_name:
         return None
@@ -1067,7 +1110,7 @@ def _decode_udt_initial_value(
         )
         results.append(decoded)
 
-    if n_elements == 1:
+    if n_elements == 1 and not is_array:
         return results[0]
     return results
 
@@ -1105,8 +1148,13 @@ def _decode_single_udt_element(
 ) -> dict:
     """Decode one UDT element from *blob* at *base_offset*.
 
-    Returns {member_name: value} for non-hidden, non-BIT members.
-    Returns an empty dict when *depth* exceeds ``_max_depth``.
+    Returns {member_name: value} for every member INCLUDING hidden ones
+    (e.g. TIMER/COUNTER's own "Control" DINT -- needed by _l5k_udt_literal,
+    which encodes its raw value even though it has no Decorated member of
+    its own) and BIT-overlay pseudo-members (e.g. TIMER.EN/TT/DN,
+    COUNTER.CU/CD/DN/OV/UN -- needed by _udt_scalar_to_xml, which renders
+    them as real BOOL DataValueMembers). Returns an empty dict when *depth*
+    exceeds ``_max_depth``.
     """
     if depth > _max_depth:
         return {}
@@ -1116,7 +1164,18 @@ def _decode_single_udt_element(
 
     result: dict = {}
     for member in data_type.members:
-        if member.hidden or member.data_type == "BIT":
+        # BIT-overlay pseudo-members have no storage of their own (they
+        # alias a specific bit of a sibling member, via member.target) --
+        # handled in the second pass below, once every sibling's own value
+        # has been decoded. Genuinely hidden non-BIT members (e.g. the
+        # "Control" DINT that TIMER/COUNTER's own EN/TT/DN or
+        # CU/CD/DN/OV/UN bits live in) ARE decoded here like any other
+        # member -- skipping them was a real bug (found via a real Studio
+        # import rejecting a COUNTER-typed tag whose Decorated structure
+        # was missing CU/CD/DN/OV/UN entirely): both the raw backing value
+        # (needed for L5K) and the individual bits (needed for Decorated)
+        # ultimately come from this same decode.
+        if member.data_type == "BIT":
             continue
 
         mname = member.name
@@ -1144,6 +1203,20 @@ def _decode_single_udt_element(
                 bit_number=bn,
             )
             result[mname] = val
+
+    # Second pass: extract each BIT-overlay member's own bit from its
+    # already-decoded target sibling (e.g. TIMER.EN = bit 31 of "Control").
+    # Verified against a real TIMER tag: raw Control=-1607863227 with
+    # EN/TT/DN at bit_number 31/30/29 decodes to EN=1, TT=0, DN=1, matching
+    # Studio 5000's own Decorated output exactly. Python's ">>" on a
+    # negative int is an arithmetic (sign-extending) shift, which correctly
+    # reproduces the 32-bit two's-complement bit pattern for any bit 0-31.
+    for member in data_type.members:
+        if member.data_type != "BIT":
+            continue
+        target_val = result.get(member.target)
+        if isinstance(target_val, int) and member.bit_number is not None:
+            result[member.name] = (target_val >> member.bit_number) & 1
 
     return result
 
@@ -2808,7 +2881,8 @@ class TagBuilder(L5xElementBuilder):
         dimensions = ",".join(dim_parts) if dim_parts else None
         dti = r.main_record.data_table_instance
         initial_value = _read_tag_initial_value(
-            self._cur, dti, data_type, _count_array_elements(dimensions)
+            self._cur, dti, data_type, _count_array_elements(dimensions),
+            is_array=dimensions is not None,
         )
 
         tag_name = results[0][0]
@@ -3787,7 +3861,7 @@ class ProgramBuilder(L5xElementBuilder):
                     n = _count_array_elements(tag.dimensions)
                     udt_val = _decode_udt_initial_value(
                         self._cur, tag._data_table_instance, tag.data_type, n,
-                        self._data_types_map,
+                        self._data_types_map, is_array=tag.dimensions is not None,
                     )
                     if udt_val is not None:
                         tag._initial_value = udt_val
@@ -4038,7 +4112,7 @@ class ControllerBuilder(L5xElementBuilder):
                 n = _count_array_elements(tag.dimensions)
                 udt_val = _decode_udt_initial_value(
                     self._cur, tag._data_table_instance, tag.data_type, n,
-                    data_types_map,
+                    data_types_map, is_array=tag.dimensions is not None,
                 )
                 if udt_val is not None:
                     tag._initial_value = udt_val

@@ -648,10 +648,100 @@ be indistinguishable from the source, without needing an actual Studio 5000 inst
 a file real Studio 5000 accepts.** Two separate open questions remain, neither resolved yet:
 - Without a registered `FileInfo.Dat` signing key (see `acd/integrity/`), any mutation leaves
   the checksum stale; whether Studio 5000 actually enforces/checks this on open (as opposed to
-  only the SDK) is untested.
+  only the SDK) is untested — **three purpose-built experiment ACDs now exist to answer this;
+  see the next section**.
 - Even with a valid key, nobody has confirmed a `save_acd()`-produced, mutated ACD actually
   opens correctly in real Studio 5000 — that would require an actual test against the real
   software, which hasn't been done as of this writing.
+
+## ACD write-back: what a real Studio 5000 save/edit actually writes (three-way diff)
+
+Reverse-engineered from three sibling saves of the same large real project (in
+`...\PLC_Claude_Code\Bethel_Planer\source\`): `BPM_TrimmerSorter_20260707.ACD` (original),
+`..._STUDIO_NOOP.ACD` (opened in Studio, saved unmodified), `..._STUDIO_EDITED.ACD` (opened,
+one edit, saved). `Version.Log` (plain text, one `"...: Saved - V32.04"` line per save)
+revealed the EDITED save actually happened *before* the NOOP save — both are independent
+children of the original, so `noop→edit` isolates exactly one edit's footprint on an identical
+save-normalization baseline. Compare **decompressed** contents (every internal `.Dat`/`.Idx`
+is gzip-compressed in the container); many `.Dat` files have page-quantized sizes (multiples
+of 65535) that stay constant while content changes.
+
+**The identified edit** (recovered purely from the binary diff): rung `0x17c4b9bd` in routine
+`Flasher` had `OTE(BitFlags[21])` appended, and — incidental leftover of the same editing
+session — a new, unused controller-scope tag `BitsFlags` (note the extra "s": almost certainly
+typed first, auto-created by Studio's inline new-tag flow, then corrected) was created under
+`RxTagCollection`.
+
+**Finding 1 — save-time compaction/GC exists but is NOT required on open.** A no-op resave
+shrank `Comps.Dat` by ~581KB (19113→19097 records, dead `fd fd` records 151→142), dropped 372
+stale `SbRegion.Dat` records, 54 `Nameless.Dat` records, etc. But the *original* (uncompacted,
+dead-record-laden) file opens fine in Studio — that's where the NOOP/EDITED saves came from.
+So a writer does **not** need to replicate compaction; it only needs to express its own delta
+with consistent cross-file invariants.
+
+**Finding 2 — the complete per-file footprint of the one rung edit (`noop→edit`)**:
+- `SbRegion.Dat`: the rung's `Rung NT` record is **excised in place (bytes compacted out, not
+  tombstoned) and the new version appended as the physically-last record**. Every other record
+  byte-identical — including the rung's own 1065-byte `REGION AST` record (compiled form is
+  NOT regenerated). Header: u32 at file offset 0 = (file length − 1), u32 at offset 8 =
+  record-region length (both adjusted); `DatHeader` also has `no_records` at 0x14 and a
+  second count at 0x18 (unchanged here: −1 removed +1 appended).
+- `SbRegion.Idx`: ~10k tiny diffs — the B-tree entries store **absolute `.Dat` record offsets**
+  which all rebase by the length delta after the excision point. Any length-changing `.Dat`
+  edit MUST rebase its `.Idx` (our current `patch_rungs` does not — see experiments below).
+- `Nameless.Dat`: the routine's compiled-artifact records are **deleted, not regenerated**
+  (a 1740-byte compiled-body record and a 68-byte link record removed; a 56-byte list record
+  keyed by the routine's object_id at body[8:12] rewritten shorter with its child references
+  emptied). Net −2 records.
+- `Comps.Dat`: 422 differing bytes in 13 regions, fully decoded:
+  - the routine's own record: one byte at body[10] flips `0x03 → 0x00` (compile-state/"dirty"
+    flag, matching the deleted compiled artifacts);
+  - the controller's own record: an 8-byte FILETIME last-edit timestamp updated;
+  - **new-object creation via free-slot resurrection**: a dead `fd fd` record (an old deleted
+    tag `Test3dudt` — deleted comps records keep their full bytes, and *pointer* records get
+    renamed to `$hex$` placeholder names like `$447f0b6a$`) is flipped to `fa fa` and
+    overwritten with the new tag's record; same for its paired pointer record elsewhere;
+  - a **free-list structure inside Comps.Dat** (same idea as the Comments.Dat free-list): a
+    count field decremented (0x18→0x17) and the entry holding the resurrected slot's file
+    offset — stored as a **3-byte big-endian** value inside a 10-byte entry — removed from the
+    list (tail shifted up, last entry left duplicated as garbage);
+  - `.Dat` header counts at file offsets 0x14/0x18: live-record count +1, free-record count −1;
+  - two allocator/seed fields (one near the file header at ~0xc25 holding the most recently
+    allocated object_id, one at ~0x4cce) updated.
+  - Comps record body layout (relative to the 6-byte `fa fa`+u32len prefix): body[0:4] inner
+    length, body[8:12] flags (body[10] = the dirty byte for routines), body[16:20] object_id,
+    body[20:24] parent_id, body[24:] UTF-16LE name.
+- `CanonicalSize.Dat`: a per-object table of `(0x0200 marker u32, canonical_size u32,
+  object_id u32)` entries; the edited rung's size went `0x18 → 0x1c` (+4 for one added
+  instruction).
+- `RegnLink.Dat`: **header counter/timestamp only — zero record changes** (the rung kept its
+  object_id and chain position); `RegnLink.Idx` byte-identical.
+- `XRefs.Dat`: +3 records appended (header count at 0x14 `0xbbdf→0xbbe2`, count at 0x18 +1),
+  one ~89-byte tail region rewritten with entries referencing the rung and routine ids —
+  format still not reverse-engineered (`record_format` 132; `DbExtract` refuses it).
+  `XRefs.Idx` grew by exactly one 0x3FFF page.
+- Every `.Dat`/`.Idx` header also has a save-generation counter + unix-timestamp pair in the
+  `[0x6c:0x74]` region that bumps on each save even when the file is otherwise untouched.
+- `QuickInfo.XML`: the `CopyUID="..."` attribute value is regenerated per save.
+  `OfflineChangelog.Dat`: a 4-byte counter. `Version.Log`: appends a `Saved - V<ver>` line.
+  `FileInfo.Dat`: the 32-byte digest at [2:34] differs on every save (as expected).
+
+**Finding 3 — experiment files for the FileInfo-enforcement question** (built with this
+library from the NOOP baseline, in `...\Bethel_Planer\source\WriteBack_Tests\`; all three
+verified to re-parse correctly with our own reader; none has a valid FileInfo digest):
+- `EXP0_deadrecord_byte.ACD` — one byte inside a *dead* Comps record's leftover text
+  (`Test3dudt`→`Xest3dudt`); semantically invisible. If Studio opens it → the FileInfo
+  checksum is **not** enforced on open (nothing else can be blamed).
+- `EXPA_comment_letter.ACD` — one letter changed in place, same length, in a live rung
+  comment (`VAB_MainProgram/R02_Flash` rung 3: `Bit flash X/5`→`Bat flash X/5`). If it opens
+  AND shows "Bat" → same-length in-place `Comments.Dat` edits are viable end-to-end.
+- `EXPB_rung_append_ote.ACD` — the same rung edit Studio itself made, but via our
+  `patch_rungs()` (in-place, length-changing), deliberately leaving `SbRegion.Idx` offsets,
+  Nameless compiled artifacts, the Comps dirty flag, `CanonicalSize`, and `XRefs` all stale.
+  If it opens and shows the new rung → Studio's loader is lenient about all of that; if it
+  fails, add the bookkeeping pieces one at a time (start with `SbRegion.Idx` rebasing —
+  the most likely hard requirement).
+Outcome of the user's Studio test not yet recorded as of this writing — update here when known.
 
 ## Testing gotchas
 

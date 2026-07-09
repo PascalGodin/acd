@@ -434,6 +434,26 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
             break
         referenced_names |= new_names
 
+    # An Alias's own target can resolve to an I/O tag (e.g. LngthLmt_16ft ->
+    # "Remote_TrimmerIO:0:I.Data.7") -- the base-name resolution above
+    # correctly identifies "Remote_TrimmerIO:0:I" as a referenced name, but
+    # that literal I/O Tag object must NOT be emitted as its own <Tag>
+    # element: Tag._l5x_exclude already encodes exactly this rule for a
+    # normal full-project export (I/O tags never appear as standalone
+    # <Tag> elements there either), but export_routine() builds its own
+    # ad-hoc tag lists rather than going through that generic list-section
+    # serialization, so the exclusion was never applied here. Confirmed via
+    # a real Studio 5000 import rejecting exactly this: "Error creating
+    # 'Tag[@Name="Remote_TrimmerIO:0:I"]' (Invalid name.)" -- the I/O tag's
+    # *owning Module* is what actually needs to be referenced (already
+    # handled separately by _referenced_modules() for direct rung
+    # references; an alias's I/O target doesn't go through that path today,
+    # so its owning Module isn't picked up this way -- a separate,
+    # not-yet-observed gap. Not clear this Alias/JsX-import combination even
+    # works in this project without the underlying I/O connection already
+    # existing).
+    program_tags = [t for t in program_tags if not t._l5x_exclude]
+
     # Standard Logix scoping: a program-scope tag shadows a same-named
     # controller-scope tag for bare-name operand resolution within that
     # program. Verified against a real project: a routine's OTE(Flash)
@@ -446,6 +466,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     controller_tags = [
         t for t in project.controller.tags
         if t.name in referenced_names and t.name not in program_tag_names
+        and not t._l5x_exclude
     ]
 
     referenced_type_names = {t.data_type.upper() for t in controller_tags + program_tags if t.data_type}

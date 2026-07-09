@@ -741,7 +741,51 @@ verified to re-parse correctly with our own reader; none has a valid FileInfo di
   If it opens and shows the new rung → Studio's loader is lenient about all of that; if it
   fails, add the bookkeeping pieces one at a time (start with `SbRegion.Idx` rebasing —
   the most likely hard requirement).
-Outcome of the user's Studio test not yet recorded as of this writing — update here when known.
+
+**RESULT — `FileInfo.Dat` IS enforced by Studio 5000 on open (definitive).** The user opened
+`EXP0_deadrecord_byte.ACD` in real Studio 5000: it was **rejected** with *"File is not
+recognized as a valid project file"* — a container-level rejection that fires before any
+project-content parsing. This is the cleanest possible proof, because EXP0 is provably NOOP
+with exactly ONE semantically-dead byte changed:
+- A zero-edit passthrough (read the NOOP container's raw file blocks, rebuild via
+  `build_acd_bytes`, no changes) reproduces the NOOP `.ACD` **byte-for-byte** — so the
+  container writer is not the culprit.
+- Recompressing an unchanged `Comps.Dat` with `gzip.compress(level=1, mtime=0)` + XFL/OS
+  patch reproduces the original compressed stream **byte-for-byte** — so the recompression
+  is not the culprit.
+- EXP0's only change vs NOOP is one byte inside a dead `fd fd` record (invisible to parsing)
+  and, consequently, a now-stale `FileInfo.Dat` digest. NOOP itself opens; EXP0 doesn't.
+  The stale digest is the only remaining difference → `FileInfo.Dat` is enforced on open.
+
+**Consequence: the entire raw-binary write path is blocked on recomputing `FileInfo.Dat`,
+which needs the HMAC key.** EXPA/EXPB were not worth testing after this — they change *more*
+than EXP0, so they can only also fail at the same gate; they become useful only once files
+can be correctly re-signed. The key situation, corrected from earlier notes:
+- `acd/integrity/fileinfo.py` implements the (hypothesised) construction:
+  selector `02 00` = `HMAC-SHA-256(key, sha256(container − FileInfo.Dat))`, key = 32 bytes.
+  This project's `FileInfo.Dat` is selector `02 00` (header bytes `02 00 …`), so it needs the
+  32-byte key.
+- **The key is a per-Studio-version constant, NOT a per-project brute-force target** (earlier
+  task framing was wrong on this). Per our own module docs it is extractable from a legitimate
+  Studio 5000 install. It is not shipped with this library and is not present anywhere in the
+  repo, tests, or environment (`ACD_FILEINFO_KEY` unset).
+- **The HMAC construction in `fileinfo.py` has never been validated against a real key** — the
+  integrity tests only check self-consistency with dummy keys; the real end-to-end test is
+  gated behind the unset `ACD_FILEINFO_KEY`. So even once a key is obtained, the algorithm
+  itself is still an unconfirmed hypothesis. We hold three genuine Studio-signed containers
+  (orig / noop / edit, all same project, all with *different* valid `FileInfo.Dat` digests):
+  the instant a candidate 32-byte key is available, verify it against all three with
+  `verify_fileinfo()` — a correct key must match all three, which simultaneously confirms both
+  the key and the algorithm.
+
+**Open paths from here** (none pursued yet, pending a decision):
+1. Obtain the 32-byte key from the user's Studio 5000 install (DLL/static extraction on their
+   machine — not installed on the dev machine). Biggest unlock: if the algorithm is right,
+   `save_acd()` re-signs correctly and EXP0/EXPA become the next probes.
+2. Native-import escape hatch (mirrors `export_routine()` → Studio "Import Routine"): sidesteps
+   `FileInfo.Dat` entirely for the edits it covers. Likely the pragmatic path for actually
+   getting tag/rung/comment edits into a project without solving the key.
+Outcome of any Studio re-test after re-signing not yet recorded — update here when known.
 
 ## Testing gotchas
 

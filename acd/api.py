@@ -174,6 +174,64 @@ def _referenced_tag_names(rung_texts) -> set:
     return names
 
 
+def _resolve_type_closure(initial_type_names: set, project: RSLogix5000Content):
+    """Recursively resolve a set of DataType/AOI names to every DataType and
+    AOI they transitively depend on, so a partial export is self-consistent
+    the same way Studio's own "Export Routine"/"Export Component" is meant to
+    be (per the user: it "only includes what is referenced ... including
+    UDT, AOI, Modules, etc").
+
+    Expands the closure through: a UDT's own members' data types (so a UDT
+    containing another project UDT pulls that one in too -- e.g. a member
+    whose data_type is itself a UDT name), and an AOI's own parameters' and
+    local tags' data types (so an AOI using a project UDT, or nesting another
+    AOI as a parameter type, pulls those in too). Order names never seen
+    before are processed in a simple worklist so the recursion terminates
+    even with cyclic-looking (but not actually cyclic, Logix disallows UDT
+    self-reference) dependency graphs.
+
+    Returns (data_types, aois) -- each a list in the project's own
+    declaration order, filtered to the resolved closure.
+
+    NOTE: only the "which UDTs/AOIs get included" computation is exercised
+    against real data (mirrors the already-verified single-level UDT
+    resolution, generalized into a transitive closure and extended to also
+    search project.controller.aois, which the single-level version never
+    did). The AOI wrapper's XML *placement* in export_routine() is still
+    unverified -- see the comment at its one call site.
+    """
+    resolved_types: set = set()
+    resolved_aois: set = set()
+    worklist = set(initial_type_names)
+    data_types_by_name = {dt.name.upper(): dt for dt in project.controller.data_types}
+    aois_by_name = {a.name.upper(): a for a in (project.controller.aois or [])}
+
+    while worklist:
+        name = worklist.pop()
+        if name in resolved_types or name in resolved_aois:
+            continue
+        dt = data_types_by_name.get(name)
+        if dt is not None:
+            resolved_types.add(name)
+            for member in dt.members:
+                if member.data_type:
+                    worklist.add(member.data_type.upper())
+            continue
+        aoi = aois_by_name.get(name)
+        if aoi is not None:
+            resolved_aois.add(name)
+            for p in aoi.parameters:
+                if p.data_type:
+                    worklist.add(p.data_type.upper())
+            for lt in aoi.local_tags:
+                if lt.data_type:
+                    worklist.add(lt.data_type.upper())
+
+    data_types = [dt for dt in project.controller.data_types if dt.name.upper() in resolved_types]
+    aois = [a for a in (project.controller.aois or []) if a.name.upper() in resolved_aois]
+    return data_types, aois
+
+
 def export_routine(project: RSLogix5000Content, routine: Routine, output_path, owner: str = None) -> None:
     """Export a single routine as a standalone, partial L5X file.
 
@@ -206,7 +264,20 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     (see _referenced_tag_names) -- not a full ladder-logic parser, but
     correct for plain tag-name operands (which is what matters for
     instruction operands). Custom UDTs used by any referenced tag are
-    included in <DataTypes Use="Context"> automatically.
+    included in <DataTypes Use="Context"> automatically, expanded to a full
+    transitive closure (a UDT containing another project UDT, or an AOI
+    parameter/local tag typed with a project UDT or a nested AOI, pulls in
+    that dependency too -- see _resolve_type_closure()). AOI dependencies
+    (a routine calling an AOI instruction, whose instance tag's data_type is
+    the AOI's own name) are resolved the same way and emitted under
+    <AddOnInstructionDefinitions Use="Context"> -- *** this AOI section's
+    exact placement/shape is NOT yet verified against a real Studio export
+    that has one (unlike everything else in this wrapper, which is) *** --
+    see CLAUDE.md "Native-import escape hatches" for the concrete real-project
+    rung (Motors/Main_Motors calls AOI_RPMtoFPM) to verify this against.
+    Module dependencies (a routine referencing an I/O tag, e.g.
+    "Local:1:I.Data.0") are NOT resolved or included at all yet -- same
+    routine/rung is also the one to use to figure this out.
 
     Args:
         project: The loaded project (from load_acd()) that owns `routine`
@@ -295,9 +366,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     ]
 
     referenced_type_names = {t.data_type.upper() for t in controller_tags + program_tags if t.data_type}
-    referenced_data_types = [
-        dt for dt in project.controller.data_types if dt.name.upper() in referenced_type_names
-    ]
+    referenced_data_types, referenced_aois = _resolve_type_closure(referenced_type_names, project)
 
     # NOTE: individual <Tag>/<DataType> elements never carry a Use= attribute
     # themselves -- only the wrapping container elements (<Tags Use="Context">,
@@ -311,6 +380,21 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # importing Studio 5000's own (Use=-free) export of the identical edit
     # successfully, then diffing it attribute-by-attribute against ours.
     data_types_xml = "".join(dt.to_xml() for dt in referenced_data_types)
+    # *** UNVERIFIED against a real Studio export that has an AOI dependency ***
+    # (only the plain-UDT/tag case above has been verified so far). Emitted
+    # only when at least one AOI is actually referenced, so the already-
+    # verified no-AOI case is completely unaffected. Placement (right after
+    # </DataTypes>, before <Tags>) and the Use="Context" wrapper are a
+    # reasoned guess by analogy with <DataTypes Use="Context">, NOT confirmed
+    # byte-for-byte against a real single-routine export the way the rest of
+    # this wrapper was -- see CLAUDE.md "Native-import escape hatches" for the
+    # concrete real-project rung (Motors/Main_Motors calls AOI_RPMtoFPM) that
+    # should be used to verify this before trusting an import that hits it.
+    aois_xml = "".join(aoi.to_xml() for aoi in referenced_aois)
+    aois_section = (
+        f'<AddOnInstructionDefinitions Use="Context">\n{aois_xml}\n</AddOnInstructionDefinitions>\n'
+        if referenced_aois else ""
+    )
     controller_tags_xml = "".join(t.to_xml() for t in controller_tags)
     program_tags_xml = "".join(t.to_xml() for t in program_tags)
     routine_xml = _inject_use_attr(routine.to_xml(), "Routine", "Target")
@@ -344,6 +428,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         f'ExportOptions="{export_options}">\n'
         f'<Controller Use="Context" Name="{_escape_xml_attr(controller_name)}">\n'
         f'<DataTypes Use="Context">\n{data_types_xml}\n</DataTypes>\n'
+        f'{aois_section}'
         f'<Tags Use="Context">\n{controller_tags_xml}\n</Tags>\n'
         f'<Programs Use="Context">\n'
         f'<Program Use="Context" Name="{_escape_xml_attr(program.name)}">\n'

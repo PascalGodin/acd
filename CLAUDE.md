@@ -312,17 +312,18 @@ buffer), and a single task that still can't decode is skipped with a warning rat
 existing test suite (which only exercises files that already parse cleanly) is unaffected by
 design — this only changes behavior on records/files that previously would have raised.
 
-## Native-import escape hatches for write-back (routine L5X, tag CSV)
+## Native-import escape hatches for write-back (routine L5X is the one active mechanism)
 
 Because `FileInfo.Dat` is enforced on open (see "ACD write-back"), the sanctioned way to get an
 edit into a project is to hand Studio 5000 a file it imports through its own UI — Studio then
-does the binary write + re-sign. Two native import channels, two file formats:
-- **Routine → partial L5X** via "Import Routine" — see `export_routine()` below (verified
-  end-to-end).
-- **Tags/descriptions/comments → CSV** via "Import Tags" (Tools ▸ Import, or right-click
-  Tags ▸ Import) — see `export_tag()` (draft, calibration-pending) and the tag-CSV notes next.
-  This is the path for the tag-creation/description-edit class (the `STUDIO_EDITED` project's
-  new `BitsFlags` tag was exactly this class).
+does the binary write + re-sign. **`export_routine()` (partial L5X via "Import Routine") is the
+one actively-developed, verified-end-to-end mechanism** — it now covers both rung edits (its
+original purpose) and tag-level edits (description/value), the latter via the routine-carrier
+trick below, per user direction. A standalone `export_tag()` (single-tag partial L5X via "Import
+Component") and CSV "Import Tags" were both explored as alternatives and are kept below for
+reference, but **deprioritized**: the user does not want to rely on CSV, and `export_tag()`'s
+wrapper was never calibrated against a real Studio single-tag export before the routine-carrier
+approach superseded the need for it.
 
 ### Tag CSV import format (Rockwell "CSV-Import-Export")
 
@@ -483,37 +484,104 @@ it, so its necessity hasn't been isolated), and scenarios beyond a single UDT ar
 exercised through `export_routine()` specifically yet (though the underlying `_l5k_udt_literal`/
 `_udt_scalar_to_xml` recursion has been separately verified for nested cases in other contexts).
 
-12. **UDT/AOI dependency closure was single-level and AOI-blind — fixed, but the AOI part is
-    unverified.** The user clarified the intent directly: replicate what Studio's own routine
-    export does, "including UDT, AOI, MODULES, Etc" as transitive dependencies. Auditing the code
-    found two real gaps: `referenced_data_types` only checked the data type of *directly*
-    referenced tags (a UDT containing another project UDT as a member wouldn't pull that inner
-    UDT in), and `project.controller.aois` was never consulted at all — an AOI instruction call in
-    a rung (e.g. `AOI_RPMtoFPM(TestFPM,VFD_P_INTBL2:I.OutputFreq);`, a real rung in
-    `Motors/Main_Motors`) has its AOI name resolved through the instance tag's own `data_type`
-    field (here `TestFPM.data_type == "AOI_RPMtoFPM"`) exactly like a UDT tag, but the AOI
-    collection was simply never searched. `_resolve_type_closure()` (`acd/api.py`) now does a
-    proper worklist-based transitive closure over both `project.controller.data_types` and
-    `project.controller.aois` (following a UDT's own members, and an AOI's own parameters/local
-    tags, for further nested dependencies), and `export_routine()` emits a conditional
-    `<AddOnInstructionDefinitions Use="Context">` block (only when at least one AOI is actually
-    referenced — confirmed to leave the already-verified no-AOI case byte-for-byte unaffected).
-    **The UDT-closure half is low-risk** (same mechanism already verified, just transitively
-    closed). **The AOI section's placement (right after `</DataTypes>`, before `<Tags>`) and even
-    whether Studio wants it wrapped in `Use="Context"` at all is a reasoned-by-analogy guess, NOT
-    verified against a real Studio export that has an AOI dependency** — unlike literally
-    everything else in this wrapper, which was calibrated against real Studio output before
-    trusting an import (see the `Use=` crash story above — guessing at this exact class of
-    structural placement has bitten this project before). **Module dependencies are not handled
-    at all yet**: that same `Motors/Main_Motors` rung's second argument
-    (`VFD_P_INTBL2:I.OutputFreq`) is an I/O tag reference, and whether/how a real Studio routine
-    export includes the owning `<Module>` definition for this is completely unknown — I/O tag
-    names contain a `:` and aren't picked up by the plain-identifier `_referenced_tag_names`
-    scan at all currently, so this needs its own investigation once real ground truth exists.
-    **The concrete next step**: a real Studio 5000 "Export Routine" of `Motors/Main_Motors` from
-    `BPM_TrimmerSorter_20260709.ACD` exercises both open questions in one file — requested from
-    the user, not yet obtained as of this writing. A generated (unverified) sample based on the
-    current code is at `...\Bethel_Planer\source\WriteBack_Tests\CALIBRATION_Main_Motors.L5X`.
+12. **UDT/AOI/Module/called-Routine dependency closure — SOLVED, verified exact against a real
+    Studio "Export Routine".** The user clarified the intent directly: replicate what Studio's own
+    routine export does, "including UDT, AOI, MODULES, Etc" as transitive dependencies. A real
+    export of `Motors/Main_Motors` (`BPM_TrimmerSorter_20260709.ACD`, obtained from the user) —
+    whose rungs call `AOI_RPMtoFPM(TestFPM,VFD_P_INTBL2:I.OutputFreq)`, reference
+    `Local:12:I.Data.0`, and `JSR(Infeed_LandingTable,0)` — exercised every open question in one
+    file. Diffing our generated output against it (element vocabulary, `Use=` values, AND full
+    top-level child order) came back an **exact match** except for one unrelated, separately-scoped
+    gap (`<DefaultData>`, see below). Concretely:
+    - `referenced_data_types` was single-level (a UDT containing another project UDT as a member
+      wouldn't pull that inner UDT in) and `project.controller.aois` was never consulted at all —
+      an AOI instruction call's instance tag has its AOI name resolvable through the tag's own
+      `data_type` field (here `TestFPM.data_type == "AOI_RPMtoFPM"`) exactly like a UDT tag, but the
+      AOI collection was simply never searched. `_resolve_type_closure()` (`acd/api.py`) now does a
+      proper worklist-based transitive closure over both `project.controller.data_types` and
+      `project.controller.aois` (following a UDT's own members, and an AOI's own parameters/local
+      tags, for further nested dependencies).
+    - `<AddOnInstructionDefinitions Use="Context">` (individual `<AddOnInstructionDefinition>`
+      elements carry no `Use=`, matching the Tag/DataType convention) sits right after
+      `</Modules>` and before `<Tags Use="Context">` — confirmed exact against the real export's
+      full top-level child order: `DataTypes, Modules, AddOnInstructionDefinitions, Tags,
+      Programs`.
+    - **Module dependencies**, previously unhandled entirely (I/O tag names contain a `:` and
+      aren't picked up by the plain-identifier `_referenced_tag_names` scan), are resolved by
+      `_referenced_modules()` via a real Logix addressing-convention rule, verified exact: a
+      2-part I/O reference (`ModuleName:Type...`, e.g. `VFD_P_INTBL2:I` — a directly-addressed
+      Ethernet device) needs only that module; a 3-part reference
+      (`ModuleName:SlotNumber:Type...`, e.g. `Local:12:I` — rack/chassis-slot addressing) needs
+      BOTH the chassis module itself (`Local`) AND whichever module occupies that slot (found via
+      `Module.parent_module == chassis_name and Module._slot == slot_number` — here `AC_IN_12`,
+      slot 12 of `Local`). The real export's `<Modules Use="Context">` contained exactly
+      `{AC_IN_12, Local, VFD_P_INTBL2}` for this rung, matching the rule precisely; critically, it
+      did **not** include `Ethernet2` (`VFD_P_INTBL2`'s own `parent_module`) — a directly-addressed
+      module's parent is not walked, only a slot-occupant's rack is. Each `<Module>` is an empty
+      `Use="Reference"` stub (bare name, no definition content), a new `Use=` value distinct from
+      `Context`/`Target` seen anywhere else in this wrapper. **Caveat**: verified against exactly
+      one rack + one direct Ethernet device; bridged/remote racks (ControlNet, DeviceNet, a remote
+      Ethernet chassis through an adapter) haven't been exercised.
+    - **Routine dependencies**: a target routine calling another routine in the same program via
+      `JSR` needs that routine included too — as an empty `<Routine Use="Reference" Name="...">`
+      stub (no rung content), positioned *before* the real `<Routine Use="Target">` inside the same
+      `<Routines Use="Context">` wrapper. `_referenced_called_routines()` resolves this via a
+      `JSR\s*\(\s*(name)` scan against the *same program's* own routines (JSR can't cross program
+      boundaries in native ladder logic). Verified exact against the real export
+      (`Infeed_LandingTable` stub before `Main_Motors` target).
+    - All of the above are purely additive/conditional (only emitted when actually referenced),
+      confirmed to leave the earlier, already-verified no-AOI/no-Module/no-JSR case byte-for-byte
+      unaffected.
+    - **A genuine, general bug found and fixed along the way** (not AOI/Module-specific):
+      `_decorated_real_literal()`'s `"%.6g"`-style formatting silently drops the decimal point for
+      an exact whole-number float (`f"{1800.0:.6g}"` → `"1800"`, not `"1800.0"`) — this went
+      undetected in every earlier verification sample because none happened to include a REAL
+      value that reduces to a whole number. Confirmed against four real values on the AOI instance
+      tag `TestFPM` (`MotorRPM=1800.0`, and three sheave/sprocket diameters at `6.0`/`12.0`/`14.0`,
+      all rendered by real Studio with an explicit `.0`). Fixed by appending `.0` whenever the
+      formatted string has neither a decimal point nor scientific notation. This affects every
+      Decorated-format REAL/LREAL rendering project-wide (plain tags, UDT members, AOI members),
+      not just AOI structures.
+
+    **Separate, deeper, NOT-yet-solved gap found via the same real `TestFPM` comparison — AOI
+    *instance value* decoding is measurably wrong, independent of the dependency-declaration fixes
+    above**: comparing our rendered `TestFPM` tag (`DataType="AOI_RPMtoFPM"`) against the real
+    export's byte-for-byte:
+    - Two members are silently missing from both our `<Data Format="L5K">` and `<Structure>`
+      output: `EnableIn`/`EnableOut` (both real BOOL members present in Studio's own output, not
+      BIT-overlay pseudo-members). The underlying synthetic "DataType" that backs an AOI instance's
+      value decode (found via `all_data_types_map[dt.name.upper()] = dt` in `ControllerBuilder`,
+      which inserts *every* `RxDataTypeCollection` entry regardless of `cls`, not just `cls ==
+      "User"` — meaning an AOI's own instance-data-shape record lives there under the AOI's name,
+      separately from the AOI's own `AddOnInstructionDefinition`/Parameters) appears to mark these
+      two members `hidden`, and `_udt_scalar_to_xml`/`_decode_single_udt_element`'s generic
+      "skip if hidden" rule (correct for real UDT BIT-overlay members) incorrectly drops them here
+      too. Whether that's a raw-byte misread of the hidden flag for this specific case, or a
+      genuine semantic difference (AOI system-defined params need to never be skipped regardless
+      of a hidden flag) is not yet determined.
+    - The real `<Data Format="L5K">` literal has **17 comma-separated values**; ours has only 8
+      (matching the 8 members we do emit). Real Decorated `<Structure>` only shows 10 named
+      members (`EnableIn`/`EnableOut` + our 8) — still short of 17, meaning L5K encodes something
+      beyond even the full named-Parameter list, quite possibly the AOI's own `LocalTags` (private
+      storage) packed into the same flat blob, plus the leading value `3` in the real L5K array
+      that doesn't map to any named Parameter or LocalTag at all (possibly an internal AOI
+      execution-state field Studio never exposes as a named member).
+    - `<Structure DataType="AOI_RPMtoFPM">` in real output preserves the AOI's own mixed-case name;
+      ours renders `AOI_RPMTOFPM` (all-caps) — traceable to `display_name` falling back to the
+      already-uppercased lookup key when the synthetic backing DataType's own stored `.name` isn't
+      the properly-cased one.
+    - `<DefaultData Format="L5K">`/`<DefaultData Format="Decorated">` (an AOI's own default value
+      for a `Parameter`/`LocalTag`, e.g. `MotorRPM`'s default `0.0`) is never emitted at all —
+      `Parameter`/`LocalTag` dataclasses don't even have an `_initial_value`-equivalent field yet,
+      so this needs new binary reverse-engineering (where an AOI *definition's* own default values
+      live in Comps.Dat, analogous to but distinct from `_read_tag_initial_value`/
+      `_decode_udt_initial_value` for a tag *instance's* current value) before it can be
+      implemented at all — not attempted this session.
+    None of this blocks the dependency-declaration fixes above (which only need the AOI/Module/
+    UDT/routine *names* to be correctly identified and included, not their values decoded
+    correctly) — but any future work rendering an AOI-typed tag's own current value, or an AOI's
+    own parameter/local-tag default values, should start here rather than assume the existing UDT
+    value-decode pipeline already handles AOIs correctly.
 
 ## Routine-level Description (leading XML comment newline pitfall)
 

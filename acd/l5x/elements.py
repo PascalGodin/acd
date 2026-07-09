@@ -308,17 +308,26 @@ def _decorated_real_literal(value: float, in_array: bool) -> str:
 
     Finite values use the normal "%.6g"-style short form Studio 5000 uses
     for Decorated (distinct from L5K's fixed 8-digit scientific notation,
-    see _l5k_real_literal). NaN/Infinity: confirmed against a real
-    project's own Studio 5000 export that a *scalar* tag's Decorated NaN
-    value is the bare label "1.#QNAN" (no padding/exponent, unlike L5K) --
-    the analogous "1.#INF" for scalar Infinity was not observed but is
-    inferred by direct symmetry. An *array* Element's Decorated value for
-    the one non-finite case observed (+Infinity) was instead the truncated
-    "1.$" -- a real, reproducible quirk/bug in Studio 5000's own array
-    Decorated-value exporter (distinct from the scalar case), applied here
-    for NaN too since no counter-evidence exists and the truncation looks
-    like a generic "any '#'-prefixed special-value label gets mangled in
-    this code path" bug rather than one specific to Infinity.
+    see _l5k_real_literal), with a mandatory decimal point even for a
+    whole-number value -- confirmed against a real AOI instance tag's own
+    Decorated value (TestFPM, DataType AOI_RPMtoFPM): MotorRPM=1800.0,
+    MotorDriverSheaveDiameter=6.0, MotorDrivenSheaveDiameter=12.0,
+    DrivenRoll_SprocketDiameter=14.0 all render with an explicit ".0" in
+    real Studio output, but Python's bare "%.6g" strips the decimal point
+    for exact whole numbers (f"{1800.0:.6g}" == "1800", not "1800.0") --
+    this went undetected in every earlier verification sample because none
+    happened to include a REAL value that was an exact whole number.
+    NaN/Infinity: confirmed against a real project's own Studio 5000 export
+    that a *scalar* tag's Decorated NaN value is the bare label "1.#QNAN"
+    (no padding/exponent, unlike L5K) -- the analogous "1.#INF" for scalar
+    Infinity was not observed but is inferred by direct symmetry. An
+    *array* Element's Decorated value for the one non-finite case observed
+    (+Infinity) was instead the truncated "1.$" -- a real, reproducible
+    quirk/bug in Studio 5000's own array Decorated-value exporter (distinct
+    from the scalar case), applied here for NaN too since no counter-
+    evidence exists and the truncation looks like a generic "any
+    '#'-prefixed special-value label gets mangled in this code path" bug
+    rather than one specific to Infinity.
     """
     if math.isnan(value) or math.isinf(value):
         if in_array:
@@ -326,7 +335,10 @@ def _decorated_real_literal(value: float, in_array: bool) -> str:
         label = "#QNAN" if math.isnan(value) else "#INF"
         sign = "-" if math.copysign(1.0, value) < 0 else ""
         return f"{sign}1.{label}"
-    return f"{value:.6g}"
+    formatted = f"{value:.6g}"
+    if "." not in formatted and "e" not in formatted and "E" not in formatted:
+        formatted += ".0"
+    return formatted
 
 # Radix string used in Decorated DataValueMember for each numeric primitive.
 # BOOL and BIT use no Radix attribute; REAL/LREAL use "Float"; all integers use "Decimal".

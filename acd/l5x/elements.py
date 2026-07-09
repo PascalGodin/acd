@@ -57,8 +57,19 @@ def _multiline_xml_text(raw: str) -> str:
     Member.description/Tag.description) -- that collapsing is documented,
     existing behavior for the convenience Python API and must not change;
     only the XML rendering needed fixing.
+
+    Does NOT strip leading/trailing whitespace or blank lines -- a prior
+    version called .strip() here, which silently discarded genuine trailing
+    blank lines from a real project's own UDT description ("Timing":
+    "Lug distances and go points\r\n\r\n\r\n", i.e. two real blank lines
+    intentionally left at the end). Invisible to the eye (a rendered
+    description with or without trailing blank lines reads the same), but a
+    real Studio 5000 "Import Routine" comparison flagged the stripped
+    version as different from the project's own -- caught during the first
+    live end-to-end routine-carrier import test (see CLAUDE.md "Native-
+    import escape hatches").
     """
-    return raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return raw.replace("\r\n", "\n").replace("\r", "\n")
 
 
 @dataclass

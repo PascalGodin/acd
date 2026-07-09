@@ -237,22 +237,23 @@ the logs if you ever suspect a module's connection Type is wrong.
   separate from (and larger than) the regular per-`<Tag>` `<Comments>` block, which **is**
   implemented and was verified byte-exact against that same project (see comment-resolution
   section above).
-- **Whole-project L5X fidelity, update**: a full whole-project element-count comparison against a
-  real Studio 5000 L5X export (see "Whole-project element-count verification" below) found and
-  fixed real bugs causing `Tag`/`Module`/`Program`/`Routine`/`Rung` count mismatches — all five
-  are now **exact matches** (0 diff), joining `DataType`/`AddOnInstructionDefinition`. `Description`
-  is also now much closer (was -40, now only short by the module-comment gap above plus a few
-  `<Trend>`/`<Pen>` descriptions, since Trends aren't implemented at all — see above) after fixing
-  a real comment-dedup bug (see below). **`Comment` (rung-level specifically) is now fully
-  solved**: went from only 98 of 582 real rung comments emitted (17%), through 522/582 via a
-  `RegnLink.Dat` chain reading that later turned out to only *approximate* the real mechanism,
-  to **582/582 exact — every comment on exactly the right rung, verified against that project's
-  own Studio 5000 L5X export** — after finding the authoritative fragment→rung mapping in
-  **`RegnLink.Idx`**. See "Rung comments: attribution via RegnLink.Idx" below for the full
-  investigation (including the retraction of an earlier "Rockwell editor quirk" theory that
-  turned out to be our own misreading). Don't assume whole-project L5X output is byte-identical
-  to a real Studio 5000 export just because a specific feature (like tag comments, or these
-  element counts) was verified exact.
+- **Whole-project L5X fidelity — current status (as thoroughly verified as this project has ever
+  been checked)**: a full whole-project element-count comparison against a real Studio 5000 L5X
+  export (see "Whole-project element-count verification" below) found and fixed real bugs causing
+  `Tag`/`Module`/`Program`/`Routine`/`Rung`/`Task` count mismatches — all six are now **exact
+  matches** (0 diff), joining `DataType`/`AddOnInstructionDefinition`. `Comment` (rung-level) is
+  also now an **exact match** (582/582, every one on the exactly right rung, not just the right
+  count — see "Rung comments: attribution via RegnLink.Idx" below) after finding the authoritative
+  fragment→rung mapping in `RegnLink.Idx`. The **only** two remaining, fully-understood (not
+  mysterious) discrepancies against that same real project's L5X, both already covered above: the
+  `Comment` total is short by exactly 570 (the un-implemented `InputTag`/`OutputTag`/
+  `InAliasTag`/`OutAliasTag` module-connection comments) and `Description` is short by exactly 19
+  (16 of the same module-connection kind + 3 un-implemented `<Trend>`/`<Pen>` descriptions) —
+  verified by breaking down both totals element-by-element, not just diffing the raw counts.
+  Tag-level `<Comments>` and rung `<Comment>` content were both independently checked
+  comment-by-comment (not just aggregate counts) against the real export with zero mismatches.
+  Don't assume this same level of fidelity holds for a *different* real project just because one
+  project now checks out this cleanly — re-verify against a fresh real export if it matters.
 - `_decode_udt_initial_value`/`_decode_single_udt_element` (initial-*value* decoding from the
   data-table blob, `elements.py`) has a hardcoded recursion depth limit of 3 nested structs —
   this is a generic safety cap (not tied to any specific type/module), separate from the
@@ -660,7 +661,7 @@ a file real Studio 5000 accepts.** Two separate open questions remain, neither r
 - Some AB module DataType names contain `:` (e.g. `CHANNEL_DI_TIMESTAMP:O:0`), which is invalid
   in Windows paths — anything that turns a comp name into a filename/directory (see
   `DumpCompsRecords` in `elements.py`) needs to sanitize it first.
-- The full suite (`pytest` from repo root) should show `68 passed, 2 skipped, 0 failed`. If you
+- The full suite (`pytest` from repo root) should show `77 passed, 2 skipped, 0 failed`. If you
   see `FileNotFoundError`s or `PermissionError`s across many unrelated test files, first check
   you're not missing the `conftest.py` chdir behavior or that a previous test crashed and left
   a locked SQLite file/build artifact behind.

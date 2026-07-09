@@ -47,7 +47,8 @@ for program in controller.programs:
     for routine in program.routines:
         print(f"  Routine: {routine.name}  [{routine.type}]")
         for i, rung in enumerate(routine.rungs):
-            print(f"    Rung {i}: {rung}")
+            comment = routine._rung_comments.get(i)
+            print(f"    Rung {i}: {rung}" + (f"  // {comment}" if comment else ""))
 
 # Inspect user-defined data types and their members
 for udt in controller.data_types:
@@ -154,7 +155,7 @@ The output is pretty-printed by default. Pass `pretty_print=False` for a compact
 ConvertAcdToL5x("MyController.ACD", "MyController.L5X", pretty_print=False).extract()
 ```
 
-> **Note** — The L5X serialisation captures tags, programs, routines, rungs, UDTs, and AOIs with their initial values, along with per-tag `<Description>` and `<Comments>` blocks. Hardware module metadata (catalog numbers, connection parameters) is not fully round-tripped because Rockwell stores those as opaque CIP identity records rather than as strings, and per-bit comments on I/O module connections (`<Module><Connections><Connection><InputTag>/<OutputTag><Comments>`) are not yet emitted. A whole-project structural comparison against a real Studio 5000 export (one large real-world project) also turned up small, not-yet-root-caused count differences in `<Tag>`/`<Module>`/`<Routine>`/`<Program>`/`<Rung>`/`<Description>` elements — see `CLAUDE.md`'s "Known limitations" for details. Tag-level description/comment fidelity itself was verified byte-exact against that same project.
+> **Note** — The L5X serialisation captures tags, programs, routines, rungs (including rung-level `<Comment>`s), UDTs, and AOIs with their initial values, along with per-tag `<Description>` and `<Comments>` blocks. A whole-project structural comparison against a real, decades-old production Studio 5000 export found `<Tag>`, `<Module>`, `<Routine>`, `<Program>`, `<Rung>`, `<Task>`, `<DataType>`, and `<AddOnInstructionDefinition>` counts to be **exact matches**, and both tag-level `<Comments>` and rung-level `<Comment>` content checked comment-by-comment (not just counted) with **zero mismatches**. The only two known, fully-understood remaining gaps: hardware module metadata (catalog numbers, connection parameters) is not fully round-tripped because Rockwell stores those as opaque CIP identity records rather than as strings, and per-bit comments/descriptions on I/O module connections (`<Module><Connections><Connection><InputTag>/<OutputTag><Comments>`) are not yet emitted — see `CLAUDE.md`'s "Known limitations" for details.
 
 ---
 

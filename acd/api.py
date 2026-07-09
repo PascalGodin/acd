@@ -164,14 +164,41 @@ def _referenced_tag_names(rung_texts) -> set:
     intersect against the project's actual known tag names -- instruction
     mnemonics (XIC, OTE, TON, ...) are harmless false positives here since
     they simply won't match any real tag name afterward.
+
+    A token immediately followed by "(" (optionally with whitespace) is
+    excluded: in RLL syntax this position is always an instruction, AOI, or
+    JSR mnemonic being invoked, never a bare tag operand (a real tag
+    reference is either standalone or followed by "[...]"/"."). Found via a
+    real project where a genuine tag happened to share its name with the
+    AFI (Always False Instruction) mnemonic -- "AFI()" in the rung text
+    wrongly matched that unrelated real tag by name, pulling it in as
+    context even though the rung has nothing to do with it. This exclusion
+    is safe for AOI instance calls too (e.g. "AOI_RPMtoFPM(TestFPM,...)"):
+    the AOI's own mnemonic name isn't a tag and was never meant to be
+    matched here -- it's resolved separately via the instance tag's own
+    data_type field (see _resolve_type_closure()).
+
+    A token immediately preceded by "." is also excluded: in Rockwell
+    address syntax "." always introduces a MEMBER name (e.g. "Length_In" in
+    "ToTrim[Timing.Length_Lug].Length_In"), never a fresh, independent tag
+    reference -- a real tag reference never itself follows a literal ".".
+    Found via the same real project: an unrelated real tag happened to be
+    named "Length_In", coincidentally matching the member-access suffix
+    ".Length_In" in several rungs and getting wrongly pulled in as context.
     """
     import re
     token_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    paren_next_re = re.compile(r"\s*\(")
     names = set()
     for text in rung_texts:
         if not text:
             continue
-        names.update(token_re.findall(text))
+        for m in token_re.finditer(text):
+            if paren_next_re.match(text, m.end()):
+                continue
+            if m.start() > 0 and text[m.start() - 1] == ".":
+                continue
+            names.add(m.group())
     return names
 
 
@@ -444,15 +471,19 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # ad-hoc tag lists rather than going through that generic list-section
     # serialization, so the exclusion was never applied here. Confirmed via
     # a real Studio 5000 import rejecting exactly this: "Error creating
-    # 'Tag[@Name="Remote_TrimmerIO:0:I"]' (Invalid name.)" -- the I/O tag's
-    # *owning Module* is what actually needs to be referenced (already
-    # handled separately by _referenced_modules() for direct rung
-    # references; an alias's I/O target doesn't go through that path today,
-    # so its owning Module isn't picked up this way -- a separate,
-    # not-yet-observed gap. Not clear this Alias/JsX-import combination even
-    # works in this project without the underlying I/O connection already
-    # existing).
+    # 'Tag[@Name="Remote_TrimmerIO:0:I"]' (Invalid name.)".
     program_tags = [t for t in program_tags if not t._l5x_exclude]
+
+    # The I/O tag's *owning Module(s)* (per the rack/slot rule in
+    # _referenced_modules()) ARE what Studio references instead -- verified
+    # against a real Studio export of LS_Read: LngthLmt_16ft's alias target
+    # above needs both "Remote_TrimmerIO" (the rack) and "Trimmer_Inputs"
+    # (the module occupying slot 0 of that rack), even though neither name
+    # appears literally in the routine's own rung text -- only in the
+    # alias's target string. Collected here (any referenced_names entry
+    # that looks like an I/O tag reference) and fed to _referenced_modules()
+    # below alongside the routine's own rungs.
+    alias_io_targets = [name for name in referenced_names if ":" in name]
 
     # Standard Logix scoping: a program-scope tag shadows a same-named
     # controller-scope tag for bare-name operand resolution within that
@@ -488,8 +519,10 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # Modules: verified against the real Motors/Main_Motors export -- see
     # _referenced_modules() for the rack/slot-vs-direct-addressing rule.
     # Each <Module> is an empty Use="Reference" stub (just a name), not a
-    # full definition -- confirmed against the real export.
-    referenced_modules = _referenced_modules(routine.rungs, project)
+    # full definition -- confirmed against the real export. Also scans
+    # alias_io_targets (see above) so an alias's I/O target pulls in its
+    # owning Module(s) too.
+    referenced_modules = _referenced_modules(list(routine.rungs) + alias_io_targets, project)
     modules_xml = "".join(
         f'<Module Use="Reference" Name="{_escape_xml_attr(m.name)}">\n</Module>\n'
         for m in referenced_modules

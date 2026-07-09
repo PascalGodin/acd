@@ -3283,14 +3283,40 @@ class RoutineBuilder(L5xElementBuilder):
                     if not rec_str:
                         continue
                     fragment = rung_content >> 16
+                    # Authoritative lookup: RegnLink.Idx maps the fragment
+                    # directly to the rung's object_id (verified 582/582 exact
+                    # against a real project's own Studio 5000 L5X export --
+                    # see populate_regnlink() and CLAUDE.md "Rung comments").
+                    # A fragment can match several Idx entries (stale entries
+                    # from old index pages survive the file scan), so prefer
+                    # the one naming a live rung of this routine.
+                    rung_index = None
                     self._cur.execute(
-                        "SELECT rung_object_id FROM regnlink WHERE routine_id=? AND fragment=?",
+                        "SELECT rung_object_id FROM regnlink_idx "
+                        "WHERE routine_id=? AND fragment=?",
                         (self._object_id, fragment),
                     )
-                    row = self._cur.fetchone()
-                    if row is None:
-                        continue
-                    rung_index = rung_id_to_index.get(row[0])
+                    idx_uids = [row[0] for row in self._cur.fetchall()]
+                    if idx_uids:
+                        for uid in idx_uids:
+                            rung_index = rung_id_to_index.get(uid)
+                            if rung_index is not None:
+                                break
+                        # Idx entries exist but none names a live rung: the
+                        # comment is genuinely stale -- drop it rather than
+                        # guessing via the unreliable .Dat chain reading.
+                    else:
+                        # No Idx entry at all for this fragment (e.g. the file
+                        # had no readable RegnLink.Idx): fall back to the .Dat
+                        # chain reading -- only reliable for routines whose
+                        # rungs were never reordered/relinked.
+                        self._cur.execute(
+                            "SELECT rung_object_id FROM regnlink WHERE routine_id=? AND fragment=?",
+                            (self._object_id, fragment),
+                        )
+                        row = self._cur.fetchone()
+                        if row is not None:
+                            rung_index = rung_id_to_index.get(row[0])
                     if rung_index is not None and rung_index not in rung_comments:
                         rung_comments[rung_index] = rec_str
         except Exception:

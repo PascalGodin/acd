@@ -350,14 +350,41 @@ rare escape chars, still being chased). Layout:
   key set present varies by tag kind (some omit `RADIX`, InOut params omit `Constant`).
 
 Studio's Import Tags accepts a *subset* CSV (just the preamble + header + the changed rows), so
-an edit doesn't require regenerating all rows. **Open question (decisive, not yet tested in real
-Studio): does Import Tags UPDATE an existing tag's description, or only CREATE missing tags?** A
-minimal one-tag-description-change test CSV was generated for the `20260709` project at
-`...\Bethel_Planer\source\WriteBack_Tests\CSVTEST_update_description.CSV` (changes only
-`LsRead_Start`'s description) to answer this. If it updates → the CSV path solves the
-description/comment edit class outright; build out `export_tags_csv()` as the full exporter. If
-it only creates → descriptions on existing tags need a different channel (routine-import context
-tags, or partial-L5X `export_tag()`).
+an edit doesn't require regenerating all rows.
+
+**Deprioritized per user direction**: the user does not want to rely on CSV import/export as the
+tag-edit mechanism. The format reverse-engineering above is kept for reference (it's real,
+verified-reproducible knowledge), but the active path for tag edits is the routine-carrier
+mechanism below, not `export_tags_csv()`.
+
+### Tag edits via the routine-import overwrite prompt (the active mechanism)
+
+Confirmed by the user: Studio 5000's **Import Routine** dialog offers to overwrite a tag's
+description when the imported file's `<Tag>` context element differs from what's already in the
+project. Since `export_routine()` already embeds a full `<Tag>` definition for every
+controller-/program-scope tag a routine's rung text references (see below), a tag-level edit
+(description, value, ...) can be pushed through the *already-verified* routine-import path with
+no new binary/XML format to trust:
+
+1. Find an existing routine whose rung text already references the target tag by name (a
+   controller-scope tag can be referenced from any routine in the project; a program-scope tag
+   only from routines in its own program).
+2. Edit the tag's description (or other field) on the in-memory `Tag` object.
+3. `export_routine()` that *unmodified* routine — the routine's own logic doesn't change, but the
+   tag's context `<Tag>` element now carries the edit.
+4. Import in Studio; accept the overwrite prompt for the tag.
+
+**Real limitation, measured on the current project** (`BPM_TrimmerSorter_20260709.ACD`): a
+sizeable fraction of tags are never referenced in any routine's ladder or ST text at all —
+**35% of controller-scope base tags, 59% of program-scope base tags** (measured by building the
+full set of identifier tokens across every routine's `rungs` + `_st_lines`, project-wide, and
+checking which base — non-Alias, non-I/O — tags never appear; the project has no FBD/SFC
+routines, ruling that out as an explanation). These are presumably HMI/SCADA-only or legacy tags.
+**This is not a bug to work around**: per the user, this should replicate what Studio's own
+"Export Routine"/"Export Component" does, which likewise only includes what a routine actually
+references — a tag with no logic reference wouldn't be in Studio's own export either. Tags in
+this category are simply out of scope for the routine-carrier mechanism; no fallback (like
+synthesizing a dead-code reference) has been built, pending a decision on whether one is wanted.
 
 ## Partial/context L5X exports (`export_routine()`)
 
@@ -455,6 +482,38 @@ it, so its necessity hasn't been isolated), and scenarios beyond a single UDT ar
 (nested UDTs within UDTs, AOI-typed members, multi-dimensional UDT arrays) haven't been
 exercised through `export_routine()` specifically yet (though the underlying `_l5k_udt_literal`/
 `_udt_scalar_to_xml` recursion has been separately verified for nested cases in other contexts).
+
+12. **UDT/AOI dependency closure was single-level and AOI-blind — fixed, but the AOI part is
+    unverified.** The user clarified the intent directly: replicate what Studio's own routine
+    export does, "including UDT, AOI, MODULES, Etc" as transitive dependencies. Auditing the code
+    found two real gaps: `referenced_data_types` only checked the data type of *directly*
+    referenced tags (a UDT containing another project UDT as a member wouldn't pull that inner
+    UDT in), and `project.controller.aois` was never consulted at all — an AOI instruction call in
+    a rung (e.g. `AOI_RPMtoFPM(TestFPM,VFD_P_INTBL2:I.OutputFreq);`, a real rung in
+    `Motors/Main_Motors`) has its AOI name resolved through the instance tag's own `data_type`
+    field (here `TestFPM.data_type == "AOI_RPMtoFPM"`) exactly like a UDT tag, but the AOI
+    collection was simply never searched. `_resolve_type_closure()` (`acd/api.py`) now does a
+    proper worklist-based transitive closure over both `project.controller.data_types` and
+    `project.controller.aois` (following a UDT's own members, and an AOI's own parameters/local
+    tags, for further nested dependencies), and `export_routine()` emits a conditional
+    `<AddOnInstructionDefinitions Use="Context">` block (only when at least one AOI is actually
+    referenced — confirmed to leave the already-verified no-AOI case byte-for-byte unaffected).
+    **The UDT-closure half is low-risk** (same mechanism already verified, just transitively
+    closed). **The AOI section's placement (right after `</DataTypes>`, before `<Tags>`) and even
+    whether Studio wants it wrapped in `Use="Context"` at all is a reasoned-by-analogy guess, NOT
+    verified against a real Studio export that has an AOI dependency** — unlike literally
+    everything else in this wrapper, which was calibrated against real Studio output before
+    trusting an import (see the `Use=` crash story above — guessing at this exact class of
+    structural placement has bitten this project before). **Module dependencies are not handled
+    at all yet**: that same `Motors/Main_Motors` rung's second argument
+    (`VFD_P_INTBL2:I.OutputFreq`) is an I/O tag reference, and whether/how a real Studio routine
+    export includes the owning `<Module>` definition for this is completely unknown — I/O tag
+    names contain a `:` and aren't picked up by the plain-identifier `_referenced_tag_names`
+    scan at all currently, so this needs its own investigation once real ground truth exists.
+    **The concrete next step**: a real Studio 5000 "Export Routine" of `Motors/Main_Motors` from
+    `BPM_TrimmerSorter_20260709.ACD` exercises both open questions in one file — requested from
+    the user, not yet obtained as of this writing. A generated (unverified) sample based on the
+    current code is at `...\Bethel_Planer\source\WriteBack_Tests\CALIBRATION_Main_Motors.L5X`.
 
 ## Routine-level Description (leading XML comment newline pitfall)
 

@@ -210,6 +210,24 @@ for (program_name, routine_name), changes in diff.items():
     print("  added:  ", changes["added"])
 ```
 
+**Already have two specific `Routine` objects** (e.g. you found "the same" routine by name in two
+different projects) and just want that one routine's diff? Use `diff_routine()` instead of a
+whole-project scan — and don't manually zip/print `routine_a.rungs` and `routine_b.rungs` side by
+side by index to eyeball it: a single rung inserted or removed anywhere shifts every later rung's
+index, making an otherwise-unchanged tail look completely different in a naive side-by-side
+printout even though nothing there actually changed:
+
+```python
+from acd import diff_routine
+
+print(diff_routine(routine_a, routine_b))
+# {'status': 'changed', 'changes': [{'op': 'delete',
+#   'old': ['JSR(P_Landing,0);', 'JSR(Storage_Table,0)...', 'JSR(Planer_Outfeed,0);'],
+#   'new': []}]}
+# -- the other rungs (which shifted position by 3) are correctly recognized
+# as unchanged and don't appear in "changes" at all.
+```
+
 `find_io_addresses(text)` extracts the raw list of I/O addresses from a single rung/ST-line;
 `io_addresses_by_routine(project)` gives the whole project's routine-by-routine breakdown without
 diffing.

@@ -2894,6 +2894,16 @@ def _resolve_tag_name_from_oid(cur, oid: int) -> Union[str, None]:
 
 @dataclass
 class TagBuilder(L5xElementBuilder):
+    # Project-wide, identical for every tag (see _build_hex_oid_map) -- pass
+    # it in from the caller's own single project-wide build instead of
+    # rebuilding it here per tag. A real project (2725 controller tags +
+    # program tags) took 90s to load_acd() before this fix, ~82s of which
+    # was this same global query re-run once per tag (3872 times); passing
+    # a pre-built map in cut that to a fraction of a second. Falls back to
+    # building it locally (the old, slow behavior) only if a caller
+    # constructs TagBuilder directly without providing one.
+    _hex_oid_map: Union[Dict[int, str], None] = None
+
     def build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -3060,7 +3070,10 @@ class TagBuilder(L5xElementBuilder):
         # Resolve !HEXOID references to member names for non-I/O tags.
         # I/O tags keep their !HEXOID refs for ControllerBuilder resolution.
         if ":" not in tag_name:
-            hex_oid_map = _build_hex_oid_map(self._cur)
+            hex_oid_map = (
+                self._hex_oid_map if self._hex_oid_map is not None
+                else _build_hex_oid_map(self._cur)
+            )
             if hex_oid_map:
                 resolved_comments = []
                 for ref, text in comment_results:
@@ -3860,6 +3873,7 @@ class AoiBuilder(L5xElementBuilder):
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _redundancy_enabled: bool = field(default=False)
+    _hex_oid_map: Union[Dict[int, str], None] = None
 
     def build(self) -> Program:
         self._cur.execute(
@@ -3948,7 +3962,7 @@ class ProgramBuilder(L5xElementBuilder):
             # record_type exclusion, not a blanket "only 256" filter.
             results = self._cur.fetchall()
             for result in results:
-                tag = TagBuilder(self._cur, result[1]).build()
+                tag = TagBuilder(self._cur, result[1], self._hex_oid_map).build()
                 tag._data_types_map = self._data_types_map
                 # Decode UDT initial values now that data_types_map is available.
                 # Multi-dimensional arrays are supported: _decode_udt_initial_value
@@ -4196,10 +4210,20 @@ class ControllerBuilder(L5xElementBuilder):
         # record_type=264 marks internal AOI default-value bookkeeping entries -- see
         # the identical filter (and full rationale) in ProgramBuilder's tag query above.
         results = self._cur.fetchall()
+
+        # Built ONCE here and threaded through every TagBuilder/ProgramBuilder
+        # call below -- it's an identical, project-wide map (see
+        # _build_hex_oid_map's own docstring), not specific to any one tag.
+        # Previously rebuilt from scratch inside TagBuilder.build() for every
+        # single tag (thousands of times project-wide), re-running the same
+        # full-project SQL join each time -- the dominant cost of load_acd()
+        # for a real project (measured: ~82s of a 90s total load).
+        hex_oid_map = _build_hex_oid_map(self._cur)
+
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tag = TagBuilder(self._cur, _tag_object_id).build()
+            tag = TagBuilder(self._cur, _tag_object_id, hex_oid_map).build()
             tag._data_types_map = data_types_map
             # Decode UDT initial values now that data_types_map is available.
             # Multi-dimensional arrays are supported: _decode_udt_initial_value
@@ -4329,7 +4353,9 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled).build()
+                ProgramBuilder(
+                    self._cur, _program_object_id, data_types_map, redundancy_enabled, hex_oid_map
+                ).build()
             )
 
         # Build comment_id → program name map for task scheduled-program resolution.

@@ -20,6 +20,14 @@ with concrete attribute paths; check those with `help()` before guessing
 at the object shape. See this package's README.md for full usage examples,
 and CLAUDE.md for internals/gotchas if modifying this library itself.
 
+Comparing I/O wiring between two projects/saves (e.g. "what I/O addresses
+changed between these two ACDs?"): use `diff_io_addresses(project_a,
+project_b)`, NOT a hand-rolled regex over rung text -- I/O addresses like
+"Remote_GraderConsole:3:I.Pt13.Data" or "IO024:I.Data[0].13" are easy to
+mis-tokenize, and comparing two routines' rungs by index breaks (IndexError)
+the moment they have a different rung count, which routinely happens even
+between two saves of what is otherwise "the same" routine.
+
 Writing changes back to a real `.ACD` that Studio 5000 will open: prefer
 `export_routine()` (a partial L5X imported via Studio's own "Import
 Routine" feature) over `save_acd()`/`patch_rungs()` -- Studio enforces a
@@ -28,4 +36,12 @@ key it does not have, so `save_acd()` only produces an openable file for a
 completely unmodified round-trip.
 """
 
-from acd.api import load_acd, save_acd, patch_rungs, export_routine  # noqa: F401
+from acd.api import (  # noqa: F401
+    load_acd,
+    save_acd,
+    patch_rungs,
+    export_routine,
+    find_io_addresses,
+    io_addresses_by_routine,
+    diff_io_addresses,
+)

@@ -162,6 +162,33 @@ ConvertAcdToL5x("MyController.ACD", "MyController.L5X", pretty_print=False).extr
 
 ---
 
+### Comparing I/O addresses between two projects
+
+Finding where I/O wiring changed between two ACDs (two saves of the same project, or two related
+variants) without hand-writing a regex over rung text:
+
+```python
+from acd import load_acd, diff_io_addresses
+
+project_a = load_acd("MyController_v1.ACD")
+project_b = load_acd("MyController_v2.ACD")
+
+diff = diff_io_addresses(project_a, project_b)
+for (program_name, routine_name), changes in diff.items():
+    print(program_name, routine_name)
+    print("  removed:", changes["removed"])
+    print("  added:  ", changes["added"])
+```
+
+Only routines with an actual I/O address difference appear in the result. This compares by
+*address set*, not by rung position — two routines with a different rung count (very common even
+between two saves of "the same" logic) still diff correctly instead of raising `IndexError`. For a
+single rung/ST-line, `find_io_addresses(text)` returns the raw list of addresses found
+(`"IO024:I.Data[0].13"`, `"Remote_GraderConsole:3:I.Pt13.Data"`, `"Local:10:I.Data.11"`, ...); for
+a whole project's routine-by-routine breakdown without diffing, use `io_addresses_by_routine(project)`.
+
+---
+
 ### Editing a project and getting the change into Studio 5000
 
 **`save_acd()` alone will NOT produce a file real Studio 5000 accepts if anything changed.** Studio

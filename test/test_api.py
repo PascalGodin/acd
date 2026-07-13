@@ -8,6 +8,9 @@ from acd.api import (
     Extract,
     ExtractAcdDatabase,
     DumpCompsRecordsToFile,
+    find_io_addresses,
+    io_addresses_by_routine,
+    diff_io_addresses,
 )
 
 
@@ -69,3 +72,79 @@ def test_st_routine_content():
     assert '<Line Number="0"><![CDATA[' in xml
     # Line numbering must match source positions (blank lines preserved)
     assert f'<Line Number="{len(st._st_lines) - 1}">' in xml
+
+
+def test_find_io_addresses():
+    """A real I/O address always contains ':' (Rockwell reserves it for
+    module addressing) so this must never match a plain UDT member path."""
+    assert find_io_addresses(
+        "XIC(Sorter_VFD:I.DriveStatus_Active)GT(Sorter_LPM,20)TON(Timer[8],?,?);"
+    ) == ["Sorter_VFD:I.DriveStatus_Active"]
+    assert find_io_addresses(
+        "XIC(Remote_GraderConsole:1:I.Pt14.Data)ONS(BF_Override_ONS);"
+    ) == ["Remote_GraderConsole:1:I.Pt14.Data"]
+    assert find_io_addresses("MOVE(IO026:I.Data[0],I_26_0);") == ["IO026:I.Data[0]"]
+    assert find_io_addresses(
+        "XIC(M304_Sorter_Lug_Chain.VFD.Running)GT(Sorter_LPM,20);"
+    ) == []
+    assert find_io_addresses(
+        "XIO(Remote_MCC050:2:O.Pt08.Data)XIO(Remote_MCC050:1:I.Pt08.Data);"
+    ) == ["Remote_MCC050:2:O.Pt08.Data", "Remote_MCC050:1:I.Pt08.Data"]
+    assert find_io_addresses("") == []
+    assert find_io_addresses(None) == []
+
+
+def test_io_addresses_by_routine_and_diff():
+    """io_addresses_by_routine()/diff_io_addresses() must not assume two
+    routines' rungs line up by index -- a routine with a different rung
+    count between two projects should still diff cleanly by address set,
+    not raise IndexError."""
+    importer = ImportProjectFromFile(
+        Path(os.path.join("..", "resources", "CuteLogix.ACD"))
+    )
+    project: RSLogix5000Content = importer.import_project()
+    by_routine = io_addresses_by_routine(project)
+    assert isinstance(by_routine, dict)
+    for key in by_routine:
+        assert isinstance(key, tuple) and len(key) == 2
+
+    # Identical project vs itself: no I/O address differences anywhere.
+    assert diff_io_addresses(project, project) == {}
+
+
+def test_diff_io_addresses_survives_mismatched_rung_counts():
+    """The bug this exists to prevent: a naive "zip rung i of A with rung i
+    of B" comparison raises IndexError the moment two routines have a
+    different rung count -- diff_io_addresses() must handle that cleanly by
+    comparing address sets instead of positions."""
+    from types import SimpleNamespace
+
+    def make_project(program_name, routine_name, rungs):
+        routine = SimpleNamespace(name=routine_name, rungs=rungs, _st_lines=[])
+        program = SimpleNamespace(name=program_name, routines=[routine])
+        controller = SimpleNamespace(programs=[program], aois=[])
+        return SimpleNamespace(controller=controller)
+
+    project_a = make_project(
+        "MainProgram",
+        "R01",
+        [
+            "XIC(Local:10:I.Data.11)OTE(Foo);",
+            "XIC(IO024:I.Data[0].13)OTE(Bar);",
+        ],
+    )
+    project_b = make_project(
+        "MainProgram",
+        "R01",
+        [
+            "XIC(Local:10:I.Data.11)OTE(Foo);",
+            "XIC(Remote_GraderConsole:3:I.Pt13.Data)OTE(Bar);",
+            "XIC(Baz)OTE(Qux);",  # extra rung, no I/O address at all
+        ],
+    )
+
+    diff = diff_io_addresses(project_a, project_b)
+    key = ("MainProgram", "R01")
+    assert diff[key]["removed"] == ["IO024:I.Data[0].13"]
+    assert diff[key]["added"] == ["Remote_GraderConsole:3:I.Pt13.Data"]
+    assert diff[key]["common"] == ["Local:10:I.Data.11"]

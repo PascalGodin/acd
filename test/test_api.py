@@ -11,6 +11,7 @@ from acd.api import (
     find_io_addresses,
     io_addresses_by_routine,
     diff_io_addresses,
+    diff_project,
 )
 
 
@@ -148,3 +149,65 @@ def test_diff_io_addresses_survives_mismatched_rung_counts():
     assert diff[key]["removed"] == ["IO024:I.Data[0].13"]
     assert diff[key]["added"] == ["Remote_GraderConsole:3:I.Pt13.Data"]
     assert diff[key]["common"] == ["Local:10:I.Data.11"]
+
+
+def test_diff_project_covers_routines_tags_and_names():
+    """diff_project() is the generic "what changed" entry point -- it must
+    handle a routine with a different rung count between the two projects
+    (the same IndexError-prone shape diff_io_addresses() guards against),
+    plus tag value/description changes and data-type/module/AOI presence
+    changes, all in one call."""
+    from types import SimpleNamespace
+
+    def make_project(rungs_a_style):
+        tag_foo = SimpleNamespace(
+            name="Foo", data_type="DINT", description="original", _initial_value=1
+        )
+        tag_bar = SimpleNamespace(
+            name="Bar", data_type="DINT", description="original", _initial_value=2
+        )
+        routine = SimpleNamespace(
+            name="R01", type="RLL", rungs=rungs_a_style, _st_lines=[]
+        )
+        program = SimpleNamespace(name="MainProgram", routines=[routine], tags=[tag_bar])
+        controller = SimpleNamespace(
+            programs=[program],
+            aois=[],
+            tags=[tag_foo],
+            data_types=[SimpleNamespace(name="MY_UDT")],
+            modules=[SimpleNamespace(name="Local")],
+        )
+        return SimpleNamespace(controller=controller)
+
+    project_a = make_project(["XIC(Foo)OTE(Bar);", "XIC(Baz)OTE(Qux);"])
+    project_b = make_project(
+        ["XIC(Foo)OTE(Bar);", "XIC(Baz)OTE(Qux);", "XIC(Extra)OTE(Rung);"]
+    )
+    # Change a tag's description/value on the "b" side.
+    project_b.controller.tags[0].description = "changed"
+    project_b.controller.tags[0]._initial_value = 99
+    # Add a data type and remove a module on the "b" side.
+    project_b.controller.data_types.append(SimpleNamespace(name="MY_UDT_2"))
+    project_b.controller.modules = []
+
+    diff = diff_project(project_a, project_b)
+
+    routine_key = ("MainProgram", "R01")
+    assert diff["routines"][routine_key]["status"] == "changed"
+    changes = diff["routines"][routine_key]["changes"]
+    assert any(c["op"] == "insert" and c["new"] == ["XIC(Extra)OTE(Rung);"] for c in changes)
+
+    tag_key = ("", "Foo")
+    assert diff["tags"][tag_key]["status"] == "changed"
+    assert diff["tags"][tag_key]["changed"]["description"] == {
+        "old": "original",
+        "new": "changed",
+    }
+    assert diff["tags"][tag_key]["changed"]["value"] == {"old": 1, "new": 99}
+
+    assert diff["data_types"] == {"added": ["MY_UDT_2"], "removed": []}
+    assert diff["modules"] == {"added": [], "removed": ["Local"]}
+    assert "aois" not in diff  # identical (both empty) -- omitted entirely
+
+    # Identical project vs itself: no differences of any kind.
+    assert diff_project(project_a, project_a) == {}

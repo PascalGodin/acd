@@ -20,13 +20,18 @@ with concrete attribute paths; check those with `help()` before guessing
 at the object shape. See this package's README.md for full usage examples,
 and CLAUDE.md for internals/gotchas if modifying this library itself.
 
-Comparing I/O wiring between two projects/saves (e.g. "what I/O addresses
-changed between these two ACDs?"): use `diff_io_addresses(project_a,
-project_b)`, NOT a hand-rolled regex over rung text -- I/O addresses like
-"Remote_GraderConsole:3:I.Pt13.Data" or "IO024:I.Data[0].13" are easy to
-mis-tokenize, and comparing two routines' rungs by index breaks (IndexError)
-the moment they have a different rung count, which routinely happens even
-between two saves of what is otherwise "the same" routine.
+Comparing two projects/saves -- for a GENERIC "what changed between these two
+ACDs?" request (routines, tags, data types, modules, AOIs), use
+`diff_project(project_a, project_b)`. Only reach for the narrower
+`diff_io_addresses(project_a, project_b)` when the request is SPECIFICALLY
+about I/O address wiring (e.g. "what I/O addresses changed?") -- it reports
+nothing about tag values, rung logic changes, or anything else, so it is
+the wrong default for a broad comparison. Both avoid a hand-rolled regex
+over rung text (I/O addresses like "Remote_GraderConsole:3:I.Pt13.Data" or
+"IO024:I.Data[0].13" are easy to mis-tokenize) and both compare routines by
+aligning rung/ST-line content instead of zipping by index, which breaks
+(IndexError) the moment two routines have a different rung count -- this
+happens even between two saves of what is otherwise "the same" routine.
 
 Writing changes back to a real `.ACD` that Studio 5000 will open: prefer
 `export_routine()` (a partial L5X imported via Studio's own "Import
@@ -44,4 +49,5 @@ from acd.api import (  # noqa: F401
     find_io_addresses,
     io_addresses_by_routine,
     diff_io_addresses,
+    diff_project,
 )

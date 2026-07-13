@@ -1,3 +1,4 @@
+import difflib
 import os
 import re
 import tempfile
@@ -7,7 +8,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 from acd.integrity import (
     FILEINFO_LENGTH,
@@ -260,12 +261,17 @@ def io_addresses_by_routine(project: RSLogix5000Content) -> Dict[Tuple[str, str]
 def diff_io_addresses(
     project_a: RSLogix5000Content, project_b: RSLogix5000Content
 ) -> Dict[Tuple[str, str], Dict[str, List[str]]]:
-    """Compare I/O address usage between two projects (e.g. two saves/versions
-    of the same controller) routine by routine, without assuming the two
-    routines' rungs/lines line up by index -- the naive "zip rung i of A with
-    rung i of B" approach breaks (IndexError) the moment a routine gained or
-    lost a rung between the two saves, even when the actual I/O wiring is
-    unchanged.
+    """Compare ONLY I/O address usage between two projects -- for a general
+    "what changed between these two projects" comparison (routines, tags,
+    data types, modules, AOIs), use diff_project() instead. Do not reach for
+    this function by default just because it has "diff" in the name; it
+    reports nothing about non-I/O tag values, rung logic, descriptions, etc.
+
+    Compares two projects (e.g. two saves/versions of the same controller)
+    routine by routine, without assuming the two routines' rungs/lines line
+    up by index -- the naive "zip rung i of A with rung i of B" approach
+    breaks (IndexError) the moment a routine gained or lost a rung between
+    the two saves, even when the actual I/O wiring is unchanged.
 
     Returns one entry per (program_name, routine_name) key (see
     io_addresses_by_routine()) that differs between the two projects --
@@ -288,6 +294,137 @@ def diff_io_addresses(
             "added": sorted(set_b - set_a),
             "common": sorted(set_a & set_b),
         }
+    return diff
+
+
+def _routine_lines(routine: Routine) -> List[str]:
+    return routine.rungs if routine.type == "RLL" else routine._st_lines
+
+
+def _all_routines(project: RSLogix5000Content) -> Dict[Tuple[str, str], Routine]:
+    result: Dict[Tuple[str, str], Routine] = {}
+    for program in project.controller.programs:
+        for routine in program.routines:
+            result[(program.name, routine.name)] = routine
+    for aoi in project.controller.aois:
+        for routine in aoi.routines:
+            result[(f"AOI:{aoi.name}", routine.name)] = routine
+    return result
+
+
+def _diff_routines(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -> dict:
+    routines_a = _all_routines(project_a)
+    routines_b = _all_routines(project_b)
+    diff = {}
+    for key in sorted(set(routines_a) | set(routines_b)):
+        ra, rb = routines_a.get(key), routines_b.get(key)
+        if ra is None:
+            diff[key] = {"status": "added", "lines": _routine_lines(rb) or []}
+            continue
+        if rb is None:
+            diff[key] = {"status": "removed", "lines": _routine_lines(ra) or []}
+            continue
+        lines_a, lines_b = _routine_lines(ra) or [], _routine_lines(rb) or []
+        if lines_a == lines_b:
+            continue
+        changes = []
+        matcher = difflib.SequenceMatcher(a=lines_a, b=lines_b, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            changes.append({"op": tag, "old": lines_a[i1:i2], "new": lines_b[j1:j2]})
+        diff[key] = {"status": "changed", "changes": changes}
+    return diff
+
+
+def _all_tags(project: RSLogix5000Content) -> dict:
+    result = {}
+    for tag in project.controller.tags:
+        result[("", tag.name)] = tag
+    for program in project.controller.programs:
+        for tag in program.tags:
+            result[(program.name, tag.name)] = tag
+    return result
+
+
+def _diff_tags(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -> dict:
+    tags_a, tags_b = _all_tags(project_a), _all_tags(project_b)
+    diff = {}
+    for key in sorted(set(tags_a) | set(tags_b)):
+        ta, tb = tags_a.get(key), tags_b.get(key)
+        if ta is None or tb is None:
+            diff[key] = {"status": "added" if ta is None else "removed"}
+            continue
+        changed = {}
+        if ta.data_type != tb.data_type:
+            changed["data_type"] = {"old": ta.data_type, "new": tb.data_type}
+        if ta.description != tb.description:
+            changed["description"] = {"old": ta.description, "new": tb.description}
+        if ta._initial_value != tb._initial_value:
+            changed["value"] = {"old": ta._initial_value, "new": tb._initial_value}
+        if changed:
+            diff[key] = {"status": "changed", "changed": changed}
+    return diff
+
+
+def _diff_names(objs_a, objs_b) -> Union[dict, None]:
+    names_a = {o.name for o in objs_a}
+    names_b = {o.name for o in objs_b}
+    if names_a == names_b:
+        return None
+    return {"added": sorted(names_b - names_a), "removed": sorted(names_a - names_b)}
+
+
+def diff_project(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -> dict:
+    """General-purpose structural diff between two projects (e.g. two saves,
+    or two related variants of the same controller) -- routines, tags, data
+    types, modules, and AOIs. Use this for a broad/generic "what changed"
+    comparison; use diff_io_addresses() only when specifically asked about
+    I/O address wiring.
+
+    Returns a dict with up to five keys, each populated only where something
+    actually differs (an empty dict means no differences found at all):
+
+      "routines": {(program_name, routine_name): {...}, ...}
+          "status": "added"/"removed"/"changed".
+          "added"/"removed" entries include the routine's full rungs/ST
+          lines under "lines". "changed" entries include "changes": a list
+          of {"op": "replace"/"delete"/"insert", "old": [...], "new": [...]}
+          blocks from aligning the two routines' rung/line lists with
+          difflib.SequenceMatcher -- NOT a naive index-by-index zip, so a
+          routine with a different rung count between the two projects
+          (routine) diffs correctly instead of raising IndexError. AOI
+          logic routines are keyed as ("AOI:<name>", routine_name).
+
+      "tags": {(program_name_or_"", tag_name): {...}, ...}
+          "" as the first key element means controller-scope. "status":
+          "added"/"removed"/"changed", where "changed" includes a
+          "changed" dict naming which of data_type/description/value
+          differ (each as {"old": ..., "new": ...}).
+
+      "data_types" / "modules" / "aois": {"added": [...], "removed": [...]}
+          Presence-only (by name) -- this does NOT diff UDT member
+          layout, module connection/RPI details, or AOI parameters; for
+          that, compare the relevant objects directly (e.g.
+          project.controller.data_types) or render both to L5X and diff
+          the XML.
+    """
+    diff = {}
+    routines = _diff_routines(project_a, project_b)
+    if routines:
+        diff["routines"] = routines
+    tags = _diff_tags(project_a, project_b)
+    if tags:
+        diff["tags"] = tags
+    data_types = _diff_names(project_a.controller.data_types, project_b.controller.data_types)
+    if data_types:
+        diff["data_types"] = data_types
+    modules = _diff_names(project_a.controller.modules, project_b.controller.modules)
+    if modules:
+        diff["modules"] = modules
+    aois = _diff_names(project_a.controller.aois, project_b.controller.aois)
+    if aois:
+        diff["aois"] = aois
     return diff
 
 

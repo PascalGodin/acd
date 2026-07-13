@@ -39,8 +39,23 @@ def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
 
     Args:
         path: Path to the .ACD file.
-        temp_dir: Directory for SQLite and extracted files.  A temporary
-            directory is created and cleaned up automatically if omitted.
+        temp_dir: Directory for SQLite and extracted files. If omitted
+            (the normal case), a directory is created under the OS temp
+            location (`tempfile.mkdtemp()` -- e.g. under
+            "%LOCALAPPDATA%/Temp/" on Windows, NOT next to `path`) and
+            deleted again before this function returns. Pass an
+            explicit `temp_dir` if you want the extracted `.Dat`/`.Idx`
+            files and SQLite DB left on disk afterward for inspection --
+            they are NOT cleaned up when you supply this yourself.
+
+            This differs from the lower-level `ExportL5x` class (which
+            `load_acd()` wraps): with no `temp_dir` given, `ExportL5x`
+            defaults to a folder next to the source file itself
+            (`<dir>/<stem>/`, e.g. `MyController.ACD` ->
+            `MyController/`) and leaves it in place -- the two entry
+            points intentionally behave differently (`load_acd()` favors a
+            clean one-shot load; `ExportL5x` favors leaving artifacts
+            around for a debugging/exploration session).
 
     Returns:
         RSLogix5000Content with a fully populated controller object tree.

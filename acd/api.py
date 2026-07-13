@@ -90,10 +90,25 @@ def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
     cleanup = temp_dir is None
     if cleanup:
         temp_dir = tempfile.mkdtemp(prefix="acd_load_")
+    exporter = None
     try:
         exporter = ExportL5x(str(path), temp_dir)
         return exporter.project
     finally:
+        # The SQLite connection must be closed BEFORE rmtree, or the open
+        # acd.db file keeps the temp directory locked on Windows -- rmtree
+        # then silently fails (ignore_errors=True swallows the
+        # PermissionError) and the "auto-deleted" directory is left behind
+        # on disk forever, not just until some later cleanup. Found via a
+        # real user report ("does the temp folder stay active until
+        # reboot?") after directly confirming the directory survived a
+        # completed load_acd() call. Safe to close here: .project/
+        # .controller are lazily built and cached on first access (see
+        # ExportL5x.project/.controller), so the object graph returned
+        # above is already fully materialized in plain Python objects with
+        # no further dependency on the connection.
+        if exporter is not None:
+            exporter.close()
         if cleanup:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

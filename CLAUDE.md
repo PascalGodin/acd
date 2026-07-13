@@ -309,6 +309,22 @@ Number="N"><![CDATA[...]]></Line>...</STContent>` — verified line-for-line aga
 automatically wherever `RoutineBuilder` runs. Adapted from an open, unmerged PR against
 `hutcheb/acd` (our upstream) after independently re-verifying the layout against our own fixtures.
 
+**A second, distinct "not a real line" case, found via a real false-positive routine diff**: some
+`0x01000002` records — same record type as genuine source lines — carry sequence number
+`0xFFFFFFFF` (u32 sentinel) instead of a real ordinal. These are a shadow/compiled copy of part of
+the routine's logic (observed: the ladder-equivalent body backing a `for`-loop's semantics,
+`ADD`/`CMP`/`MOVE`/`SIZE`/`SUB` instruction-call syntax, not valid ST), not source Studio ever
+displays. `_st_routine_lines()` used to sort all lines by `(seq, text)` with no sentinel check, so
+these all-`0xFFFFFFFF`-seq records tied on the primary key and fell back to sorting by their own
+(still-unresolved) `@hexid@` text — which differs between any two saves of the *same* routine
+simply because each save assigns different object ids to the same tags, producing a spurious,
+save-dependent order for lines Studio never even shows. Root-caused by comparing the exact same
+routine (`S01_Next_Board_Search`) across two real saves of one project that a user reported as
+"identical" despite our tool reporting 4 differing lines — after excluding `seq==0xFFFFFFFF`
+records, the remaining (real, numbered) lines were byte-for-byte identical between the two saves,
+confirming both the fix and that the excluded records were never genuine source. Fixed by skipping
+`seq == 0xFFFFFFFF` records entirely in `_st_routine_lines()`.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*

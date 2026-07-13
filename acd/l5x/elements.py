@@ -3597,6 +3597,17 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
             if struct.unpack_from("<I", rec, 4)[0] != _ST_LINE_RECORD_TYPE:
                 continue
             seq = struct.unpack_from("<I", rec, 20)[0]
+            if seq == 0xFFFFFFFF:
+                # Sentinel "no sequence assigned" -- a shadow/compiled copy of
+                # the routine's logic (e.g. a FOR-loop's ladder-equivalent
+                # body), not real numbered source text. Sorting these in with
+                # genuine lines makes their relative order fall back to a raw
+                # (unresolved @hexid@) text comparison, which differs between
+                # otherwise-identical saves purely because object ids differ
+                # -- and Studio 5000 never displays them as source lines at
+                # all. Confirmed via a real project: two saves of the same
+                # routine, textually identical once these are excluded.
+                continue
             text, _ = _parse_fffeff(rec, 24)
             lines.append((seq, text))
     if not lines:

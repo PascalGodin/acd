@@ -1189,6 +1189,25 @@ steers away from itself, not just describes what it does.
   NOT diff UDT member layout, module connection/RPI details, or AOI parameters; documented as a
   known scope limit in the function's own docstring rather than silently doing something partial.
 
+**Second follow-up, found the very next time a downstream LLM actually used `diff_project()` on a
+real large project pair**: it technically worked, but the "tags" section dumped every changed
+tag's FULL old/new `_initial_value` inline — for a UDT array tag that's a list of dozens of
+per-element dicts, so one real comparison (`BPM_TrimmerSorter_20260713.ACD` vs
+`BPM_TrimmerSorter_VAB_20260713.ACD`, 1601 changed tags) produced an unreadable wall of raw numeric
+noise that overflowed the LLM's context before it could even start summarizing. `_diff_tags()` now
+runs each tag's `"value"` entry through `_summarize_value_diff()`: values under 200 chars of
+`repr()` are still shown in full (`{"old": ..., "new": ...}`), but a large list is reduced to
+`{"summary": "list[N] vs list[M]: K of N common elements differ", "differing_indices": [...]
+(first 10)}` and a large dict similarly to `{"summary": ..., "differing_keys": [...] (first 10)}`
+— callers can tell which shape they got by checking for a `"summary"` key vs `"old"`/`"new"` keys.
+Verified against the same real project pair: total `repr()` size of the whole diff dropped from
+"too large to read" to ~468KB (290 of 1018 changed-value tags actually needed summarizing; the
+rest were small scalars shown in full) — the routines/tags sections can still legitimately be
+large for two *genuinely very different* projects (this pair is a mill vs. a substantially
+different VAB variant, not two saves of the same logic), so don't expect `diff_project()` output
+to always be small; the fix targets the *per-value* blowup, not the *aggregate* size when the
+underlying projects really do differ everywhere.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

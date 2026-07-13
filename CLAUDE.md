@@ -453,6 +453,21 @@ native `LS_Read.L5X` export — no errors, only the expected/normal "tag exists 
 messages for I/O tags (see below), and the tag description overwrite applied successfully. The
 routine-carrier mechanism is proven end-to-end for the tag-description-edit case.
 
+**Second edit class also confirmed end-to-end: creating a brand-new tag from scratch** (not
+editing an existing one). Test: a controller-scope `Tag` object constructed directly in Python
+(never existing anywhere in the ACD, name `ACDTOOLS_NEW_TAG_TEST`, `DINT`, value 42, with a
+description), appended to `project.controller.tags`, referenced via one new rung appended to
+`LS_Read` (`XIC(Always_Off)MOV(42,ACDTOOLS_NEW_TAG_TEST);` — guarded by `Always_Off`, a tag
+conventionally always 0, so the rung can never execute; it exists purely so
+`_referenced_tag_names()` picks up the new tag as context). Exported via the same
+`export_routine()` path and imported into real Studio 5000 successfully, confirmed by the user
+("everything worked as expected") — Studio created the new tag and added the new (dead) rung with
+no errors. Both core edit classes the routine-carrier mechanism needs to support (editing an
+existing tag's fields, and introducing a brand-new tag) are now proven end-to-end against real
+Studio 5000, using the exact same code path with no special-casing required for "new" vs
+"existing" — Studio itself decides create-vs-overwrite based on whether the name already exists
+in the project.
+
 **Confirmed normal, not a gap**: Studio's own Import Routine comparison shows "tag exists in
 project only" for `IO042:I` and `Remote_TrimmerIO:0:I` (I/O tags backed by `AB:` module-defined
 datatypes) when importing our file — but the user independently confirmed Studio's own *native*

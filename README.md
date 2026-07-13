@@ -188,7 +188,12 @@ for key, tag_diff in diff.get("tags", {}).items():
 Routine content is compared with `difflib.SequenceMatcher` alignment, not a naive index-by-index
 zip — two routines with a different rung count (very common even between two saves of "the same"
 logic) still diff correctly instead of raising `IndexError`. Data types/modules/AOIs are compared
-by name presence only (added/removed), not deep member/parameter layout.
+by name presence only (added/removed), not deep member/parameter layout. A tag's `"value"` entry
+is shown in full for small/scalar values, but a large container (typically a UDT array tag's
+decoded value) is summarized instead of dumped in full — e.g.
+`{"summary": "list[64] vs list[64]: 3 of 64 common elements differ", "differing_indices": [3, 10, 41]}`
+— so comparing two large, genuinely different projects doesn't produce an unreadable wall of raw
+array values.
 
 **If the request is specifically about I/O address wiring** (not a general diff), use the
 narrower `diff_io_addresses()` instead — it reports *only* I/O tag address changes

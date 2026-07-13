@@ -211,3 +211,40 @@ def test_diff_project_covers_routines_tags_and_names():
 
     # Identical project vs itself: no differences of any kind.
     assert diff_project(project_a, project_a) == {}
+
+
+def test_diff_project_summarizes_large_tag_values():
+    """A UDT array tag's decoded value (a list of per-element dicts) must be
+    summarized, not dumped in full -- otherwise a project with many changed
+    array tags produces an unreadable, multi-megabyte result (the real
+    failure this exists to prevent: 1601 changed tags on one real project
+    comparison, many holding full UDT-array initial values)."""
+    from types import SimpleNamespace
+
+    def make_project(value):
+        tag = SimpleNamespace(
+            name="BigArrayTag", data_type="MY_UDT", description="", _initial_value=value
+        )
+        program = SimpleNamespace(name="MainProgram", routines=[], tags=[])
+        controller = SimpleNamespace(
+            programs=[program], aois=[], tags=[tag], data_types=[], modules=[]
+        )
+        return SimpleNamespace(controller=controller)
+
+    old_value = [{"Field1": i, "Field2": i * 2, "Field3": "x" * 20} for i in range(50)]
+    new_value = list(old_value)
+    new_value[3] = {"Field1": 999, "Field2": 999, "Field3": "changed"}
+    new_value[10] = {"Field1": 999, "Field2": 999, "Field3": "changed"}
+
+    diff = diff_project(make_project(old_value), make_project(new_value))
+    value_diff = diff["tags"][("", "BigArrayTag")]["changed"]["value"]
+    assert "summary" in value_diff
+    assert "old" not in value_diff
+    assert value_diff["differing_indices"] == [3, 10]
+
+    # A small scalar value must still be reported in full, not summarized.
+    scalar_diff = diff_project(make_project(1), make_project(2))
+    assert scalar_diff["tags"][("", "BigArrayTag")]["changed"]["value"] == {
+        "old": 1,
+        "new": 2,
+    }

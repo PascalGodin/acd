@@ -337,6 +337,41 @@ def _diff_routines(project_a: RSLogix5000Content, project_b: RSLogix5000Content)
     return diff
 
 
+_MAX_VALUE_REPR = 200  # chars before a tag value diff switches to a summary
+
+
+def _summarize_value_diff(old, new) -> dict:
+    """Compact old/new representation for a tag's "value" diff.
+
+    Small/scalar values are reported in full ({"old": ..., "new": ...}).
+    Large containers -- typically a UDT array tag's decoded initial value,
+    a list of per-element dicts -- are summarized instead of embedded in
+    full: dumping every element's full old/new value produces an unreadable,
+    multi-megabyte wall of output on a real project (observed: 1601 changed
+    tags in one real comparison, many holding full UDT-array values), which
+    defeats the purpose of a diff meant to be read directly.
+    """
+    old_repr, new_repr = repr(old), repr(new)
+    if len(old_repr) <= _MAX_VALUE_REPR and len(new_repr) <= _MAX_VALUE_REPR:
+        return {"old": old, "new": new}
+    if isinstance(old, list) and isinstance(new, list):
+        n = min(len(old), len(new))
+        differing = [i for i in range(n) if old[i] != new[i]]
+        return {
+            "summary": f"list[{len(old)}] vs list[{len(new)}]: "
+            f"{len(differing)} of {n} common elements differ",
+            "differing_indices": differing[:10],
+        }
+    if isinstance(old, dict) and isinstance(new, dict):
+        keys = set(old) | set(new)
+        differing = sorted(k for k in keys if old.get(k) != new.get(k))
+        return {
+            "summary": f"dict with {len(keys)} keys: {len(differing)} differ",
+            "differing_keys": differing[:10],
+        }
+    return {"summary": f"value too large to display ({len(old_repr)} / {len(new_repr)} chars)"}
+
+
 def _all_tags(project: RSLogix5000Content) -> dict:
     result = {}
     for tag in project.controller.tags:
@@ -361,7 +396,7 @@ def _diff_tags(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -> 
         if ta.description != tb.description:
             changed["description"] = {"old": ta.description, "new": tb.description}
         if ta._initial_value != tb._initial_value:
-            changed["value"] = {"old": ta._initial_value, "new": tb._initial_value}
+            changed["value"] = _summarize_value_diff(ta._initial_value, tb._initial_value)
         if changed:
             diff[key] = {"status": "changed", "changed": changed}
     return diff
@@ -400,7 +435,16 @@ def diff_project(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -
           "" as the first key element means controller-scope. "status":
           "added"/"removed"/"changed", where "changed" includes a
           "changed" dict naming which of data_type/description/value
-          differ (each as {"old": ..., "new": ...}).
+          differ. data_type/description are always {"old": ..., "new": ...}
+          in full; "value" is too for a small/scalar value, but a large
+          container (typically a UDT array tag's decoded value -- a list of
+          per-element dicts) is instead summarized as {"summary": "...",
+          "differing_indices"/"differing_keys": [...] (first 10)} --
+          dumping every element's full old/new value in full for every
+          changed tag is not readable and can produce a multi-megabyte
+          result on a real project (observed: 1601 changed tags in one real
+          comparison). Check for a "summary" key vs "old"/"new" keys to tell
+          which shape a given "value" entry is.
 
       "data_types" / "modules" / "aois": {"added": [...], "removed": [...]}
           Presence-only (by name) -- this does NOT diff UDT member

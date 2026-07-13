@@ -1378,6 +1378,17 @@ def _build_comments_xml(tag_name: str, comments: List[Tuple[str, str]]) -> str:
 
 @dataclass
 class Tag(L5xElement):
+    """`.description` (a property) is the tag's own whole-tag description,
+    collapsed to one line -- for per-element/per-bit descriptions or the
+    raw (uncollapsed, multi-line) whole-tag description, use `._comments`
+    (a list of (path, text) tuples; path "" is the tag's own description).
+    `._initial_value` is the decoded current value (int/float/list/dict
+    depending on type) -- there is no separate "default value" concept
+    exposed here. To edit a description, mutate the ("", ...) entry in
+    `._comments` directly (no setter method exists) -- see CLAUDE.md's
+    "Native-import escape hatches" for the only proven way to get a tag
+    edit into a real ACD (export_routine(), not save_acd())."""
+
     name: str
     tag_type: str
     data_type: str
@@ -1942,6 +1953,12 @@ class Module(L5xElement):
 
 @dataclass
 class Routine(L5xElement):
+    """`.rungs[i]` is the plain-text ladder logic for rung i (`.type` is
+    usually "RLL"; "ST" routines have their text in `._st_lines` instead,
+    `.rungs` empty). `._rung_comments` maps a rung index to its comment
+    text. `._rung_ids[i]` is the integer object_id patch_rungs() needs to
+    identify rung i for a write-back edit -- NOT the same as its index i."""
+
     name: str
     type: str
     rungs: List[str]
@@ -2023,6 +2040,10 @@ class AOI(L5xElement):
 
 @dataclass
 class Program(L5xElement):
+    """One program (`project.controller.programs[i]`). `.routines[j].rungs`
+    is where ladder text lives; `.tags` here are PROGRAM-scope tags, separate
+    from `project.controller.tags` (controller-scope)."""
+
     name: str
     test_edits: str
     main_routine_name: Union[str, None]  # None if absent (omitted from XML)
@@ -2078,6 +2099,15 @@ class Task(L5xElement):
 
 @dataclass
 class Controller(L5xElement):
+    """The controller-scope object graph (`project.controller`).
+
+    `.tags`/`.data_types`/`.aois`/`.modules` here are CONTROLLER-scope only.
+    There is no `.routines` on this class at all -- routines live inside
+    programs: `.programs[i].routines[j]`, and program-scope tags live at
+    `.programs[i].tags`, separate from `.tags` here. `.io_tags`/
+    `.alias_tags` are convenience filtered views over `.tags`.
+    """
+
     use: str
     name: str
     processor_type: Union[str, None]  # None if unknown (omitted from XML)
@@ -2165,7 +2195,16 @@ class Controller(L5xElement):
 
 @dataclass
 class RSLogix5000Content(L5xElement):
-    """Controller Project"""
+    """The object returned by load_acd()/ExportL5x.project. Everything else
+    hangs off `.controller` (a Controller) -- there is no top-level
+    `.routines`/`.tags` shortcut here; e.g. to reach a routine's rungs:
+
+        project.controller.programs[i].routines[j].rungs
+
+    (Controller-scope tags/UDTs/AOIs/modules ARE directly on `.controller`
+    -- see Controller's own docstring.) `save_acd()` reads
+    `_raw_files`/`_file_order`/`_footer_unknown` from this object.
+    """
 
     controller: Union[Controller, None]
     schema_revision: str

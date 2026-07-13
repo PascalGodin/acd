@@ -46,6 +46,31 @@ def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
         RSLogix5000Content with a fully populated controller object tree.
         The project also carries _raw_files / _file_order / _footer_unknown
         for use by save_acd().
+
+        There is no top-level `.routines`/`.tags` shortcut on the returned
+        object -- routines and program-scope tags are nested under
+        programs, controller-scope tags/UDTs/AOIs/modules are directly on
+        `.controller`:
+
+            project = load_acd("MyController.ACD")
+            project.controller.name                       # controller name
+            project.controller.tags                        # controller-scope tags
+            for program in project.controller.programs:
+                for routine in program.routines:            # NOT project.routines
+                    routine.rungs                            # list[str], plain ladder text
+
+        See RSLogix5000Content/Controller/Program/Routine/Tag's own
+        docstrings (acd/l5x/elements.py) for the full shape, or README.md
+        for more complete usage examples.
+
+        Editing this object graph does NOT let you write changes back via
+        save_acd() for anything except rung text (patch_rungs()) -- and
+        even that requires a FileInfo.Dat signing key Studio 5000 enforces
+        on open, which this library does not have. For tag/routine edits
+        that need to actually open in real Studio 5000, use export_routine()
+        instead (see its own docstring, and CLAUDE.md's "Native-import
+        escape hatches" section) -- verified end-to-end in real Studio 5000
+        for both editing an existing tag and creating a brand-new one.
     """
     cleanup = temp_dir is None
     if cleanup:

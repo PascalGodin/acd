@@ -159,25 +159,81 @@ ConvertAcdToL5x("MyController.ACD", "MyController.L5X", pretty_print=False).extr
 
 ---
 
-### Edit rungs and save back to ACD
+### Editing a project and getting the change into Studio 5000
 
-Ladder rung text can be modified and written back to a working `.ACD` file. The library handles the binary encoding, including resolving tag names to/from `@HEX_OBJECT_ID@` placeholders:
+**`save_acd()` alone will NOT produce a file real Studio 5000 accepts if anything changed.** Studio
+enforces a `FileInfo.Dat` checksum on open, seeded by a per-installation signing key this library
+does not have (and cannot derive from the ACD itself — see `acd/integrity/` and `CLAUDE.md`'s "ACD
+write-back" section). A `save_acd()` round-trip with **zero edits** reproduces the original file
+byte-for-byte, which is a useful sanity check, but any real edit needs a different path:
+
+**Use `export_routine()` to export a single routine as a partial L5X, then import it via Studio
+5000's own native "Import Routine" feature** (right-click a Routines folder → *Import Routine…*).
+Studio does the actual binary write and re-signing itself, so `FileInfo.Dat` is never a concern.
+This is verified end-to-end against real Studio 5000 for three edit classes: editing a rung,
+editing an existing tag's fields (description, value, …), and creating a brand-new tag.
+
+**Editing a rung:**
+
+```python
+from acd.api import load_acd, export_routine
+
+project = load_acd("MyController.ACD")
+routine = project.controller.programs[0].routines[0]
+
+routine.rungs[0] = "XIC(MySensor)OTE(MyOutput);"
+export_routine(project, routine, "MyRoutine.L5X")
+# Then in Studio 5000: right-click the Routines folder -> Import Routine... -> MyRoutine.L5X
+```
+
+**Editing a tag** (description, value, …) works the same way, via a "carrier" routine that
+already references the tag — `export_routine()` embeds a full `<Tag>` definition for every tag a
+routine's rungs reference, and Studio's Import Routine dialog offers to overwrite a tag when the
+imported copy differs from the project's own:
+
+```python
+tag = next(t for t in project.controller.tags if t.name == "MyTag")
+tag._comments = [("", "New description")]  # ("", text) is the tag's own whole-tag description
+
+# Find (or pick) any routine whose rung text already references "MyTag"
+routine = project.controller.programs[0].routines[0]
+export_routine(project, routine, "MyRoutine.L5X")
+# Import in Studio; accept the prompt to overwrite MyTag's description.
+```
+
+A tag with no reference anywhere in ladder/ST logic (HMI-only or legacy tags, commonly ~30-60% of
+a real project) can't be carried this way — there's no routine to attach it to.
+
+**Creating a brand-new tag** uses the identical mechanism — construct a new `Tag`, reference it
+from a rung (a real one, or a harmless one guarded by an always-false condition if you don't want
+to change actual logic), and export/import the same way. Studio decides create-vs-overwrite based
+on whether the tag name already exists in the project, so no special-casing is needed.
+
+See `export_routine()`'s own docstring and `CLAUDE.md`'s "Native-import escape hatches" section for
+the full mechanism, verified dependency-closure behavior (UDTs, AOIs, Modules, JSR-called
+routines), and known limitations.
+
+---
+
+### Patching rung text directly into the ACD binary (limited)
+
+`patch_rungs()`/`save_acd()` can rewrite `SbRegion.Dat` (rung text) in place without going through
+Studio at all — useful for a byte-exact round-trip check, but **the output will not open in real
+Studio 5000** unless you've registered a valid `FileInfo.Dat` signing key (see "Integrity / project
+key" below):
 
 ```python
 from acd.api import load_acd, save_acd, patch_rungs
 
 project = load_acd("MyController.ACD")
-controller = project.controller
-
-# Find the first rung of the first routine and change it
-routine = controller.programs[0].routines[0]
-changes = {routine.rung_ids[0]: "XIC(MySensor)OTE(MyOutput);"}
+routine = project.controller.programs[0].routines[0]
+changes = {routine._rung_ids[0]: "XIC(MySensor)OTE(MyOutput);"}
 
 patch_rungs(project, changes)
 save_acd(project, "MyController_modified.ACD")
 ```
 
-Only `SbRegion.Dat` (rung text) is re-serialised. Other object types (tags, data types, AOI definitions, modules) pass through as raw bytes and are preserved verbatim. Editing those structures in the Python object model and saving back requires a binary serializer for `Comps.Dat`, which is not yet implemented.
+Only `SbRegion.Dat` (rung text) is re-serialised. Other object types (tags, data types, AOI definitions, modules) pass through as raw bytes and are preserved verbatim — there is no binary serializer for `Comps.Dat`, so editing those structures in the Python object model has no write-back path via `save_acd()` at all (use `export_routine()` above instead).
 
 ---
 

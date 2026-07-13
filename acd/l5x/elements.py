@@ -2511,18 +2511,27 @@ class DataTypeBuilder(L5xElementBuilder):
 
 
 # Connection Type CIP enum, read at absolute offset 90 (u16le) of a
-# RxMapConnectionCollection child's raw record. Verified against a real
-# Studio 5000 project (matching every connection's raw bytes, keyed by
+# RxMapConnectionCollection child's raw record. Verified against two real
+# Studio 5000 projects (matching every connection's raw bytes, keyed by
 # (comp_name, RPI) read from offset 92, against its actual L5X Type=
-# attribute): a clean, zero-exception discriminator across 74 real
-# connection records spanning all four values seen so far. Other CIP
-# connection types (e.g. Safety Input/Output, Listen-Only, Config) may use
-# additional codes not yet observed -- see the name-based fallback below.
+# attribute): a clean, zero-exception discriminator, most recently across
+# every one of 205 real connection records in a second project (134 of
+# them code 48/StandardDataDriven alone) -- that same cross-check also
+# reconfirmed codes 5/6/7/23 hold with zero exceptions in this second,
+# independent project. Code 48 is a strong confirmation of the general
+# "don't trust the connection name" warning below: it appears on
+# connections literally named both "InputData" and "OutputData" in the
+# same project, so the old name-based fallback silently guessed opposite
+# answers for functionally-identical connections depending on which one
+# happened to be sitting in front of it. Other CIP connection types (e.g.
+# Safety Input/Output, Listen-Only, Config) may use additional codes not
+# yet observed -- see the name-based fallback below.
 _CONNECTION_TYPE_BY_CODE: Dict[int, str] = {
     5: "Input",
     6: "Output",
     7: "DiagnosticInput",
     23: "MotionSync",
+    48: "StandardDataDriven",
 }
 
 

@@ -205,19 +205,32 @@ caused three false "bugs" in one verification pass before being caught):
 
 ## Connection Type / RPI (Module builder)
 
-`ModuleBuilder` reads each I/O connection's Type (Input/Output/DiagnosticInput/MotionSync/...)
-from a real u16le CIP enum at raw offset 90, and its RPI (microseconds) from a u32le
-immediately after it at offset 92 — not from the connection's name. The connection's own name
-(e.g. `"Standard"`) gives **no reliable signal**: in a real project, most `"Standard"`
+`ModuleBuilder` reads each I/O connection's Type (Input/Output/DiagnosticInput/MotionSync/
+StandardDataDriven/...) from a real u16le CIP enum at raw offset 90, and its RPI (microseconds)
+from a u32le immediately after it at offset 92 — not from the connection's name. The connection's
+own name (e.g. `"Standard"`) gives **no reliable signal**: in a real project, most `"Standard"`
 connections were `Type="Output"` while a couple were `Type="Input"`. If you ever need to
 reverse-engineer a similar "guess from name" situation, the method that worked here: collect
 every real `<Connection Name=... RPI=... Type=...>` from a project's own L5X export, match each
-one to its raw ACD record (RPI is a convenient unique-ish key to match on), then scan every byte
-offset for one whose value is constant within each `Type=` group and differs across groups — a
-real 1-byte/2-byte enum will show up as a clean, zero-exception discriminator immediately.
-`_CONNECTION_TYPE_BY_CODE` only has the codes seen so far (5/6/7/23); unrecognized codes log a
-`log.warning()` and fall back to the old name heuristic rather than silently guessing — check
-the logs if you ever suspect a module's connection Type is wrong.
+one to its raw ACD record (RPI is a convenient unique-ish key to match on, but not always unique
+project-wide — scope the match to the owning Module too, since the same connection name/RPI pair
+can recur across many different module instances), then scan every byte offset for one whose
+value is constant within each `Type=` group and differs across groups — a real 1-byte/2-byte enum
+will show up as a clean, zero-exception discriminator immediately.
+
+`_CONNECTION_TYPE_BY_CODE` currently has 5/6/7/23/48; unrecognized codes log a `log.warning()` and
+fall back to the old name heuristic rather than silently guessing — check the logs if you ever
+suspect a module's connection Type is wrong. **Code 48 (`StandardDataDriven`) was added after a
+user hit the warning on a real project** (module `MCC116_Output`, connection `OutputData`) — a
+whole-project cross-check (every one of 205 real connections in that project, matched by
+module+name+RPI between the ACD's raw bytes and the project's own L5X export) found all five
+codes hold with zero exceptions, 134 of the 205 being code 48 alone. This case is a particularly
+strong confirmation of the "don't trust the name" warning above: the exact same code 48 appears on
+connections literally named both `"InputData"` and `"OutputData"` in this one project, meaning the
+old name-based fallback silently guessed opposite answers ("Input" vs "Output") for two
+functionally-identical connections depending only on which one happened to be in front of it —
+neither guess was actually `StandardDataDriven`, so both were wrong, just not usually visible as
+a hard error since callers mostly only care whether IO is input-like or output-like.
 
 ## Known limitations / things not implemented
 

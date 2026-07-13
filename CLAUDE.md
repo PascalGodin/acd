@@ -1133,6 +1133,38 @@ can be correctly re-signed. The key situation, corrected from earlier notes:
    getting tag/rung/comment edits into a project without solving the key.
 Outcome of any Studio re-test after re-signing not yet recorded — update here when known.
 
+## Comparing I/O addresses across two projects (`find_io_addresses`/`diff_io_addresses`)
+
+Added after a downstream LLM session, asked to find I/O address changes between two ACDs (two
+saves of the same project, and separately a "mill" vs "VAB" variant), hand-rolled a regex that hit
+a `re.error: unbalanced parenthesis`, then an `IndexError` from zipping two routines' rungs by
+index once it worked — routines routinely have a different rung count between two otherwise-
+similar projects/saves, so index-based comparison is fundamentally the wrong approach, not just a
+bug to patch around.
+
+`acd/api.py` now exposes three public functions for this instead of leaving every caller to
+reinvent the tokenizer:
+- `find_io_addresses(text) -> List[str]`: extracts every I/O-style address from one rung/ST-line
+  of text (`"IO024:I.Data[0].13"`, `"Remote_GraderConsole:3:I.Pt13.Data"`,
+  `"Local:10:I.Data.11"`, `"Sorter_VFD:I.DriveStatus_Active"`). A real I/O address always contains
+  `":"` (reserved by Rockwell's own tag-naming rules for module addressing), so this never
+  collides with a plain UDT member path like `"M304_Sorter_Lug_Chain.VFD.Running"` — verified
+  against real examples pulled from an actual project-vs-project diff (see the regex `_IO_ADDRESS_RE`:
+  base name, optional `:slot`, required `:Type`, then a repeating `.Member`/`.bit`/`[idx,...]` chain).
+- `io_addresses_by_routine(project) -> Dict[(program_name, routine_name), List[str]]`: every
+  routine's full set of I/O addresses (RLL rungs + ST lines), duplicates included, in source
+  order. AOI logic routines are keyed as `("AOI:<name>", routine_name)` since they have no Program.
+- `diff_io_addresses(project_a, project_b) -> Dict[(program_name, routine_name), {"removed":
+  [...], "added": [...], "common": [...]}]`: routine-by-routine, set-based (not index-based) I/O
+  address diff between two projects — only routines with an actual difference are included. A
+  routine unique to one side still gets an entry (everything shows as fully added/removed).
+
+Verified end-to-end against the real `BPM_TrimmerSorter_20260713.ACD` /
+`BPM_TrimmerSorter_VAB_20260713.ACD` pair (`Bethel_Planer_20260713_Compare`): 64 routines reported
+with real, sensible I/O address differences (e.g. `Advance`'s `Sorter_VFD:I.DriveStatus_Active`/
+`Sorter_VFD:I.OutputFreq` present only in the mill project), with zero crashes despite routines
+differing in rung count between the two files — the exact scenario that broke the ad hoc script.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

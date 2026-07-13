@@ -7,7 +7,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 from acd.integrity import (
     FILEINFO_LENGTH,
@@ -194,6 +194,101 @@ def patch_rungs(project: RSLogix5000Content, changes: dict) -> None:
         changes,
         project._id_to_name,
     )
+
+
+_IO_ADDRESS_RE = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9_]*"                          # module/tag base name
+    r"(?::\d+)?"                                          # optional :slot (rack/chassis addressing)
+    r":[A-Za-z]\w*"                                       # :Type (I, O, C, ...)
+    r"(?:\.[A-Za-z_]\w*|\.\d+|\[\d+(?:,\d+)*\])*"         # .Member / .bit / [index,...] chain
+)
+
+
+def find_io_addresses(text: str) -> List[str]:
+    """Extract every I/O-style tag address referenced in one rung/ST-line of
+    text, e.g. "IO024:I.Data[0].13", "Remote_GraderConsole:3:I.Pt13.Data",
+    "Local:10:I.Data.11", "Sorter_VFD:I.DriveStatus_Active" -- in
+    left-to-right order, duplicates included.
+
+    A real I/O address always contains a ":" (reserved by Rockwell's own
+    tag-naming rules for module addressing), so this never matches a plain
+    UDT member path like "M304_Sorter_Lug_Chain.VFD.Running" -- no
+    false-positive collisions with ordinary tag/member references.
+
+    Use this instead of writing a new regex for this address shape --
+    hand-rolled versions are easy to get subtly wrong (unbalanced brackets,
+    dropping the trailing bit/array suffix, multi-dimensional indices).
+    """
+    if not text:
+        return []
+    return _IO_ADDRESS_RE.findall(text)
+
+
+def io_addresses_by_routine(project: RSLogix5000Content) -> Dict[Tuple[str, str], List[str]]:
+    """Map every routine in the project to the full, ordered list of I/O
+    addresses (see find_io_addresses()) referenced anywhere in its rungs
+    (RLL) or lines (ST) -- duplicates included, in source order.
+
+    Keyed by (program_name, routine_name); AOI logic routines are keyed by
+    (f"AOI:{aoi.name}", routine_name) since they don't belong to a Program.
+
+    This is a rung/line-count-independent "signature" of a routine's I/O
+    wiring -- use it (or diff_io_addresses(), below) instead of zipping two
+    routines' rungs by index to compare I/O references: that breaks with an
+    IndexError as soon as the two routines have a different rung count,
+    which is common even between two saves of what is otherwise "the same"
+    routine.
+    """
+    def _addrs(routine: Routine) -> List[str]:
+        addrs: List[str] = []
+        for text in routine.rungs or []:
+            addrs.extend(find_io_addresses(text))
+        for text in routine._st_lines or []:
+            addrs.extend(find_io_addresses(text))
+        return addrs
+
+    result: Dict[Tuple[str, str], List[str]] = {}
+    for program in project.controller.programs:
+        for routine in program.routines:
+            result[(program.name, routine.name)] = _addrs(routine)
+    for aoi in project.controller.aois:
+        for routine in aoi.routines:
+            result[(f"AOI:{aoi.name}", routine.name)] = _addrs(routine)
+    return result
+
+
+def diff_io_addresses(
+    project_a: RSLogix5000Content, project_b: RSLogix5000Content
+) -> Dict[Tuple[str, str], Dict[str, List[str]]]:
+    """Compare I/O address usage between two projects (e.g. two saves/versions
+    of the same controller) routine by routine, without assuming the two
+    routines' rungs/lines line up by index -- the naive "zip rung i of A with
+    rung i of B" approach breaks (IndexError) the moment a routine gained or
+    lost a rung between the two saves, even when the actual I/O wiring is
+    unchanged.
+
+    Returns one entry per (program_name, routine_name) key (see
+    io_addresses_by_routine()) that differs between the two projects --
+    routines with identical I/O address usage are omitted entirely. Each
+    entry is {"removed": [...], "added": [...], "common": [...]}: "removed"
+    are addresses used in project_a but not project_b, "added" the reverse,
+    both order-insensitive with duplicates collapsed. A routine present in
+    only one project still gets an entry, with every one of its addresses
+    reported as fully added or fully removed.
+    """
+    a = io_addresses_by_routine(project_a)
+    b = io_addresses_by_routine(project_b)
+    diff: Dict[Tuple[str, str], Dict[str, List[str]]] = {}
+    for key in sorted(set(a) | set(b)):
+        set_a, set_b = set(a.get(key, [])), set(b.get(key, []))
+        if set_a == set_b:
+            continue
+        diff[key] = {
+            "removed": sorted(set_a - set_b),
+            "added": sorted(set_b - set_a),
+            "common": sorted(set_a & set_b),
+        }
+    return diff
 
 
 def _inject_use_attr(xml_str: str, element_name: str, use_value: str) -> str:

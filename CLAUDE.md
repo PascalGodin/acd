@@ -1165,6 +1165,30 @@ with real, sensible I/O address differences (e.g. `Advance`'s `Sorter_VFD:I.Driv
 `Sorter_VFD:I.OutputFreq` present only in the mill project), with zero crashes despite routines
 differing in rung count between the two files — the exact scenario that broke the ad hoc script.
 
+**Follow-up gap, found immediately after shipping the above**: the user reported their downstream
+LLM defaulted to `diff_io_addresses()` whenever asked for a *generic* "what changed between these
+two files" comparison, not just I/O-specific requests — because it was, at the time, the only
+`diff_*`-named function in the public API, so an LLM pattern-matching on "diff" had nothing more
+appropriate to reach for. Added `diff_project()` (same file) as the actual general-purpose entry
+point, and tightened `diff_io_addresses()`'s own docstring to explicitly disclaim general use
+("do not reach for this function by default just because it has 'diff' in the name") — the lesson
+being that a narrowly-scoped function with a generic-sounding name will get misused by an LLM
+caller unless a correctly-scoped alternative exists *and* the narrow one's docstring actively
+steers away from itself, not just describes what it does.
+
+`diff_project(project_a, project_b) -> dict` covers, each only populated when something differs:
+- `"routines"`: keyed like `io_addresses_by_routine()` (`(program_name, routine_name)`, AOI logic
+  routines as `("AOI:<name>", routine_name)`). `"status"` is `"added"`/`"removed"`/`"changed"`; a
+  `"changed"` entry's `"changes"` list comes from `difflib.SequenceMatcher(a=lines_a,
+  b=lines_b).get_opcodes()` over the routine's rungs (RLL) or `_st_lines` (ST) — reusing the same
+  alignment-based approach (not index-zipping) as `diff_io_addresses()`, for the same reason: two
+  routines routinely have a different rung count even when "the same" logic-wise.
+- `"tags"`: keyed `(program_name_or_"", tag_name)` (`""` = controller scope); compares
+  `data_type`/`description`/`_initial_value` for tags present on both sides.
+- `"data_types"`/`"modules"`/`"aois"`: presence-only (added/removed by name) — deliberately does
+  NOT diff UDT member layout, module connection/RPI details, or AOI parameters; documented as a
+  known scope limit in the function's own docstring rather than silently doing something partial.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

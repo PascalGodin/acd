@@ -162,16 +162,41 @@ ConvertAcdToL5x("MyController.ACD", "MyController.L5X", pretty_print=False).extr
 
 ---
 
-### Comparing I/O addresses between two projects
+### Comparing two projects
 
-Finding where I/O wiring changed between two ACDs (two saves of the same project, or two related
-variants) without hand-writing a regex over rung text:
+For a **generic** "what changed between these two ACDs?" comparison (two saves of the same
+project, or two related variants), use `diff_project()` — it covers routines (rung/ST-line text),
+tags (value/description/data type), data types, modules, and AOIs, all by name/content, not by
+position:
 
 ```python
-from acd import load_acd, diff_io_addresses
+from acd import load_acd, diff_project
 
 project_a = load_acd("MyController_v1.ACD")
 project_b = load_acd("MyController_v2.ACD")
+
+diff = diff_project(project_a, project_b)
+for (program_name, routine_name), routine_diff in diff.get("routines", {}).items():
+    print(program_name, routine_name, "->", routine_diff["status"])
+    for change in routine_diff.get("changes", []):
+        print(" ", change["op"], change["old"], "->", change["new"])
+
+for key, tag_diff in diff.get("tags", {}).items():
+    print(key, "->", tag_diff)
+```
+
+Routine content is compared with `difflib.SequenceMatcher` alignment, not a naive index-by-index
+zip — two routines with a different rung count (very common even between two saves of "the same"
+logic) still diff correctly instead of raising `IndexError`. Data types/modules/AOIs are compared
+by name presence only (added/removed), not deep member/parameter layout.
+
+**If the request is specifically about I/O address wiring** (not a general diff), use the
+narrower `diff_io_addresses()` instead — it reports *only* I/O tag address changes
+(`"IO024:I.Data[0].13"`, `"Remote_GraderConsole:3:I.Pt13.Data"`, `"Local:10:I.Data.11"`, ...) and
+nothing else, so it's the wrong default for a broad comparison:
+
+```python
+from acd import diff_io_addresses, find_io_addresses, io_addresses_by_routine
 
 diff = diff_io_addresses(project_a, project_b)
 for (program_name, routine_name), changes in diff.items():
@@ -180,12 +205,9 @@ for (program_name, routine_name), changes in diff.items():
     print("  added:  ", changes["added"])
 ```
 
-Only routines with an actual I/O address difference appear in the result. This compares by
-*address set*, not by rung position — two routines with a different rung count (very common even
-between two saves of "the same" logic) still diff correctly instead of raising `IndexError`. For a
-single rung/ST-line, `find_io_addresses(text)` returns the raw list of addresses found
-(`"IO024:I.Data[0].13"`, `"Remote_GraderConsole:3:I.Pt13.Data"`, `"Local:10:I.Data.11"`, ...); for
-a whole project's routine-by-routine breakdown without diffing, use `io_addresses_by_routine(project)`.
+`find_io_addresses(text)` extracts the raw list of I/O addresses from a single rung/ST-line;
+`io_addresses_by_routine(project)` gives the whole project's routine-by-routine breakdown without
+diffing.
 
 ---
 

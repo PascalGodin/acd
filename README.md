@@ -24,6 +24,9 @@ pip install acd-tools
 
 ### Quick start — read an ACD file
 
+`load_acd()` extracts the ACD into a temporary directory (system temp, auto-deleted when the call
+returns — see "Low-level access via ExportL5x" below if you want the extracted files left on disk):
+
 ```python
 from acd.api import load_acd
 
@@ -321,6 +324,13 @@ project    = export.project
 
 export.close()   # release the SQLite connection
 ```
+
+**Working-directory default differs from `load_acd()`.** With no `temp_dir` argument, `ExportL5x`
+extracts into a folder *next to the source file* (`MyController.ACD` → `MyController/`, in the same
+directory) and leaves it there — handy for inspecting the raw `.Dat`/`.Idx` files or the SQLite DB
+afterward. `load_acd()` (above) instead uses a system temp directory and deletes it automatically,
+so a one-shot load doesn't clutter your project folder. Pass `temp_dir=` explicitly to either one
+to control this yourself.
 
 > Always call `close()` when you are done, especially on Windows, to release the file lock on the SQLite database.
 

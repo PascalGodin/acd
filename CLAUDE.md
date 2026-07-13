@@ -1208,6 +1208,34 @@ different VAB variant, not two saves of the same logic), so don't expect `diff_p
 to always be small; the fix targets the *per-value* blowup, not the *aggregate* size when the
 underlying projects really do differ everywhere.
 
+**Third follow-up**: despite both fixes above and the module docstring already recommending
+`diff_project()`, a downstream LLM asked to look at one specific routine (`Motors/Main_Motors`)
+across the same two real projects still wrote its own manual comparison — fetched both `Routine`
+objects, then printed `.rungs` for each side by side by index. Three JSR rungs were removed near
+the top of one project's copy, shifting every later rung's index by 3, which made the printed
+lists look like the whole routine had changed even though the tail (`Infeed_LandingTable` onward)
+was byte-identical. This wasn't a bug in `diff_project()`/`diff_io_addresses()` (both already
+handle this correctly via `difflib`) — it was a *discoverability* gap: the LLM had two `Routine`
+objects in hand and reached for `print()`/manual zip rather than any diff function, likely because
+nothing in the public API matched that exact shape ("I already have two routines, just diff
+these") as directly as `diff_project(project_a, project_b)` (which needs whole projects) did.
+
+Extracted the per-routine alignment logic `_diff_routines()` already used into a new public
+`diff_routine(routine_a, routine_b) -> {"status": "unchanged"/"changed", "changes": [...]}`, and
+rewrote the top of `acd/__init__.py`'s module docstring to lead with an explicit "COMPARING TWO
+PROJECTS/SAVES/ROUTINES — READ THIS BEFORE WRITING YOUR OWN COMPARISON CODE" section (previously
+this guidance existed but was positioned after the Quick Start snippet, one paragraph among
+several, with no equivalent function for the single-routine case) naming all three diff functions
+by exact use case. Verified `diff_routine()` reproduces the real `Main_Motors` scenario exactly:
+`{"status": "changed", "changes": [{"op": "delete", "old": [the 3 removed JSR rungs], "new": []}]}`
+— nothing else reported, confirming the tail is correctly recognized as unchanged.
+
+The recurring lesson across all three follow-ups: a correct implementation is not sufficient for
+an LLM caller to actually use it — the function matching the caller's exact mental model ("I have
+two routines" vs. "I have two projects") has to exist, and the guidance steering them to it has to
+be positioned where it will actually be read (at the very top, restated at the point of need), not
+just documented accurately somewhere in the file.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

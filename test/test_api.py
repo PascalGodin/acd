@@ -12,6 +12,7 @@ from acd.api import (
     io_addresses_by_routine,
     diff_io_addresses,
     diff_project,
+    diff_routine,
 )
 
 
@@ -248,3 +249,104 @@ def test_diff_project_summarizes_large_tag_values():
         "old": 1,
         "new": 2,
     }
+
+
+def _make_routine_project(rungs):
+    from types import SimpleNamespace
+
+    routine = SimpleNamespace(name="R01", type="RLL", rungs=rungs, _st_lines=[])
+    program = SimpleNamespace(name="Main", routines=[routine], tags=[])
+    controller = SimpleNamespace(
+        programs=[program], aois=[], tags=[], data_types=[], modules=[]
+    )
+    return SimpleNamespace(controller=controller)
+
+
+def test_diff_project_routine_insert_does_not_flag_unrelated_rungs():
+    """Inserting one rung at the top of a routine must not flag the whole
+    routine as different -- the other rungs shifted position by one but are
+    otherwise byte-identical, and diff_routines() aligns by content
+    (difflib.SequenceMatcher), not by index, so they must still show up as
+    unchanged (i.e. absent from "changes")."""
+    a = _make_routine_project(
+        ["XIC(A)OTE(B);", "XIC(C)OTE(D);", "XIC(E)OTE(F);"]
+    )
+    b = _make_routine_project(
+        ["XIC(NEW)OTE(TOP);", "XIC(A)OTE(B);", "XIC(C)OTE(D);", "XIC(E)OTE(F);"]
+    )
+    routine_diff = diff_project(a, b)["routines"][("Main", "R01")]
+    assert routine_diff["status"] == "changed"
+    assert routine_diff["changes"] == [
+        {"op": "insert", "old": [], "new": ["XIC(NEW)OTE(TOP);"]}
+    ]
+
+
+def test_diff_project_routine_isolates_a_single_modified_rung():
+    """A rung edited in place (e.g. one tag renamed), surrounded by
+    unchanged rungs, must isolate to a single "replace" op, not spill over
+    into flagging the surrounding unchanged rungs."""
+    a = _make_routine_project(
+        ["XIC(A)OTE(B);", "XIC(C)OTE(D);", "XIC(E)OTE(F);", "XIC(G)OTE(H);"]
+    )
+    b = _make_routine_project(
+        ["XIC(A)OTE(B);", "XIC(Ccc)OTE(D);", "XIC(E)OTE(F);", "XIC(G)OTE(H);"]
+    )
+    routine_diff = diff_project(a, b)["routines"][("Main", "R01")]
+    assert routine_diff["status"] == "changed"
+    assert routine_diff["changes"] == [
+        {"op": "replace", "old": ["XIC(C)OTE(D);"], "new": ["XIC(Ccc)OTE(D);"]}
+    ]
+
+
+def test_diff_routine_unchanged():
+    """Two Routine objects with identical rungs must report "unchanged",
+    not an empty "changed" -- callers should be able to branch on status
+    without also checking whether "changes" happens to be empty."""
+    from types import SimpleNamespace
+
+    routine_a = SimpleNamespace(type="RLL", rungs=["XIC(A)OTE(B);"], _st_lines=[])
+    routine_b = SimpleNamespace(type="RLL", rungs=["XIC(A)OTE(B);"], _st_lines=[])
+    assert diff_routine(routine_a, routine_b) == {"status": "unchanged", "changes": []}
+
+
+def test_diff_routine_reproduces_real_jsr_removal_scenario():
+    """Real-world case that motivated diff_routine() as its own public
+    function: a caller who already has two specific Routine objects (found
+    by program/routine name) manually zipped their .rungs by index and
+    concluded the whole routine had changed, because 3 JSR rungs were
+    removed near the top of one project's copy and shifted every later
+    rung's index. diff_routine() must isolate exactly the 3 removed rungs
+    and report everything else as unchanged."""
+    from types import SimpleNamespace
+
+    rungs_a = [
+        "JSR(P_Landing,0);",
+        "JSR(Storage_Table,0)JSR(Lug_Backlog_Table,0)JSR(Lug_loader_Table_Wheels,0);",
+        "JSR(Planer_Outfeed,0);",
+        "JSR(Infeed_LandingTable,0);",
+        "XIC(Local:12:I.Data.0)XIC(Local:12:I.Data.1)TON(DelayedControlPowe,?,?);",
+        "XIC(B23[1].0)OTL(Clr_InfeedFaults);",
+        "AOI_RPMtoFPM(TestFPM,VFD_P_INTBL2:I.OutputFreq);",
+    ]
+    rungs_b = [
+        "JSR(Infeed_LandingTable,0);",
+        "XIC(Local:12:I.Data.0)XIC(Local:12:I.Data.1)TON(DelayedControlPowe,?,?);",
+        "XIC(B23[1].0)OTL(Clr_InfeedFaults);",
+        "AOI_RPMtoFPM(TestFPM,VFD_P_INTBL2:I.OutputFreq);",
+    ]
+    routine_a = SimpleNamespace(type="RLL", rungs=rungs_a, _st_lines=[])
+    routine_b = SimpleNamespace(type="RLL", rungs=rungs_b, _st_lines=[])
+
+    result = diff_routine(routine_a, routine_b)
+    assert result["status"] == "changed"
+    assert result["changes"] == [
+        {
+            "op": "delete",
+            "old": [
+                "JSR(P_Landing,0);",
+                "JSR(Storage_Table,0)JSR(Lug_Backlog_Table,0)JSR(Lug_loader_Table_Wheels,0);",
+                "JSR(Planer_Outfeed,0);",
+            ],
+            "new": [],
+        }
+    ]

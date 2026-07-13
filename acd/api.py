@@ -312,6 +312,41 @@ def _all_routines(project: RSLogix5000Content) -> Dict[Tuple[str, str], Routine]
     return result
 
 
+def diff_routine(routine_a: Routine, routine_b: Routine) -> dict:
+    """Compare two Routine objects directly -- e.g. "the same" routine
+    fetched from two different projects/saves, when you already have both
+    Routine objects in hand and don't need diff_project()'s whole-project
+    scan.
+
+    Do NOT manually zip/print routine_a.rungs and routine_b.rungs side by
+    side (or by ST-line index) and eyeball the difference: two rungs at the
+    same index are NOT necessarily "the same rung" -- a single rung deleted
+    or inserted anywhere in one routine shifts every later rung's index,
+    making an otherwise-identical tail look completely different in a naive
+    side-by-side printout even though nothing actually changed there. This
+    function aligns the two routines' rungs (RLL) or lines (ST) with
+    difflib.SequenceMatcher instead (the same approach diff_project()'s
+    "routines" section uses internally), so an inserted/deleted/edited rung
+    shows up as exactly that -- one small op -- with everything else
+    correctly recognized as unchanged regardless of where it shifted to.
+
+    Returns {"status": "unchanged"/"changed", "changes": [...]}: "changes"
+    is a list of {"op": "replace"/"delete"/"insert", "old": [...], "new":
+    [...]} blocks, empty (status "unchanged") if the two routines' rungs/
+    lines are identical.
+    """
+    lines_a, lines_b = _routine_lines(routine_a) or [], _routine_lines(routine_b) or []
+    if lines_a == lines_b:
+        return {"status": "unchanged", "changes": []}
+    changes = []
+    matcher = difflib.SequenceMatcher(a=lines_a, b=lines_b, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changes.append({"op": tag, "old": lines_a[i1:i2], "new": lines_b[j1:j2]})
+    return {"status": "changed", "changes": changes}
+
+
 def _diff_routines(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -> dict:
     routines_a = _all_routines(project_a)
     routines_b = _all_routines(project_b)
@@ -324,16 +359,10 @@ def _diff_routines(project_a: RSLogix5000Content, project_b: RSLogix5000Content)
         if rb is None:
             diff[key] = {"status": "removed", "lines": _routine_lines(ra) or []}
             continue
-        lines_a, lines_b = _routine_lines(ra) or [], _routine_lines(rb) or []
-        if lines_a == lines_b:
+        result = diff_routine(ra, rb)
+        if result["status"] == "unchanged":
             continue
-        changes = []
-        matcher = difflib.SequenceMatcher(a=lines_a, b=lines_b, autojunk=False)
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag == "equal":
-                continue
-            changes.append({"op": tag, "old": lines_a[i1:i2], "new": lines_b[j1:j2]})
-        diff[key] = {"status": "changed", "changes": changes}
+        diff[key] = result
     return diff
 
 
@@ -415,7 +444,8 @@ def diff_project(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -
     or two related variants of the same controller) -- routines, tags, data
     types, modules, and AOIs. Use this for a broad/generic "what changed"
     comparison; use diff_io_addresses() only when specifically asked about
-    I/O address wiring.
+    I/O address wiring, or diff_routine() if you already have two specific
+    Routine objects in hand and don't need a whole-project scan.
 
     Returns a dict with up to five keys, each populated only where something
     actually differs (an empty dict means no differences found at all):

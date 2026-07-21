@@ -9,11 +9,13 @@ from acd.l5x.elements import (
     Member,
     _apply_dead_member_byte_corrections,
     _decode_single_udt_element,
+    _decode_string_family_value,
     _decorated_real_literal,
     _escape_xml_attr,
     _filetime_to_iso,
     _get_type_size,
     _l5k_real_literal,
+    _l5k_string_padded,
     _read_tag_initial_value,
     _resolve_bit_target,
 )
@@ -316,3 +318,33 @@ def test_apply_dead_member_byte_corrections_noop_when_no_dead_bytes():
     b, c = outer_dt.members
     assert b._byte_offset == 0
     assert c._byte_offset == 4
+
+
+def test_decode_string_family_value_uses_latin1_never_replacement_char():
+    # Regression test for a real bug: decoding raw STRING bytes as utf-8
+    # (with errors="replace") inserted U+FFFD for any byte sequence that
+    # wasn't valid UTF-8 -- found via a real array tag whose STRING member
+    # held uninitialized/garbage data. latin-1 is a 1:1 byte<->codepoint
+    # mapping that can never fail, so U+FFFD must never appear.
+    blob = struct.pack("<i", 4) + bytes([0xC7, 0x65, 0x02, 0x01]) + b"\x00" * 82
+    result = _decode_string_family_value(blob, 0, "STRING", {})
+    assert result["LEN"] == 4
+    assert "�" not in result["DATA"]
+    assert result["DATA"] == "\xc7\x65\x02\x01"
+
+
+def test_l5k_string_padded_escapes_non_ascii_bytes():
+    # Regression test for a real Studio 5000 import rejection ("Only ASCII
+    # characters are supported") on a tag's <Data Format="L5K"> element:
+    # a non-ASCII character (originating from a byte that isn't valid
+    # UTF-8, previously mis-decoded as U+FFFD -- see the decode test above)
+    # must be $XX-hex-escaped the same way control characters already are,
+    # not embedded raw.
+    result = _l5k_string_padded("\xc7\x65", capacity=4)
+    assert result == "'$C7e$00$00'"
+    assert all(ord(c) <= 0x7E for c in result)
+
+
+def test_l5k_string_padded_still_escapes_control_chars():
+    result = _l5k_string_padded("\x00\x1b", capacity=2)
+    assert result == "'$00$1B'"

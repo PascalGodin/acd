@@ -1229,6 +1229,68 @@ ground truth exactly, confirming this change didn't regress anything for tags wi
 Regression tests: `test_decode_string_family_value_uses_latin1_never_replacement_char`,
 `test_l5k_string_padded_escapes_non_ascii_bytes`, `test_l5k_string_padded_still_escapes_control_chars`.
 
+## UDT total size must round up to a multiple of 4 (`_get_type_size`), and alignment can absorb a
+## pending dead-byte shift (`_apply_dead_member_byte_corrections`)
+
+Found via a fresh Studio 5000 "Tag Name Collision / Data Compare" dialog on a re-exported routine
+(same investigation as the fixes above): a plain `DINT[40]` tag (`Comm_From_VABView_Recipe_Status`)
+showed every value multiplied by 65536 vs. the real Studio value, AND (after fixing that) a *scalar*
+UDT tag (`EncTrm`, type `Encoder`) showed the exact same 65536x pattern on several plain scalar
+members despite `Encoder` having zero orphaned members of its own. Two genuinely different bugs
+were found chasing the `Encoder` case, both confirmed **directly against Studio 5000's own UDT
+Properties dialog** (`Data Type Size` field — an authoritative value the user screenshotted for
+`Lug`, `Encoder`, and `LugWrk`), after seven other hypotheses (TIMER/COUNTER reference, array-of-
+struct members, `DataType`-level `built_in`/`module_defined`/`string_family` flags, tag-level
+attributes, `record_format_version`/`cip_type`, object_id ordering) were tested and ruled out:
+
+1. **`_get_type_size()` must round a UDT's computed size up to a multiple of 4, not just leave it
+   as-is.** Rockwell always declares a UDT's total size as a multiple of 4, confirmed directly:
+   `Encoder`'s members sum to 263 bytes (its own last member is one of three trailing 1-byte hidden
+   `SINT` backing fields for BIT-flag groups), but Studio's own Properties dialog shows `Encoder`'s
+   `Data Type Size` as **264** — later, the user explicitly confirmed this in general ("UDT can
+   only have a multiple of 4 byte total size"), correcting an initial narrower guess of just
+   "round to even" (264 happens to also be even, which is why the narrower guess wasn't immediately
+   caught). `Lug` (568) and `Timing` (144) are already multiples of 4, which is why testing only
+   those two earlier didn't surface this.
+2. **A BOOL array member can absorb part or all of a pending dead-byte shift via its own 4-byte
+   alignment, so `_apply_dead_member_byte_corrections()` must not apply the shift flatly.** Found by
+   comparing `LugWrk`'s own computed size (650) against Studio's declared size for the *same* UDT
+   (**648**) — a 2-byte *overcorrection*, in the opposite direction from the original dead-member
+   bug. Root cause: `LugWrk`'s trailing `Ons` (`BOOL[32]`, 4-byte aligned since it's bit-packed into
+   DINT-sized words — the same rule `_get_type_size()` already uses for BOOL-array *sizing*) had its
+   own stored offset already correctly positioned by Rockwell's own alignment padding (which
+   naturally absorbs a smaller gap left by the preceding dead-member correction); blindly adding the
+   full pending +2 on top of an already-correctly-aligned offset overcorrected it. Fixed by having
+   `_apply_dead_member_byte_corrections()` track each member's own true end as it walks a DataType's
+   members, and for a BOOL array specifically, recompute its start by aligning up from the previous
+   member's true end (`-(-prev_true_end // 4) * 4`) instead of adding the flat cumulative shift —
+   the *effective* shift actually applied (which may be less than the pending amount) is what
+   carries forward to subsequent members. Also fixed a related latent bug this exposed: a scalar
+   struct-typed member's own contribution to the running "true end" tracker didn't include its
+   nested type's own dead bytes, which would have mattered if a BOOL array followed such a member
+   with nothing in between (not exercised by `LugWrk`'s own shape, but fixed since found).
+
+**Verified**: `Lug` (568), `Encoder` (264), and `LugWrk` (648) computed sizes now all match Studio
+5000's own declared "Data Type Size" for the same three real UDTs exactly. Re-ran the full
+99-`DataType` whole-project comparison and the 369-tag array sweep (both established earlier in
+this investigation): still zero mismatches for both, confirming these two fixes are a no-op for
+every UDT that doesn't need them (the overwhelming majority — no dead members, no BOOL array
+immediately following one). `Trim_Decision`/`Fence_Decision`'s `L5K` literal re-verified
+byte-for-byte identical to real Studio ground truth after this change. New regression test:
+`test_apply_dead_member_byte_corrections_bool_array_absorbs_shift_via_alignment`.
+
+**Still open, NOT resolved by either fix above**: `EncTrm`'s own scalar members (`PlssQty`, `Pstn`,
+etc.) still decode wrong — confirmed via raw byte inspection that the entire tag's value region
+needs an additional whole-tag +2 shift (base `0x1A2 + 2`, not `0x1A2`) despite `EncTrm` being a
+*scalar* (non-array) tag, which contradicts the array-vs-scalar rule established for primitive
+arrays elsewhere in this file. A wide, systematic sweep of 60 real scalar UDT-typed tags found that
+`Lug`/`LugWrk`-typed tags are the *only* ones that don't need this additional shift — every other
+UDT type tested does — but no structural, `DataType`-level, or tag-level property found so far
+predicts this split; it may be a per-tag artifact of when/how that specific tag's data was
+allocated, not something derivable from the UDT's current declared structure at all. Do not guess a
+fix for this without further real data — see the git history around this comment for the specific
+hypotheses already tried and ruled out, so they aren't re-tried.
+
 ## Rung patch write-back (`patch_rungs`/`patch_sbregion_dat`)
 
 This path (`acd/zip/write_dat.py`) had **zero test coverage** until it was manually exercised

@@ -938,10 +938,23 @@ def _l5k_string_padded(text: str, capacity: int) -> str:
     0x7F) this way, rather than just NUL, so this can never happen again
     regardless of which specific byte value the root-cause garbage data
     happens to produce.
+
+    Bytes >= 0x80 (non-ASCII) are escaped the same ``$XX`` way -- Studio 5000
+    rejects an L5K string literal containing a raw non-ASCII character with
+    "Only ASCII characters are supported". Found via a real array tag whose
+    STRING member held uninitialized/garbage data (an implausible LEN of
+    millions, clamped to the type's capacity, meaning the following "text"
+    bytes were never real content); the raw bytes weren't valid UTF-8, and
+    utf-8-decoding them (this function's caller previously used
+    errors="replace") inserted U+FFFD, an unescaped non-ASCII codepoint,
+    into what must be an ASCII-only literal. Now that the caller decodes as
+    latin-1 (1:1 byte<->codepoint, never fails), every original byte value
+    reaches here intact and gets escaped correctly, whether it's meaningful
+    extended/accented text or garbage.
     """
     escaped = text.replace("$", "$$").replace("'", "$'")
     escaped = "".join(
-        f"${ord(ch):02X}" if ord(ch) < 0x20 or ord(ch) == 0x7F else ch
+        f"${ord(ch):02X}" if ord(ch) < 0x20 or ord(ch) == 0x7F or ord(ch) > 0x7E else ch
         for ch in escaped
     )
     pad = "$00" * max(capacity - len(text), 0)
@@ -1197,6 +1210,21 @@ def _decode_string_family_value(
     tag, array element, or a member nested inside another struct), so the
     generic UDT-rendering code can treat it identically everywhere via
     _udt_scalar_to_xml's own string-family check.
+
+    Decoded as latin-1 (a 1:1 byte<->codepoint mapping that can never fail),
+    NOT utf-8 -- a Rockwell STRING is just a raw SINT[] byte array with no
+    guarantee of valid UTF-8 content, and utf-8-with-errors="replace" was
+    found to insert U+FFFD (a non-ASCII codepoint) for any byte sequence
+    that doesn't happen to be valid UTF-8 -- confirmed via a real project
+    tag (an array element whose STRING member was uninitialized/garbage
+    data, not real text) whose L5K export Studio 5000 rejected with "Only
+    ASCII characters are supported": _l5k_string_padded() already $XX-hex-
+    escapes every control character for exactly this reason, but had no
+    non-ASCII bytes to escape in the first place until utf-8 decoding
+    replaced them with an unescaped, illegal-for-L5K codepoint. latin-1
+    preserves every original byte value 0x00-0xFF as its own codepoint, so
+    _l5k_string_padded's escaping (extended below to cover >= 0x80 too) can
+    correctly represent any byte, meaningful text or garbage alike.
     """
     cap = _string_family_capacity(type_name, data_types_map)
     if offset + 4 > len(blob):
@@ -1206,7 +1234,7 @@ def _decode_string_family_value(
     text = ""
     if offset + 4 + length <= len(blob):
         raw = blob[offset + 4: offset + 4 + length]
-        text = raw.decode("utf-8", errors="replace")
+        text = raw.decode("latin-1")
     return {"LEN": length, "DATA": text}
 
 

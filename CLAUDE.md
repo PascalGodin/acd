@@ -1137,6 +1137,40 @@ not independently verified against a real nested-UDT-with-REAL-member sample.
 Regression tests: `test_l5k_real_literal_nan_and_infinity_do_not_crash`,
 `test_decorated_real_literal_scalar_nan`, `test_decorated_real_literal_array_infinity_matches_real_quirk`.
 
+## STRING-family decode must use latin-1, never utf-8 (`_decode_string_family_value`)
+
+Found immediately after re-testing the `Trim_Decision` export fixes above against real Studio 5000:
+a *different* real tag (`LugTrm`, a `Lug[200]` array) failed import with `Only ASCII characters are
+supported` on its `<Data Format="L5K">` element. Root cause: `_decode_string_family_value` decoded a
+STRING member's raw bytes with `raw.decode("utf-8", errors="replace")` — a Rockwell STRING is just a
+raw `SINT[]` byte array with no guarantee of valid UTF-8 content, and for element 114 of that array
+(uninitialized/garbage data — its own `LEN` field read as ~17.8 million, obvious nonsense, clamped to
+the type's 82-byte capacity, meaning the "text" that follows was never real content either) the raw
+bytes weren't valid UTF-8. `errors="replace"` silently inserted U+FFFD (the Unicode replacement
+character) for every invalid sequence — itself a non-ASCII codepoint, and unlike control characters
+(already `$XX`-hex-escaped by `_l5k_string_padded`, see above), nothing was escaping it, so it reached
+the L5K literal raw and Studio rejected it.
+
+Fixed by decoding as **latin-1** instead — a 1:1 byte↔codepoint mapping that can never fail (every
+byte 0x00-0xFF maps to a valid codepoint), so every original byte value survives intact whether it's
+meaningful accented/extended text (plausible in this project — French terminology in tag/product
+names) or pure garbage. `_l5k_string_padded`'s existing `$XX`-escape logic (originally only for
+control characters 0x00-0x1F/0x7F) was extended to also escape any byte `> 0x7E` (non-ASCII), so
+every possible byte value the latin-1 decode can now produce is representable in an ASCII-only L5K
+literal. **`_string_literal_cdata`/`Tag._sanitize_xml_text` (used for the `Decorated` CDATA content)
+needed no change** — XML 1.0 legitimately allows Unicode text in CDATA (0x20–0xD7FF, 0xE000–0xFFFD),
+so a latin-1-decoded accented character (or garbage byte) renders there as valid, unescaped XML,
+matching what real Studio would show; only the `L5K` text-literal format has the ASCII-only
+restriction.
+
+Verified: the same real project's `LugTrm`/`LugALL`/etc. tags no longer produce any non-ASCII
+character in their `L5K` output (swept every controller-scope tag), while `Decorated` output still
+correctly contains the raw latin-1-decoded characters in CDATA (not stripped or escaped away) — and
+`Trim_Decision`/`Fence_Decision` (fixed earlier in this same investigation) still match real Studio
+ground truth exactly, confirming this change didn't regress anything for tags without STRING content.
+Regression tests: `test_decode_string_family_value_uses_latin1_never_replacement_char`,
+`test_l5k_string_padded_escapes_non_ascii_bytes`, `test_l5k_string_padded_still_escapes_control_chars`.
+
 ## Rung patch write-back (`patch_rungs`/`patch_sbregion_dat`)
 
 This path (`acd/zip/write_dat.py`) had **zero test coverage** until it was manually exercised

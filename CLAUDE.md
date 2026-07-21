@@ -993,6 +993,56 @@ project against a *whole-project* L5X export, not just the specific UDT named in
 Don't treat "fixes the reported case" as "correct in general" for this kind of byte-offset
 heuristic — cross-check against everything available before considering it done.
 
+## Nested-UDT decode recursion-depth double-increment (`_decode_single_udt_element`)
+
+A real Studio 5000 import of an `export_routine()` output failed with `Failed to set the 'Data'
+property (Data type mismatch...)` at the line of a tag's `<Data Format="L5K">` element
+(`Trim_Decision`, `LugWrk`-typed). Traced to `_decode_single_udt_element`'s `depth` counter being
+incremented **twice** per real struct-nesting level: once where it calls `_decode_scalar_member(...,
+depth + 1, ...)`, and again inside `_decode_scalar_member`, which itself calls
+`_decode_single_udt_element(..., depth + 1)` before descending. This silently halved the usable
+nesting depth from the documented 3 levels (`_max_depth=3`) to effectively 1 — a real UDT only 2
+real levels deep (`LugWrk` → `Lug` → `LugErrorCode`, via `Trim_Decision.BfrLug.ErrorCd`) had its
+innermost member (`ErrorCd`) decode to `{}` well within the intended limit. An empty dict for a
+struct-typed member renders as nothing at all in `<Data Format="Decorated">` (the whole
+`<StructureMember>` is silently dropped since `_udt_scalar_to_xml` only appends it `if inner:`,
+easy to miss entirely in a spot-check) but as a bare `"[]"` in the `L5K` literal's fixed-position
+array — a shape Studio 5000 rejects on import, which is how this was actually caught (an ordinary
+Decorated-only diff would have missed it, another argument for checking L5K too, not just
+Decorated, per the AOI-instance-value gap noted elsewhere in this file).
+
+Fixed by removing the redundant increment at the two call sites in `_decode_single_udt_element`
+(now passes plain `depth`, not `depth + 1`, to `_decode_scalar_member` — which still owns the
+single `depth + 1` when it actually recurses into a nested UDT). Verified: `ErrorCd` now decodes
+all 36 of its own members instead of `{}`. Two synthetic unit tests
+(`test_decode_single_udt_element_two_real_levels_of_struct_nesting`,
+`test_decode_single_udt_element_still_truncates_beyond_max_depth`) lock in both the fix (2 real
+levels of nesting must decode fully) and that the depth-limit safety net itself still works (4
+real levels must still truncate the innermost to `{}`) — this had zero prior test coverage.
+
+**A second, separate, NOT-yet-fixed discrepancy found on the same tag while verifying the fix
+above**: 5 scalar members of `LugWrk` itself (`pntrTpStrt`/`pntrTpStp`/`pntrTpTrtmnt`/`pntrLug`/
+`pntrDrtn`, declared directly after the nested `BfrLug` (`Lug`-typed) member) decode values shifted
+by exactly one `INT` (2 bytes) versus the real Studio ground truth — confirmed by direct raw-byte
+inspection of the tag's own data-table blob: the true values (`24,25,0,183,0`) sit at byte offsets
+570/572/574/576/578, but each of these members' own *stored* `_byte_offset` (read from the raw ACD
+record's own `0x60` field) says 568/570/572/574/576 — 2 bytes short. Ruled out several
+explanations: `Lug`'s own 133 members are individually self-consistent and 100% correct (verified
+leaf-by-leaf against ground truth — the STRING member `Z5_Product_Name` at offset 340 correctly
+gaps 88 bytes to the next member, matching `_STRING_SIZE`; the struct's own last member,
+`Trim_Decision`, a `DINT[10]`, is contiguous with its neighbors with no internal gap anywhere).
+`_get_type_size("LUG", ...)` and `Lug`'s own last member's stored offset+size both independently
+agree on 568 — yet the *true* required value is 570. This looks like a real, not-yet-understood
+Rockwell layout/alignment quirk in how a nested-UDT member's true occupied size differs from a
+simple `max(offset + size)` computation over its own members — not a bug in how we read/interpret
+already-stored offsets, since every stored offset involved is self-consistent, just collectively 2
+bytes short of the physical truth. **Do not guess a padding rule and apply it broadly
+(e.g. "always round a struct member's size up to N bytes") without finding more real examples to
+characterize it first** — this is exactly the kind of heuristic that looked-complete-but-wasn't in
+the BIT-target-resolution investigation above. Revisit this by finding another real UDT with a
+similar "struct member immediately followed by more scalar siblings" shape and comparing stored
+vs. true offsets the same way, before attempting a fix.
+
 ## REAL/LREAL NaN and Infinity rendering (`_l5k_real_literal`/`_decorated_real_literal`)
 
 Found while attempting a full whole-project `to_xml()` export of a large real project for the

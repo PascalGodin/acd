@@ -1216,6 +1216,20 @@ def _decode_single_udt_element(
     COUNTER.CU/CD/DN/OV/UN -- needed by _udt_scalar_to_xml, which renders
     them as real BOOL DataValueMembers). Returns an empty dict when *depth*
     exceeds ``_max_depth``.
+
+    *depth* counts real struct-nesting levels (0 = the tag's own top-level
+    struct), incremented exactly once per level by _decode_scalar_member
+    when it actually descends into a nested UDT. Do NOT also increment it
+    in the calls to _decode_scalar_member below -- a real bug here (fixed)
+    incremented depth both here AND inside _decode_scalar_member, silently
+    halving the usable nesting depth from the documented 3 levels to
+    effectively 1: a real UDT only 2 real levels deep (LugWrk -> Lug ->
+    LugErrorCode) had its innermost member silently decode to `{}` well
+    within the intended limit. A `{}` for a struct-typed member renders as
+    nothing in Decorated output (a member simply goes missing, easy to miss
+    entirely) but as a bare "[]" in the L5K literal's fixed-position array
+    -- a shape Studio 5000 rejects on import as "Data type mismatch", which
+    is how this was actually caught.
     """
     if depth > _max_depth:
         return {}
@@ -1253,14 +1267,14 @@ def _decode_single_udt_element(
             for i in range(member.dimension):
                 elem_off = off + i * elem_size
                 val = _decode_scalar_member(
-                    blob, elem_off, mdt, data_types_map, depth + 1,
+                    blob, elem_off, mdt, data_types_map, depth,
                     bit_number=bn,
                 )
                 arr.append(val)
             result[mname] = arr
         else:
             val = _decode_scalar_member(
-                blob, off, mdt, data_types_map, depth + 1,
+                blob, off, mdt, data_types_map, depth,
                 bit_number=bn,
             )
             result[mname] = val

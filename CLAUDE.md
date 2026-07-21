@@ -915,6 +915,61 @@ Studio ground truth for two different built-in types: `DelayedControlPowe` (TIME
 exactly; `Luci_NOBRD` (COUNTER) now renders all 5 status bits (structurally verified, though no
 independent real-Studio ground truth exists for this specific tag's own `Control` value).
 
+**5. Arrays need offset 0x1A2 + 2, not 0x1A2 — a major, project-wide bug, found via a real Studio
+5000 import error that turned out to be unrelated to what was actually wrong.** After re-testing an
+`export_routine()` export following the `Trim_Decision`/`LugWrk` fixes above, Studio reported `Only
+ASCII characters are supported` on an unrelated tag (`LugTrm`) — chased down and fixed (see the
+STRING/latin-1 section below) — but while re-verifying the *other* tags swept into that same export
+as context, a completely different, far larger bug turned up: `Comm_From_VABView_Recipe_Status`
+(a plain `DINT[40]` tag, no UDT involved at all) showed every decoded value as if multiplied by
+65536 versus the real Studio value (e.g. existing `3` → our `196608`, existing `192` → our
+`12582912`) in Studio's own **Tag Name Collision / Data Compare** dialog — the exact tell-tale
+signature of a value's real bytes landing in the high 16 bits of a 4-byte read that started 2 bytes
+too early (if the true low-order bytes are zero, as they always are for a small value, `value` read
+2 bytes early becomes `value << 16` = `value * 65536`, with no other distortion). The 0x1A2 offset
+established two findings up was **only ever verified against scalar tags** — arrays were never
+independently checked. A project-wide sweep confirmed this is not a one-off: **273 of 347 primitive
+array tags and 14 of 22 BOOL array tags** (SINT/INT/DINT/BOOL, every one checked against this same
+project's real Studio 5000 L5X export) decoded wrong at 0x1A2, and **all of them** decoded correctly
+at 0x1A2 + 2 — including a real `Dimensions="1"` tag (`Test_Bit_DINT`), confirming the split is keyed
+on `is_array` (declared array, even a 1-element one), not `n_elements > 1`, mirroring the identical
+scalar-vs-array distinction already established for the collapse-to-scalar behavior. Fixed by
+splitting `offset = 0x1A2 + 2 if is_array else 0x1A2` in both `_read_tag_initial_value` (primitives)
+and `_decode_udt_initial_value` (UDTs/struct arrays) — previously both hardcoded a single `0x1A2`
+with an explicit comment claiming "for both scalar and array tags... no separate scalar offset,"
+which this finding disproves.
+
+**This also caught and reversed a wrong turn from the very same investigation just above (the
+`Trim_Decision`/dead-member fix)**: `_get_type_size()` had been given a `+ dt._dead_member_bytes`
+addition on the untested assumption that a deleted member's persisting footprint would affect an
+*array* element's stride the same way it affects a scalar struct member's trailing siblings
+(`_apply_dead_member_byte_corrections()`, which is unrelated and still correct). Verified wrong
+against a real 200-element array of the exact UDT this was found on (`Lug`, via tag `LugTrm`): by
+directly locating two known-consecutive elements' own leading field value in the raw data-table
+blob (searching for the literal 4-byte little-endian encoding of "158" and "159"), the true
+per-element stride is exactly 568 bytes — the *plain* `max(offset + size)` computation, with **no**
+dead-byte addition (570 was wrong). Reverted `_get_type_size()` to never add `_dead_member_bytes`;
+the scalar-sibling case remains correctly handled by the separate, already-verified
+`_apply_dead_member_byte_corrections()` pass, which was never affected by this reversion.
+
+**Verified end-to-end**: with both the array-offset split and the `_get_type_size()` reversion in
+place, `Trim_Decision`/`Fence_Decision` still match real Studio ground truth exactly (unaffected,
+since they're scalar), `LugTrm`'s array elements now show the correct incrementing sequence
+(158, 159, 160, ...) at the correct stride, and the full project-wide sweep of every primitive/BOOL
+array tag with real ground truth (369 tags) came back with **zero mismatches**, up from 273+14
+wrong. This is the single highest-impact bug found in this investigation — it silently corrupted
+the large majority of every project's array tag values, primitive or UDT, scalar-vs-array
+distinction notwithstanding, and had gone undetected because the earlier verification pass (758
+BOOL + 812 DINT tags) happened to only include scalars.
+
+**Methodological lesson, worth restating a third time in this file**: a fix that resolves the
+specific reported symptom (here: the `Trim_Decision` "Data type mismatch") is not evidence the
+*surrounding* changes made along the way are correct — the `_get_type_size()` addition was never
+actually required to fix the reported bug (`_apply_dead_member_byte_corrections()` alone was
+sufficient) and was wrong for a case (arrays) nobody had checked yet. When touching a shared,
+widely-called helper like `_get_type_size()`, verify the *new* behavior against a case that
+specifically exercises the path being changed, not just the one bug report that prompted the change.
+
 ## BIT-overlay member Target resolution (`MemberBuilder.build`/`_resolve_bit_target`)
 
 A UDT's BIT-type members (bit-overlay pseudo-members aliasing one bit of a sibling field, e.g.
@@ -1062,18 +1117,21 @@ the smallest non-BOOL primitive), logged via `log.warning()` so a wrong guess fo
 project's dead member is visible rather than silently corrupting values, stored on the owning
 `DataType` as `_dead_member_bytes` (`DataTypeBuilder.build()`).
 
-Two call sites needed this, not one — a wrong assumption caught only the first:
-- `_get_type_size()` adds `dt._dead_member_bytes` on top of `max(offset + size)` over visible
-  members — this is what fixes an **array** of a dead-member-carrying struct type (element stride).
-- **This alone did not fix `Trim_Decision`** — `pntrTpStrt` etc. are *scalar* (non-array) siblings
-  of `BfrLug`, and a scalar struct-typed member never consults `_get_type_size()` at all; its own
-  (and every subsequent sibling's own) byte offset comes directly from Rockwell's stored per-member
-  value, equally blind to the dead member's footprint. Needed a **second**, separate mechanism:
-  `_apply_dead_member_byte_corrections()`, a post-processing pass run once every `DataType` is
-  built (so nested-type name references resolve, including forward references), which walks each
-  DataType's own members in declaration order and shifts every member *after* a scalar struct-typed
-  member whose nested type carries dead bytes, cumulatively (so multiple dead-byte-carrying structs
-  in the same chain compound correctly).
+`pntrTpStrt` etc. are *scalar* (non-array) siblings of `BfrLug`, and a scalar struct-typed member
+never consults `_get_type_size()` at all; its own (and every subsequent sibling's own) byte offset
+comes directly from Rockwell's stored per-member value, equally blind to the dead member's
+footprint. Fixed via `_apply_dead_member_byte_corrections()`, a post-processing pass run once every
+`DataType` is built (so nested-type name references resolve, including forward references), which
+walks each DataType's own members in declaration order and shifts every member *after* a scalar
+struct-typed member whose nested type carries dead bytes, cumulatively (so multiple dead-byte-
+carrying structs in the same chain compound correctly).
+
+**A first attempt also added `dt._dead_member_bytes` inside `_get_type_size()` itself, reasoning
+this would additionally fix an *array* of a dead-member-carrying struct type's element stride —
+this was wrong, and reverted.** See "Initial-value decoding offset bugs" (finding 5) below for the
+full story: verified against a real 200-element array of this exact UDT that the true per-element
+stride is the plain `max(offset + size)` value with **no** dead-byte addition. `_get_type_size()`
+must never add `_dead_member_bytes`; only `_apply_dead_member_byte_corrections()` needs it.
 
 **Verified**: `Trim_Decision` and its sibling `Fence_Decision` (both `LugWrk`-typed) now match real
 Studio 5000 ground truth **exactly** — 170/170 leaf `Decorated` values identical, and the `L5K`
@@ -1081,11 +1139,11 @@ literal byte-for-byte identical (736 chars, zero diff) — up from 5 wrong scala
 truncated `L5K` shape. Re-ran the full 99-`DataType` whole-project comparison (see the BIT-target
 section above) after this fix: still zero mismatches, confirming the correction pass doesn't
 disturb any DataType lacking a dead member (the overwhelming majority — `_dead_member_bytes`
-defaults to 0, making both new mechanisms a no-op unless a real orphan is detected). New unit tests
-(`test_get_type_size_includes_dead_member_bytes`,
+defaults to 0, making it a no-op unless a real orphan is detected). Unit tests
+(`test_get_type_size_does_not_add_dead_member_bytes`,
 `test_apply_dead_member_byte_corrections_shifts_subsequent_members`,
-`test_apply_dead_member_byte_corrections_noop_when_no_dead_bytes`) lock in both mechanisms
-independent of any real ACD fixture.
+`test_apply_dead_member_byte_corrections_noop_when_no_dead_bytes`) lock in both the correction pass
+and that `_get_type_size()` stays a no-op for dead bytes, independent of any real ACD fixture.
 
 **Caveat for the next dead member found in a different project**: the "2 bytes, INT-sized" default
 is confirmed correct for exactly one real case. If a future orphaned member turns out to need a

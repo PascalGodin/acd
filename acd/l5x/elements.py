@@ -192,6 +192,12 @@ class DataType(L5xElement):
     cls: str
     members: List[Member]
     _description: Union[str, None] = field(default=None)
+    # Extra bytes a deleted-but-still-space-occupying member contributes to
+    # this UDT's true physical size, on top of what summing visible members
+    # gives -- see _get_type_size()'s docstring and DataTypeBuilder.build()
+    # for how this is detected/estimated. 0 for the overwhelming majority of
+    # UDTs (no deleted members at all).
+    _dead_member_bytes: int = field(default=0)
 
     def __post_init__(self):
         super().__post_init__()
@@ -980,8 +986,11 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
     """Return the byte size of a DataType (primitive, STRING, or UDT).
 
     For UDTs, computes max(byte_offset + elem_size * max(dimension,1))
-    across non-hidden non-BIT members.
-    Returns 0 for unknown types.
+    across non-hidden non-BIT members, plus dt._dead_member_bytes -- extra
+    bytes a deleted-but-still-space-occupying member contributes on top of
+    what currently-visible members alone would suggest (see
+    DataTypeBuilder.build()'s own comment for the real case this was found
+    from). Returns 0 for unknown types.
     """
     t = type_name.upper()
     prim = _PRIM.get(t)
@@ -1016,7 +1025,9 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
                 continue
             member_end = m._byte_offset + (elem_sz * max(m.dimension, 1))
         max_end = max(max_end, member_end)
-    return max_end if max_end > 0 else 0
+    if max_end == 0 and dt._dead_member_bytes == 0:
+        return 0
+    return max_end + dt._dead_member_bytes
 
 
 def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
@@ -2494,6 +2505,7 @@ class DataTypeBuilder(L5xElementBuilder):
         )
         member_results = self._cur.fetchall()
         children: List[Member] = []
+        dead_member_bytes = 0
         if len(member_results) == 1:
             member_collection_id = member_results[0][1]
 
@@ -2561,6 +2573,42 @@ class DataTypeBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
+            # Whatever's left in name_to_child is a member-collection child
+            # with NO matching extended-record descriptor -- a deleted UDT
+            # member. Deleting a member removes its type-level descriptor
+            # (data_type/dimension), but NOT its old byte range from any tag
+            # data table already allocated before the deletion -- verified
+            # against a real project (UDT "Lug", deleted member
+            # "Z1_Nominal_Width", confirmed via an older Studio 5000 export
+            # of the same UDT to have been DataType="INT") where this caused
+            # a real Studio Import Routine rejection ("Data type mismatch"):
+            # every member declared after "Lug" in the containing UDT was
+            # being decoded 2 bytes too early, because neither the UDT's own
+            # declared total-size attribute nor any live sibling's own
+            # stored byte offset accounts for the dead member's footprint --
+            # both were computed from currently-visible members only. We
+            # cannot recover a dead member's real original type in general
+            # (its extended-record content was removed, not just marked
+            # dead, and its comps row alone carries no size/type hint --
+            # confirmed by direct comparison against a live member's comps
+            # row: the two are near-identical boilerplate, with 8 bytes at
+            # the very front of a live row -- likely a type reference -- are
+            # zeroed/absent in a dead one), so this assumes 2 bytes (an
+            # INT/UINT, the smallest non-BOOL primitive) per orphaned
+            # member as a best-effort default -- verified correct for the
+            # one real case found so far, but a guess for any other project
+            # until confirmed otherwise; logs a warning so a wrong guess is
+            # visible rather than silently corrupting other members' values.
+            if name_to_child:
+                log.warning(
+                    f"DataType {name!r}: {len(name_to_child)} deleted member(s) "
+                    f"with no type descriptor found ({sorted(name_to_child)}) -- "
+                    "assuming 2 bytes (INT-sized) each for size computation; "
+                    "if this DataType's struct size is still wrong, this guess "
+                    "may not match the real deleted member(s)' original type."
+                )
+            dead_member_bytes = len(name_to_child) * 2
+
         # --- Description ---
         description: Union[str, None] = None
         self._cur.execute(
@@ -2571,7 +2619,48 @@ class DataTypeBuilder(L5xElementBuilder):
         if desc_row and desc_row[0]:
             description = desc_row[0]
 
-        return DataType(name, name, string_family, class_type, children, description)
+        return DataType(
+            name, name, string_family, class_type, children, description,
+            _dead_member_bytes=dead_member_bytes,
+        )
+
+
+def _apply_dead_member_byte_corrections(all_data_types_map: Dict[str, "DataType"]) -> None:
+    """Shift `_byte_offset` for every member declared after a scalar
+    (non-array) struct-typed member whose own nested DataType has
+    `_dead_member_bytes > 0` (see DataTypeBuilder.build()'s own comment for
+    what this corrects and why -- a deleted member's old byte range keeps
+    occupying real space in an already-allocated tag's data table even
+    though it has no live type descriptor anymore).
+
+    `_get_type_size()` already accounts for `_dead_member_bytes` when
+    computing an *array* element's stride, but a *scalar* struct-typed
+    member (dimension 0, e.g. LugWrk's own "BfrLug" -> "Lug") never
+    consults `_get_type_size()` at all -- its own byte offset, and every
+    subsequent sibling's, comes directly from Rockwell's own stored
+    per-member `0x60` value, which is equally blind to the dead member's
+    footprint. This is a separate, explicit post-processing pass (not done
+    inline while building each DataType) because it needs every DataType
+    already built first, to resolve a member's nested-type name to that
+    type's own `_dead_member_bytes` -- including forward references (a
+    UDT can reference another UDT declared later in Comps.Dat).
+
+    Verified against a real project: without this, every member declared
+    after LugWrk's "BfrLug" (Lug-typed) was read 2 bytes too early,
+    corrupting 5 scalar members' decoded values and producing a bare "[]"
+    for one further-nested member -- Studio 5000 rejected the resulting
+    export as "Data type mismatch". Fixed, and confirmed byte-exact
+    against a real Studio 5000 L5X export of the same tag.
+    """
+    for dt in all_data_types_map.values():
+        cumulative_shift = 0
+        for member in dt.members:
+            if cumulative_shift:
+                member._byte_offset += cumulative_shift
+            if member.dimension == 0 and member.data_type != "BIT":
+                nested_dt = all_data_types_map.get(member.data_type.upper())
+                if nested_dt is not None and nested_dt._dead_member_bytes:
+                    cumulative_shift += nested_dt._dead_member_bytes
 
 
 # Connection Type CIP enum, read at absolute offset 90 (u16le) of a
@@ -4271,6 +4360,8 @@ class ControllerBuilder(L5xElementBuilder):
             all_data_types_map[dt.name.upper()] = dt
             if dt.cls == "User":
                 data_types.append(dt)
+
+        _apply_dead_member_byte_corrections(all_data_types_map)
 
         # data_types_map: case-insensitive name → DataType for all types (User + ProductDefined).
         # Used by Tag.to_xml() when generating Decorated XML.

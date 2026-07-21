@@ -119,6 +119,34 @@ def test_read_tag_initial_value_scalar_uses_0x1a2_offset():
     assert value == 42
 
 
+def test_read_tag_initial_value_array_uses_0x1a2_plus_2_offset():
+    # Regression test for a major, project-wide bug found immediately after
+    # a real Studio 5000 import rejection was traced to something else
+    # entirely: the 0x1A2 offset above was only ever verified against
+    # SCALAR tags. A declared array (is_array=True, including a genuine
+    # one-element array) actually starts 2 bytes later, at 0x1A4 -- found
+    # via a real project where 273 of 347 primitive array tags and 14 of 22
+    # BOOL array tags decoded every value as if multiplied by 65536 (a
+    # value's real bytes landing in the high 16 bits of a 4-byte read
+    # started 2 bytes too early), confirmed correct once shifted +2.
+    blob = bytearray(0x1A2 + 8)
+    struct.pack_into("<i", blob, 0x1A2, 999)      # decoy -- must NOT be read
+    struct.pack_into("<i", blob, 0x1A2 + 2, 42)   # the real value
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE comps (object_id INTEGER, record BLOB)")
+    db.execute("INSERT INTO comps VALUES (1, ?)", (bytes(blob),))
+    cur = db.cursor()
+
+    # A genuine one-element array (Dimensions="1") must use the array
+    # offset too, not the scalar one -- n_elements alone can't distinguish
+    # the two cases, only is_array can (see the identical distinction for
+    # collapsing to a scalar return value, tested above).
+    value = _read_tag_initial_value(cur, 1, "DINT", 1, is_array=True)
+
+    assert value == [42]
+
+
 def test_l5k_real_literal_nan_and_infinity_do_not_crash():
     # A real production project was found with several uninitialized REAL
     # tags decoding to NaN/Infinity, which crashed this function entirely
@@ -259,18 +287,22 @@ def test_decode_single_udt_element_still_truncates_beyond_max_depth():
     assert result == {"b": {"c": {"d": {"e": {}}}}}
 
 
-def test_get_type_size_includes_dead_member_bytes():
-    # A DataType with a deleted member (no live descriptor, so it's not in
-    # .members at all) still physically reserves its old byte range in an
-    # already-allocated tag's data table -- _get_type_size() must add
-    # _dead_member_bytes on top of what summing visible members gives.
+def test_get_type_size_does_not_add_dead_member_bytes():
+    # _get_type_size() must NOT add dt._dead_member_bytes -- an earlier
+    # version of this function did, on the untested assumption that it
+    # would also apply to array-element striding the same way it applies
+    # to a scalar struct member's trailing siblings. Verified wrong against
+    # a real 200-element array of the exact UDT this was found on: the true
+    # per-element stride matched the plain max(offset+size) computation
+    # with NO dead-byte addition. _apply_dead_member_byte_corrections()
+    # handles the scalar-sibling case separately and correctly.
     inner_dt = DataType(
         "Inner", "Inner", "NoFamily", "User",
-        [_member("a", "DINT", byte_offset=0)],  # visible size: 4 bytes
+        [_member("a", "DINT", byte_offset=0)],  # size: 4 bytes
         _dead_member_bytes=2,
     )
     data_types_map = {"INNER": inner_dt}
-    assert _get_type_size("INNER", data_types_map) == 6
+    assert _get_type_size("INNER", data_types_map) == 4
 
 
 def test_apply_dead_member_byte_corrections_shifts_subsequent_members():

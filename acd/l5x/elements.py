@@ -999,11 +999,22 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
     """Return the byte size of a DataType (primitive, STRING, or UDT).
 
     For UDTs, computes max(byte_offset + elem_size * max(dimension,1))
-    across non-hidden non-BIT members, plus dt._dead_member_bytes -- extra
-    bytes a deleted-but-still-space-occupying member contributes on top of
-    what currently-visible members alone would suggest (see
-    DataTypeBuilder.build()'s own comment for the real case this was found
-    from). Returns 0 for unknown types.
+    across non-hidden non-BIT members. Returns 0 for unknown types.
+
+    Deliberately does NOT add dt._dead_member_bytes here -- an earlier
+    version of this function did, on the (untested) assumption that a
+    deleted member's persisting footprint would also affect an *array*
+    element's stride the same way it affects a scalar struct member's
+    trailing siblings (see _apply_dead_member_byte_corrections(), which
+    handles that latter case directly). Verified against a real array of
+    the exact UDT this was found on ("Lug", 200 elements): the true
+    per-element stride is the plain max(offset+size) value with NO dead-byte
+    addition -- confirmed by finding two known-consecutive elements' own
+    "No" field values at their real, empirically-located byte offsets 568
+    bytes apart. Adding dead-member bytes here would have silently
+    corrupted every array-of-that-struct tag project-wide; don't reinstate
+    it without re-verifying against a real array case specifically, not
+    just the scalar case this field was originally added for.
     """
     t = type_name.upper()
     prim = _PRIM.get(t)
@@ -1038,9 +1049,7 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
                 continue
             member_end = m._byte_offset + (elem_sz * max(m.dimension, 1))
         max_end = max(max_end, member_end)
-    if max_end == 0 and dt._dead_member_bytes == 0:
-        return 0
-    return max_end + dt._dead_member_bytes
+    return max_end if max_end > 0 else 0
 
 
 def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
@@ -1084,17 +1093,27 @@ def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
 
     raw_rec = bytes(rows[0][0])
 
-    # The data-table blob's value region always starts at 0x1A2, for both
-    # scalar and array tags -- there is no separate "scalar offset".
-    # Verified against a real project: comparing every controller-scope
-    # scalar BOOL tag (758) and DINT tag (812) against Studio 5000's own
-    # values, the previously-used scalar offset 0x19E matched only 21.4%
-    # (BOOL) / 2.8% (DINT) of the time, while 0x1A2 matched 100% for both.
-    # 0x19E was apparently never actually verified against real ground
-    # truth for scalars -- it happened to coincidentally produce a
-    # plausible-looking nonzero byte for many BOOL tags (silently wrong)
-    # and equally-wrong garbage for DINT/other scalar types.
-    offset = 0x1A2
+    # A genuine scalar's value region starts at 0x1A2 -- verified against a
+    # real project: comparing every controller-scope scalar BOOL tag (758)
+    # and DINT tag (812) against Studio 5000's own values, the previously-
+    # used scalar offset 0x19E matched only 21.4% (BOOL) / 2.8% (DINT) of
+    # the time, while 0x1A2 matched 100% for both. 0x19E was apparently
+    # never actually verified against real ground truth for scalars -- it
+    # happened to coincidentally produce a plausible-looking nonzero byte
+    # for many BOOL tags (silently wrong) and equally-wrong garbage for
+    # DINT/other scalar types.
+    #
+    # A declared ARRAY (is_array=True, including a genuine one-element
+    # array, Dimensions="1") needs 2 MORE bytes: 0x1A4, not 0x1A2. This was
+    # never actually verified for arrays when the 0x1A2 rule above was
+    # established (only scalars were checked) -- found via a real project
+    # where 273 of 347 primitive array tags, 14 of 22 BOOL array tags, and
+    # a real Dimensions="1" tag (Test_Bit_DINT) all silently decoded wrong
+    # (every value effectively multiplied by 65536 for tags whose true
+    # values were small enough to fit in 16 bits, since a value's real
+    # bytes land in the high 16 bits of a misaligned 4-byte read) --
+    # confirmed correct for every one of those tags once shifted +2.
+    offset = 0x1A2 + 2 if is_array else 0x1A2
 
     # BOOL/BIT *arrays* are bit-packed by Rockwell -- 32 bits per 4-byte
     # DWORD, NOT one byte per element (a scalar BOOL, n_elements == 1, is
@@ -1185,7 +1204,15 @@ def _decode_udt_initial_value(
     if struct_size == 0:
         return None
 
-    offset = 0x1A2
+    # See the identical scalar-vs-array offset split in
+    # _read_tag_initial_value -- a declared array (is_array=True, including
+    # a genuine one-element array) starts 2 bytes later than a scalar.
+    # Confirmed via a real 200-element array of a UDT ("Lug"): its first
+    # element's own leading field sat at byte 0x1A4, not 0x1A2, with a
+    # per-element stride equal to the plain (non-dead-byte-adjusted)
+    # struct_size above -- see _get_type_size()'s own docstring for why
+    # dead-member bytes must NOT also be added here.
+    offset = 0x1A2 + 2 if is_array else 0x1A2
 
     results: list = []
     for elem_idx in range(n_elements):

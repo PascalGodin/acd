@@ -915,6 +915,84 @@ Studio ground truth for two different built-in types: `DelayedControlPowe` (TIME
 exactly; `Luci_NOBRD` (COUNTER) now renders all 5 status bits (structurally verified, though no
 independent real-Studio ground truth exists for this specific tag's own `Control` value).
 
+## BIT-overlay member Target resolution (`MemberBuilder.build`/`_resolve_bit_target`)
+
+A UDT's BIT-type members (bit-overlay pseudo-members aliasing one bit of a sibling field, e.g.
+TIMER's `EN`/`TT`/`DN` aliasing its hidden `Control` DINT — see the section above) need a `Target=`
+attribute naming that sibling in the exported L5X; Studio 5000's schema requires it, and rejects
+Import Routine with `Required property 'Target' was missing` if it's absent. This was originally
+resolved via a small enumerated "pattern" on the member's raw `0x68` value (0/1/0x800), each
+branch using a different resolution mechanism. **A downstream agent found this incomplete on a
+real UDT** (`LugWrk` in a real project): its 4 BIT members (`ActvtnArea`/`AcqstnArea`/`TrtmntArea`/
+`TrtmntAllwd`, overlaying hidden `ZZZZZZZZZZLugWrk9`) all had `val_68=0x9`, a value outside the
+enum, which fell into the code's "not a BIT sub-element, leave as plain BOOL" catch-all — so
+`export_routine()` emitted these as `<Member DataType="BOOL">` with no `Target=` at all, and
+Studio's Import Routine rejected the file. The agent traced the raw bytes far enough to identify
+`0x68=0x9` as the distinguishing value and confirm the existing "Pattern 1" mechanism (treating
+`0x6c` as an offset60_to_name lookup key) failed for this case (`0x6c=596` matched no real member's
+own `0x60`, including the true backing field's `0x60=640`), but didn't have real Studio ground
+truth in hand to determine the *correct* fix.
+
+**Investigation, with the user then providing a real Studio 5000 export of the exact UDT as ground
+truth** (`LugWrk_DataType.L5X`, plus a whole-project L5X for broader verification) — the decisive
+resource for getting this right rather than guessing:
+
+1. Confirmed `LugWrk`'s 4 BIT members share their own `0x60` value (640) with the hidden backing
+   field (`ZZZZZZZZZZLugWrk9`, also `0x60=640`) — this is the SAME condition the code's existing
+   "Pattern 3" branch already checked (`offset60_to_name.get(own 0x60)`), just gated behind
+   `val_68 == 1` specifically. Generalizing "Pattern 1"/"Pattern 3" into a single "not a BIT
+   sub-element only if `0x68==0x800` and `0x6c==0xFFFFFFFF`; otherwise try `0x6c`-lookup then
+   own-`0x60`-lookup" fixed `LugWrk` and, cross-checked against the same ground truth file's
+   sibling `Lug` UDT (which the agent hadn't examined), ALSO fixed 8 more real BIT members there
+   with yet more previously-unseen `val_68` values (0x2, 0x14) that had been silently misclassified
+   as plain BOOL by the original code's catch-all `else` branch — not just left unresolved, actually
+   wrong. Neither `LugWrk` nor `Lug` mentioned anywhere in this repo before this session.
+2. **A separate, real bug found in the same pass**: `Member.to_xml()`'s generic attribute
+   auto-serialization emitted `BitNumber="0"` on `Ons`, a plain `BOOL[32]` array member — because
+   `member.bit_number` is set for every BOOL member internally (needed as a data-table decode hint
+   by `_decode_single_udt_element`/`_decode_scalar_member`, unrelated to XML rendering) but the
+   base `to_xml()` has no way to know that distinction. Real Studio export never emits `BitNumber=`
+   for a non-BIT member. Fixed by having `Member.to_xml()` strip a spurious `BitNumber=` attribute
+   whenever `data_type != "BIT"`, without touching the field's internal (still-needed) value.
+3. **A deeper, more consequential bug found while cross-checking the *whole* project's L5X against
+   ground truth** (99 `DataType`s, not just the two directly implicated): the "own `0x60` lookup"
+   mechanism from step 1 is not reliable in general — `offset60_to_name` is a flat, UDT-wide map
+   keyed purely by raw byte offset, and nothing prevents an unrelated, real (non-hidden) field from
+   coincidentally sharing a BIT member's own `0x60` with a *different* field than its true backing
+   one. Found concretely in `Bin_Sequence`: `Action_1`..`Action_16`'s own `0x60` all read `4`,
+   which matches real field `Sling_Pos_1` (also `0x60=4`) — NOT either of the UDT's two genuine
+   hidden backing fields (`ZZZZZZZZZZBin_Sequen1`/`ZZZZZZZZZZBin_Sequen10`, at `0x60=2`/`0x60=3`
+   respectively). The lookup didn't fail — it returned a wrong-but-plausible name, which is worse
+   than failing outright, and 3 more real UDTs in the same project turned up the identical
+   collision (`Product_Definition`, `Sorts`, `VAB_Data_Sorter_To_Scanner`). The ONE mechanism that
+   resolved every real case found correctly, including this collision — `LugWrk`, `Lug`, TIMER,
+   COUNTER, and all four collision UDTs — is **declaration order**: a BIT-overlay member always
+   immediately follows its own backing field, so the pre-existing `_fallback_target` (most-recent
+   preceding hidden member, originally only used for one narrow `val_68==0` branch) is now tried
+   FIRST, before either offset-based lookup. The offset-based lookups are kept only as a fallback
+   for when no hidden member precedes at all (verified this is what makes TIMER/COUNTER's `EN`/
+   `TT`/`DN` resolve — their shared `0x60=12` matches no plain-field entry, since `_fallback_target`
+   already gives the right answer, "Control", before either lookup is even tried).
+4. Extracted the whole decision into a small, independently unit-tested pure function,
+   `_resolve_bit_target(target_key, val_60, offset60_to_name, fallback_target)` — this logic had
+   zero test coverage before this session (surprising, given TIMER/COUNTER's own bit-overlay
+   handling has been revisited multiple times per the section above) and is fragile enough
+   (three real, wrong revisions in one investigation) to deserve permanent regression tests
+   independent of any real ACD fixture.
+
+**Verified**: every one of 362 BIT members across the whole real project resolves a Target after
+the fix (0 unresolved, down from several); a full attribute-by-attribute comparison of all 99
+`DataType`s against that project's own real Studio 5000 L5X export came back with **zero
+mismatches** (previously 2 `DataType`s had entirely unresolved targets and, after the first-pass
+fix, 4 different `DataType`s had wrong-but-resolved targets from the collision in step 3).
+
+**Methodological note, worth repeating given how this session went**: the first-pass fix (step 1)
+looked complete — it silenced the original bug report and matched ground truth for the two directly
+implicated UDTs. It was only proven wrong by deliberately widening verification to the *whole*
+project against a *whole-project* L5X export, not just the specific UDT named in the bug report.
+Don't treat "fixes the reported case" as "correct in general" for this kind of byte-offset
+heuristic — cross-check against everything available before considering it done.
+
 ## REAL/LREAL NaN and Infinity rendering (`_l5k_real_literal`/`_decorated_real_literal`)
 
 Found while attempting a full whole-project `to_xml()` export of a large real project for the

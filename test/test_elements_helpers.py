@@ -5,11 +5,13 @@ from datetime import datetime
 from xml.dom import minidom
 
 from acd.l5x.elements import (
+    Member,
     _decorated_real_literal,
     _escape_xml_attr,
     _filetime_to_iso,
     _l5k_real_literal,
     _read_tag_initial_value,
+    _resolve_bit_target,
 )
 
 
@@ -137,6 +139,67 @@ def test_decorated_real_literal_array_infinity_matches_real_quirk():
     # a real, reproducible quirk in Studio 5000's own array Decorated-value
     # exporter (distinct from the scalar case above).
     assert _decorated_real_literal(float("inf"), in_array=True) == "1.$"
+
+
+def test_resolve_bit_target_prefers_declaration_order_fallback():
+    # Regression test for a real, previously-unresolved bug (a downstream
+    # agent hit it live): a real UDT ("LugWrk") had 4 BIT members whose own
+    # 0x6c value (596) matched no known member's 0x60 at all, leaving
+    # Target unresolved entirely -- Studio 5000's Import Routine then
+    # rejected the exported L5X ("Required property 'Target' was missing").
+    # fallback_target (the most-recent preceding hidden member in
+    # declaration order) must be preferred when available, since it was
+    # confirmed correct against a real Studio 5000 export in every case
+    # found, including ones where the offset60_to_name lookups below would
+    # return a wrong-but-non-None name instead.
+    offset60_to_name = {640: "SomeOtherPlainField"}  # coincidental collision
+    assert (
+        _resolve_bit_target(596, 640, offset60_to_name, "ZZZZZZZZZZLugWrk9")
+        == "ZZZZZZZZZZLugWrk9"
+    )
+
+
+def test_resolve_bit_target_falls_back_to_target_key_lookup():
+    # When no hidden member precedes (fallback_target is None), a valid
+    # 0x6c-based offset60_to_name lookup is used (the TIMER/COUNTER-style
+    # built-in overlay case).
+    offset60_to_name = {12: "Control"}
+    assert _resolve_bit_target(12, 999, offset60_to_name, None) == "Control"
+
+
+def test_resolve_bit_target_falls_back_to_own_offset_lookup():
+    # When fallback_target is None AND the 0x6c lookup fails (0x6c is the
+    # sentinel 0xFFFFFFFF), fall back to this member's own 0x60 as the
+    # lookup key.
+    offset60_to_name = {8: "Backing"}
+    assert _resolve_bit_target(0xFFFFFFFF, 8, offset60_to_name, None) == "Backing"
+
+
+def test_resolve_bit_target_returns_none_when_nothing_resolves():
+    assert _resolve_bit_target(0xFFFFFFFF, 999, {}, None) is None
+
+
+def test_member_to_xml_bit_member_includes_target_and_bit_number():
+    member = Member(
+        "ActvtnArea", "ActvtnArea", "BIT", 0, "Decimal", False,
+        "ZZZZZZZZZZLugWrk9", 0, "Read/Write",
+    )
+    xml = member.to_xml()
+    assert 'Target="ZZZZZZZZZZLugWrk9"' in xml
+    assert 'BitNumber="0"' in xml
+
+
+def test_member_to_xml_plain_bool_array_omits_bit_number():
+    # Regression test for a real bug found alongside the fix above: a
+    # BOOL[32] array member ("Ons" in the same real UDT) was emitting a
+    # spurious BitNumber="0" not present in Studio 5000's own export --
+    # bit_number is set for every BOOL member internally (a data-table
+    # decode hint, see the Member.bit_number field docstring) but must only
+    # be rendered as an XML attribute for a genuine BIT pseudo-member.
+    member = Member("Ons", "Ons", "BOOL", 32, "Decimal", False, None, 0, "Read/Write")
+    xml = member.to_xml()
+    assert "BitNumber" not in xml
+    assert "Target" not in xml
 
 
 def test_decorated_real_literal_finite_uses_short_form():

@@ -151,7 +151,13 @@ class Member(L5xElement):
     radix: str
     hidden: bool
     target: Union[str, None]      # BIT members only; None omits the attribute
-    bit_number: Union[int, None]  # BIT members only; None omits the attribute
+    # Doubles as an internal value-decode hint for a plain BOOL member (scalar
+    # or array) -- see _decode_single_udt_element/_decode_scalar_member -- so
+    # it is NOT None for those too, even though Studio's own L5X only ever
+    # emits BitNumber= for a genuine BIT pseudo-member. to_xml() below strips
+    # it back out for any non-BIT data_type; do not rely on "bit_number is
+    # None" alone to mean "omit from XML" the way target does.
+    bit_number: Union[int, None]
     external_access: str
     _byte_offset: int = 0
     _description: Union[str, None] = field(default=None)
@@ -164,6 +170,13 @@ class Member(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
+        if self.data_type != "BIT" and self.bit_number is not None:
+            # A plain BOOL member (scalar or array) carries bit_number purely
+            # as an internal data-table decode hint -- real Studio 5000 never
+            # emits BitNumber= for it, only for a genuine BIT pseudo-member.
+            # Found via a real UDT's BOOL[32] member ("Ons") emitting a
+            # spurious BitNumber="0" not present in Studio's own export.
+            base = re.sub(r'\s*BitNumber="[^"]*"', '', base, count=1)
         if not self._description:
             return base
         desc = _multiline_xml_text(self._description)
@@ -2261,6 +2274,41 @@ def external_access_enum(i: int) -> str:
     return default
 
 
+def _resolve_bit_target(
+    target_key: int,
+    val_60: int,
+    offset60_to_name: Dict[int, str],
+    fallback_target: Union[str, None],
+) -> Union[str, None]:
+    """Resolve a BIT-overlay member's backing-field Target name.
+
+    Tries, in order:
+      1. fallback_target -- the most-recent preceding hidden member in
+         declaration order. Verified correct in every real case checked so
+         far, including one where mechanisms 2/3 below return a
+         wrong-but-non-None name due to a coincidental byte-offset
+         collision (a real UDT, "Bin_Sequence": a BIT member's own 0x60
+         happened to equal an unrelated real field's 0x60 elsewhere in the
+         same UDT, not either of its two genuine hidden backing fields).
+      2. target_key (the member's raw 0x6c value) as an offset60_to_name
+         lookup key -- works for TIMER/COUNTER-style built-in overlays
+         where 0x6c genuinely holds the backing field's own 0x60 value.
+      3. val_60 (the member's own 0x60 value) as an offset60_to_name lookup
+         key -- works whenever the overlay shares its byte offset with a
+         real backing field registered in that map.
+    Mechanisms 2/3 are kept only as a fallback for when fallback_target is
+    None (no hidden member precedes this one in declaration order at all);
+    no real case has been found where they're needed AND correct otherwise.
+    """
+    if fallback_target is not None:
+        return fallback_target
+    if target_key != 0xFFFFFFFF:
+        name = offset60_to_name.get(target_key)
+        if name is not None:
+            return name
+    return offset60_to_name.get(val_60)
+
+
 @dataclass
 class MemberBuilder(L5xElementBuilder):
     record: bytes = field(default_factory=bytes)
@@ -2305,51 +2353,53 @@ class MemberBuilder(L5xElementBuilder):
         data_type_results = self._cur.fetchall()
         data_type = data_type_results[0][0]
 
-        # BIT members: data_type resolves to BOOL but the encoding varies by sub-type.
-        #
-        # Pattern 1 (0x6c != 0xFFFFFFFF): 0x6c holds the 0x60 byte-offset of the backing
-        #   field.  Resolve target via offset60_to_name.
-        #
-        # Pattern 2 (0x6c == 0xFFFFFFFF and 0x68 == 0): BIT member where the backing field
-        #   pointer is absent.  Use _fallback_target (the most-recent preceding hidden SINT).
-        #
-        # Pattern 3 (0x6c == 0xFFFFFFFF and 0x68 == 1): BIT member where 0x60 directly
-        #   matches the backing field's 0x60 value.  Resolve target via offset60_to_name
-        #   using the member's own 0x60 value as the lookup key.
-        #
-        # Plain BOOL (0x6c == 0xFFFFFFFF and 0x68 == 0x800): not a BIT member; leave as BOOL.
+        # BIT members: data_type resolves to BOOL but only a "plain field" signature
+        # (0x6c == 0xFFFFFFFF and 0x68 == 0x800) means it's a real, independent BOOL --
+        # everything else is a BIT-overlay pseudo-member aliasing a bit of some other
+        # (usually hidden) backing field. 0x68's exact value was originally treated as a
+        # small enumerated "pattern selector" (0/1/0x800) whose other branches resolved
+        # Target by matching 0x6c or the member's own 0x60 against offset60_to_name (a
+        # map of every "plain field" member's own 0x60 -> name). Real UDTs have since
+        # turned up several more 0x68 values (0x2, 0x9, 0x14, ...) that don't fit that
+        # enum, AND -- more importantly -- turned up real cases where a BIT member's own
+        # 0x60 coincidentally equals a totally unrelated real field's 0x60 elsewhere in
+        # the same UDT (e.g. "Bin_Sequence": Action_1..16's own 0x60 all read 4, which
+        # matches unrelated field "Sling_Pos_1" (also 0x60=4), not either of the UDT's
+        # two real hidden backing fields at 0x60=2 and 0x60=3). An offset60_to_name
+        # lookup on a coincidental match returns a wrong-but-non-None name, which is
+        # worse than the lookup failing outright. The one mechanism that has resolved
+        # every real case checked so far correctly -- including this collision case --
+        # is declaration order: a BIT-overlay member always immediately follows its own
+        # backing field, so _fallback_target (the most-recent preceding hidden member)
+        # is tried FIRST; the offset60_to_name lookups (via 0x6c, then via this member's
+        # own 0x60) are kept only as a fallback for the case they were originally added
+        # for (no hidden member precedes at all, e.g. a BIT member as a UDT's very first
+        # member) since no real case has been found where they're needed AND correct.
+        # Cross-checked against a real Studio 5000 whole-project L5X export: every BIT
+        # member across all 99 DataTypes in one real project now resolves an exact-match
+        # Target (previously 4 DataTypes had wrong targets from the offset60 collision,
+        # and 2 more had entirely unresolved targets from the original bug this
+        # comment block replaced).
         target: Union[str, None] = None
         bit_number: Union[int, None] = None
         if data_type == "BOOL":
             target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
             val_68 = struct.unpack_from("<I", self.record, 0x68)[0]
-            if target_key != 0xFFFFFFFF:
-                # Pattern 1: direct backing-field reference via offset-60 map
+            if target_key == 0xFFFFFFFF and val_68 == 0x800:
+                # Plain BOOL (not a BIT sub-element) — bit_number is at 0x64 for data
+                # table bit-packing extraction.
+                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+            else:
                 data_type = "BIT"
                 # offset 0x5C holds a bit-offset into the host register, not an array
                 # size — force dimension to 0 so _member_decorated_xml treats this as
                 # a scalar rather than emitting thousands of <Element> entries.
                 dimension = 0
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
-                target = self._offset60_to_name.get(target_key)
-            elif val_68 == 0:
-                # Pattern 2: BIT member without explicit backing-field pointer
-                data_type = "BIT"
-                dimension = 0  # same bit-offset field; not an array size
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
-                target = self._fallback_target
-            elif val_68 == 1:
-                # Pattern 3: BIT member — 0x60 of this member equals 0x60 of the backing
-                # hidden field, allowing direct lookup in offset60_to_name.
-                data_type = "BIT"
-                dimension = 0
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                 val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
-                target = self._offset60_to_name.get(val_60)
-            else:
-                # Plain BOOL (not a BIT sub-element) — bit_number is at 0x64 for data
-                # table bit-packing extraction.
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+                target = _resolve_bit_target(
+                    target_key, val_60, self._offset60_to_name, self._fallback_target
+                )
 
         # --- Description ---
         # The member's description is identified in the comments table by a

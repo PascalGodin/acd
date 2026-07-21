@@ -999,7 +999,12 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
     """Return the byte size of a DataType (primitive, STRING, or UDT).
 
     For UDTs, computes max(byte_offset + elem_size * max(dimension,1))
-    across non-hidden non-BIT members. Returns 0 for unknown types.
+    across non-hidden non-BIT members, then rounds up to the next EVEN byte
+    count -- Rockwell pads a UDT's own declared total size to a 2-byte
+    boundary (confirmed directly against Studio 5000's own "Data Type
+    Size" field, shown in a UDT's Properties dialog: a real UDT whose
+    members sum to 263 bytes is declared by Studio itself as 264). Returns
+    0 for unknown types.
 
     Deliberately does NOT add dt._dead_member_bytes here -- an earlier
     version of this function did, on the (untested) assumption that a
@@ -1049,7 +1054,9 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
                 continue
             member_end = m._byte_offset + (elem_sz * max(m.dimension, 1))
         max_end = max(max_end, member_end)
-    return max_end if max_end > 0 else 0
+    if max_end == 0:
+        return 0
+    return max_end + (max_end % 2)  # round up to the next even byte count
 
 
 def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
@@ -2706,16 +2713,65 @@ def _apply_dead_member_byte_corrections(all_data_types_map: Dict[str, "DataType"
     for one further-nested member -- Studio 5000 rejected the resulting
     export as "Data type mismatch". Fixed, and confirmed byte-exact
     against a real Studio 5000 L5X export of the same tag.
+
+    The shift is NOT simply propagated flat to every subsequent member,
+    though -- a member whose own start is determined by alignment (a BOOL
+    array, 4-byte aligned since it's bit-packed into DINT-sized words, per
+    the same rule `_get_type_size()` already uses for its size) recomputes
+    its position from the previous member's true end instead, since
+    alignment padding can absorb part or all of a pending shift. Found via
+    the same real UDT: LugWrk's own trailing BOOL[32] member ("Ons") got a
+    flat +2 applied on top of an already-correctly-aligned stored offset,
+    making the computed total type size (650) 2 bytes larger than Studio
+    5000's own declared "Data Type Size" for the same UDT (648, confirmed
+    directly from the UDT's Properties dialog).
     """
     for dt in all_data_types_map.values():
         cumulative_shift = 0
+        prev_true_end = None
         for member in dt.members:
-            if cumulative_shift:
-                member._byte_offset += cumulative_shift
-            if member.dimension == 0 and member.data_type != "BIT":
+            if member.data_type == "BIT":
+                continue
+            original_offset = member._byte_offset
+            is_bool_array = member.dimension > 0 and member.data_type.upper() == "BOOL"
+            if is_bool_array and prev_true_end is not None:
+                # A BOOL array is 4-byte aligned (bit-packed into DINT-sized
+                # words -- see _get_type_size()'s own BOOL-array sizing).
+                # Its start is determined by ALIGNMENT from the previous
+                # member's true end, not by adding the pending shift on top
+                # of its own stored offset -- the alignment padding can
+                # partially or fully ABSORB a pending dead-byte shift.
+                # Found via a real UDT ("LugWrk"): its trailing BOOL[32]
+                # member ("Ons") got a flat +2 applied on top of an already-
+                # correctly-aligned stored offset, computing a total type
+                # size 2 bytes larger than Studio 5000's own declared size
+                # for the same UDT (650 vs the real 648).
+                true_offset = -(-prev_true_end // 4) * 4  # ceil division by 4
+            else:
+                true_offset = original_offset + cumulative_shift
+            member._byte_offset = true_offset
+            # The shift actually applied to *this* member (which may be less
+            # than cumulative_shift if alignment absorbed part of it) is what
+            # subsequent members should carry forward.
+            cumulative_shift = true_offset - original_offset
+
+            if member.dimension > 0:
+                if member.data_type.upper() == "BOOL":
+                    size = ((member.dimension + 31) // 32) * 4
+                else:
+                    size = _get_type_size(member.data_type, all_data_types_map) * member.dimension
+                prev_true_end = true_offset + size
+            else:
+                size = _get_type_size(member.data_type, all_data_types_map)
+                # A scalar struct-typed member's own TRUE physical extent
+                # includes its nested type's dead bytes -- needed so a BOOL
+                # array immediately following it (no other member in
+                # between) aligns from the correct true end, not one that's
+                # still missing the dead-byte footprint.
                 nested_dt = all_data_types_map.get(member.data_type.upper())
-                if nested_dt is not None and nested_dt._dead_member_bytes:
-                    cumulative_shift += nested_dt._dead_member_bytes
+                dead_bytes = nested_dt._dead_member_bytes if nested_dt is not None else 0
+                prev_true_end = true_offset + size + dead_bytes
+                cumulative_shift += dead_bytes
 
 
 # Connection Type CIP enum, read at absolute offset 90 (u16le) of a

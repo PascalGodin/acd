@@ -352,6 +352,41 @@ def test_apply_dead_member_byte_corrections_noop_when_no_dead_bytes():
     assert c._byte_offset == 4
 
 
+def test_apply_dead_member_byte_corrections_bool_array_absorbs_shift_via_alignment():
+    # Regression test for a real bug found immediately after the fix above:
+    # a BOOL array member (4-byte aligned -- bit-packed into DINT-sized
+    # words) must NOT receive the flat pending shift on top of its own
+    # stored offset; its true position is recomputed by aligning up from
+    # the previous member's true end, since alignment padding can absorb
+    # part or all of the shift. Reproduces the real LugWrk shape: BfrLug
+    # (Lug-typed, 2 dead bytes) followed by several scalar INT members,
+    # then a trailing BOOL[32] member ("Ons") whose own stored offset was
+    # already correctly 4-byte-aligned -- applying the flat +2 on top of it
+    # anyway made the computed total type size 2 bytes larger than Studio
+    # 5000's own declared size for the same real UDT (650 vs the real 648).
+    inner_dt = DataType(
+        "Inner", "Inner", "NoFamily", "User",
+        [_member("a", "DINT", byte_offset=0)],  # size 4
+        _dead_member_bytes=2,
+    )
+    outer_dt = DataType(
+        "Outer", "Outer", "NoFamily", "User",
+        [
+            _member("b", "Inner", byte_offset=0),
+            _member("c", "SINT", byte_offset=4),  # 1 byte, stored pre-shift
+            _member("d", "BOOL", byte_offset=5, dimension=32),  # already 4-aligned pre-shift... but true end of c is 4+2+1=7, so d must align to 8
+        ],
+    )
+    data_types_map = {"INNER": inner_dt, "OUTER": outer_dt}
+
+    _apply_dead_member_byte_corrections(data_types_map)
+
+    b, c, d = outer_dt.members
+    assert b._byte_offset == 0
+    assert c._byte_offset == 6  # shifted by Inner's 2 dead bytes (4 -> 6)
+    assert d._byte_offset == 8  # aligned up from c's true end (6+1=7 -> 8), NOT 5+2=7
+
+
 def test_decode_string_family_value_uses_latin1_never_replacement_char():
     # Regression test for a real bug: decoding raw STRING bytes as utf-8
     # (with errors="replace") inserted U+FFFD for any byte sequence that

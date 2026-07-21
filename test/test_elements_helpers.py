@@ -5,7 +5,9 @@ from datetime import datetime
 from xml.dom import minidom
 
 from acd.l5x.elements import (
+    DataType,
     Member,
+    _decode_single_udt_element,
     _decorated_real_literal,
     _escape_xml_attr,
     _filetime_to_iso,
@@ -204,3 +206,50 @@ def test_member_to_xml_plain_bool_array_omits_bit_number():
 
 def test_decorated_real_literal_finite_uses_short_form():
     assert _decorated_real_literal(0.4047619, in_array=False) == "0.404762"
+
+
+def _member(name, data_type, byte_offset=0, dimension=0):
+    return Member(
+        name, name, data_type, dimension, "Decimal", False, None, None,
+        "Read/Write", _byte_offset=byte_offset,
+    )
+
+
+def test_decode_single_udt_element_two_real_levels_of_struct_nesting():
+    # Regression test for a real bug found via a real Studio 5000 import
+    # rejection ("Data type mismatch"): the depth counter was incremented
+    # TWICE per real struct-nesting level (once in _decode_single_udt_element
+    # calling _decode_scalar_member(depth+1), again inside _decode_scalar_member
+    # calling _decode_single_udt_element(depth+1)), silently halving the
+    # usable nesting depth from the documented 3 levels to effectively 1. A
+    # real UDT only 2 real levels deep (LugWrk -> Lug -> LugErrorCode) had
+    # its innermost member ("ErrorCd") silently decode to {} well within the
+    # intended limit -- which renders as a bare "[]" in the L5K literal,
+    # a shape Studio 5000 rejects on import.
+    c_dt = DataType("C", "C", "NoFamily", "User", [_member("d", "DINT")])
+    b_dt = DataType("B", "B", "NoFamily", "User", [_member("c", "C")])
+    a_dt = DataType("A", "A", "NoFamily", "User", [_member("b", "B")])
+    data_types_map = {"A": a_dt, "B": b_dt, "C": c_dt}
+
+    blob = struct.pack("<i", 42)
+    result = _decode_single_udt_element(blob, 0, a_dt, data_types_map, 0)
+
+    assert result == {"b": {"c": {"d": 42}}}
+
+
+def test_decode_single_udt_element_still_truncates_beyond_max_depth():
+    # The depth-limit safety net itself must still work after the fix above
+    # -- 4 real levels of struct nesting beyond the top-level element must
+    # still truncate the innermost level to {} (max_depth=3 means depths
+    # 0/1/2/3 succeed, depth 4 is dropped).
+    e_dt = DataType("E", "E", "NoFamily", "User", [_member("f", "DINT")])
+    d_dt = DataType("D", "D", "NoFamily", "User", [_member("e", "E")])
+    c_dt = DataType("C", "C", "NoFamily", "User", [_member("d", "D")])
+    b_dt = DataType("B", "B", "NoFamily", "User", [_member("c", "C")])
+    a_dt = DataType("A", "A", "NoFamily", "User", [_member("b", "B")])
+    data_types_map = {"A": a_dt, "B": b_dt, "C": c_dt, "D": d_dt, "E": e_dt}
+
+    blob = struct.pack("<i", 42)
+    result = _decode_single_udt_element(blob, 0, a_dt, data_types_map, 0)
+
+    assert result == {"b": {"c": {"d": {"e": {}}}}}

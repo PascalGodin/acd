@@ -1020,28 +1020,78 @@ all 36 of its own members instead of `{}`. Two synthetic unit tests
 levels of nesting must decode fully) and that the depth-limit safety net itself still works (4
 real levels must still truncate the innermost to `{}`) — this had zero prior test coverage.
 
-**A second, separate, NOT-yet-fixed discrepancy found on the same tag while verifying the fix
-above**: 5 scalar members of `LugWrk` itself (`pntrTpStrt`/`pntrTpStp`/`pntrTpTrtmnt`/`pntrLug`/
-`pntrDrtn`, declared directly after the nested `BfrLug` (`Lug`-typed) member) decode values shifted
-by exactly one `INT` (2 bytes) versus the real Studio ground truth — confirmed by direct raw-byte
-inspection of the tag's own data-table blob: the true values (`24,25,0,183,0`) sit at byte offsets
-570/572/574/576/578, but each of these members' own *stored* `_byte_offset` (read from the raw ACD
-record's own `0x60` field) says 568/570/572/574/576 — 2 bytes short. Ruled out several
-explanations: `Lug`'s own 133 members are individually self-consistent and 100% correct (verified
-leaf-by-leaf against ground truth — the STRING member `Z5_Product_Name` at offset 340 correctly
-gaps 88 bytes to the next member, matching `_STRING_SIZE`; the struct's own last member,
-`Trim_Decision`, a `DINT[10]`, is contiguous with its neighbors with no internal gap anywhere).
-`_get_type_size("LUG", ...)` and `Lug`'s own last member's stored offset+size both independently
-agree on 568 — yet the *true* required value is 570. This looks like a real, not-yet-understood
-Rockwell layout/alignment quirk in how a nested-UDT member's true occupied size differs from a
-simple `max(offset + size)` computation over its own members — not a bug in how we read/interpret
-already-stored offsets, since every stored offset involved is self-consistent, just collectively 2
-bytes short of the physical truth. **Do not guess a padding rule and apply it broadly
-(e.g. "always round a struct member's size up to N bytes") without finding more real examples to
-characterize it first** — this is exactly the kind of heuristic that looked-complete-but-wasn't in
-the BIT-target-resolution investigation above. Revisit this by finding another real UDT with a
-similar "struct member immediately followed by more scalar siblings" shape and comparing stored
-vs. true offsets the same way, before attempting a fix.
+**A second, separate discrepancy found on the same tag while verifying the fix above — SOLVED**:
+5 scalar members of `LugWrk` itself (`pntrTpStrt`/`pntrTpStp`/`pntrTpTrtmnt`/`pntrLug`/`pntrDrtn`,
+declared directly after the nested `BfrLug` (`Lug`-typed) member) decoded values shifted by exactly
+one `INT` (2 bytes) versus real Studio ground truth — confirmed by direct raw-byte inspection: the
+true values (`24,25,0,183,0`) sit at byte offsets 570/572/574/576/578, but each of these members'
+own *stored* `_byte_offset` (the raw ACD record's own `0x60` field) says 568/570/572/574/576 — 2
+bytes short. Ruled out several explanations before finding the real one: `Lug`'s own 133 members
+are individually self-consistent and 100% correct (the STRING member `Z5_Product_Name` at offset
+340 correctly gaps 88 bytes to the next member, matching `_STRING_SIZE`; the struct's own last
+member, `Trim_Decision`, a `DINT[10]`, is contiguous with its neighbors); `_get_type_size("LUG",
+...)` and `Lug`'s own declared total-size attribute (a real, separate stored field, value 568)
+both independently agree on 568; and — decisively — 568 is already aligned to 2, 4, *and* 8 bytes,
+so a generic "round the struct size up to alignment" rule is mathematically a no-op here and
+cannot explain needing 570 (ruling out a general alignment-padding theory the user separately
+raised: Rockwell does pad individual members for natural alignment, e.g. three `SINT`s followed by
+a `DINT` leaves a 1-byte gap — real and relevant to how *live* members get positioned, which we
+already handle correctly by trusting each live member's own stored offset — but that's a different
+mechanism from this specific gap).
+
+**Root cause**: `Lug`'s member collection has a **deleted member** — a real child comps row
+(`Z1_Nominal_Width`, `record_type=512` vs `256` for a live member) with **no matching
+extended-record descriptor at all** (found by comparing the member-collection's child comps-row
+count, 134, against the DataType's own extended-record-derived member count, 133 — the mismatch
+itself is the detection signal). Deleting a UDT member removes its type-level descriptor
+(`data_type`/`dimension`) entirely, but **not** its old byte range from any tag data table already
+allocated before the deletion — so the type's own declared size (568) and every live sibling's own
+stored offset are both computed from *currently-visible* members only, blind to the dead member's
+physical footprint, while the real data table (frozen at allocation time) still reserves it. The
+user confirmed (having authored the deletion) that `Z1_Nominal_Width` was originally `DataType=
+"INT"` via an older Studio 5000 export of the same UDT from a sibling project
+(`Lug_DataType_Snider.L5X`) — exactly the missing 2 bytes.
+
+We cannot recover a dead member's original type from anything else available: its own comps row is
+mostly boilerplate template data (nearly byte-identical to a live member's own row past a short
+prefix that's absent/zeroed in the dead one — likely a type reference, which is exactly the thing
+that's missing), and `CanonicalSize.Dat`-style per-object size tables weren't found to cover this
+either. Fixed as a **documented best-effort default, not a general algorithm**: any orphaned
+member-collection child (no extended-record descriptor) is assumed to cost 2 bytes (INT-sized —
+the smallest non-BOOL primitive), logged via `log.warning()` so a wrong guess for a *different*
+project's dead member is visible rather than silently corrupting values, stored on the owning
+`DataType` as `_dead_member_bytes` (`DataTypeBuilder.build()`).
+
+Two call sites needed this, not one — a wrong assumption caught only the first:
+- `_get_type_size()` adds `dt._dead_member_bytes` on top of `max(offset + size)` over visible
+  members — this is what fixes an **array** of a dead-member-carrying struct type (element stride).
+- **This alone did not fix `Trim_Decision`** — `pntrTpStrt` etc. are *scalar* (non-array) siblings
+  of `BfrLug`, and a scalar struct-typed member never consults `_get_type_size()` at all; its own
+  (and every subsequent sibling's own) byte offset comes directly from Rockwell's stored per-member
+  value, equally blind to the dead member's footprint. Needed a **second**, separate mechanism:
+  `_apply_dead_member_byte_corrections()`, a post-processing pass run once every `DataType` is
+  built (so nested-type name references resolve, including forward references), which walks each
+  DataType's own members in declaration order and shifts every member *after* a scalar struct-typed
+  member whose nested type carries dead bytes, cumulatively (so multiple dead-byte-carrying structs
+  in the same chain compound correctly).
+
+**Verified**: `Trim_Decision` and its sibling `Fence_Decision` (both `LugWrk`-typed) now match real
+Studio 5000 ground truth **exactly** — 170/170 leaf `Decorated` values identical, and the `L5K`
+literal byte-for-byte identical (736 chars, zero diff) — up from 5 wrong scalar values and a
+truncated `L5K` shape. Re-ran the full 99-`DataType` whole-project comparison (see the BIT-target
+section above) after this fix: still zero mismatches, confirming the correction pass doesn't
+disturb any DataType lacking a dead member (the overwhelming majority — `_dead_member_bytes`
+defaults to 0, making both new mechanisms a no-op unless a real orphan is detected). New unit tests
+(`test_get_type_size_includes_dead_member_bytes`,
+`test_apply_dead_member_byte_corrections_shifts_subsequent_members`,
+`test_apply_dead_member_byte_corrections_noop_when_no_dead_bytes`) lock in both mechanisms
+independent of any real ACD fixture.
+
+**Caveat for the next dead member found in a different project**: the "2 bytes, INT-sized" default
+is confirmed correct for exactly one real case. If a future orphaned member turns out to need a
+different size (DINT=4, LINT=8, etc.), the `log.warning()` this fix added is the signal to
+investigate — check for an old export of the same UDT from before the deletion (as the user
+provided here) rather than guessing.
 
 ## REAL/LREAL NaN and Infinity rendering (`_l5k_real_literal`/`_decorated_real_literal`)
 

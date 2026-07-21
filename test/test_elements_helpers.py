@@ -7,10 +7,12 @@ from xml.dom import minidom
 from acd.l5x.elements import (
     DataType,
     Member,
+    _apply_dead_member_byte_corrections,
     _decode_single_udt_element,
     _decorated_real_literal,
     _escape_xml_attr,
     _filetime_to_iso,
+    _get_type_size,
     _l5k_real_literal,
     _read_tag_initial_value,
     _resolve_bit_target,
@@ -253,3 +255,64 @@ def test_decode_single_udt_element_still_truncates_beyond_max_depth():
     result = _decode_single_udt_element(blob, 0, a_dt, data_types_map, 0)
 
     assert result == {"b": {"c": {"d": {"e": {}}}}}
+
+
+def test_get_type_size_includes_dead_member_bytes():
+    # A DataType with a deleted member (no live descriptor, so it's not in
+    # .members at all) still physically reserves its old byte range in an
+    # already-allocated tag's data table -- _get_type_size() must add
+    # _dead_member_bytes on top of what summing visible members gives.
+    inner_dt = DataType(
+        "Inner", "Inner", "NoFamily", "User",
+        [_member("a", "DINT", byte_offset=0)],  # visible size: 4 bytes
+        _dead_member_bytes=2,
+    )
+    data_types_map = {"INNER": inner_dt}
+    assert _get_type_size("INNER", data_types_map) == 6
+
+
+def test_apply_dead_member_byte_corrections_shifts_subsequent_members():
+    # Regression test for the real bug this exists to fix: a scalar
+    # (non-array) struct-typed member ("b", typed "Inner") whose nested
+    # DataType has dead bytes must shift every member declared AFTER it in
+    # the outer struct -- reproduces the real LugWrk/Lug/pntrTpStrt shape
+    # (BfrLug -> Lug, which had a deleted member, followed by 6 scalar
+    # members that were each read 2 bytes too early before this fix).
+    inner_dt = DataType(
+        "Inner", "Inner", "NoFamily", "User",
+        [_member("a", "DINT", byte_offset=0)],
+        _dead_member_bytes=2,
+    )
+    outer_dt = DataType(
+        "Outer", "Outer", "NoFamily", "User",
+        [
+            _member("b", "Inner", byte_offset=0),
+            _member("c", "INT", byte_offset=4),
+            _member("d", "INT", byte_offset=6),
+        ],
+    )
+    data_types_map = {"INNER": inner_dt, "OUTER": outer_dt}
+
+    _apply_dead_member_byte_corrections(data_types_map)
+
+    b, c, d = outer_dt.members
+    assert b._byte_offset == 0  # unaffected -- nothing precedes it
+    assert c._byte_offset == 6  # shifted by Inner's 2 dead bytes
+    assert d._byte_offset == 8
+
+
+def test_apply_dead_member_byte_corrections_noop_when_no_dead_bytes():
+    inner_dt = DataType(
+        "Inner", "Inner", "NoFamily", "User", [_member("a", "DINT", byte_offset=0)],
+    )
+    outer_dt = DataType(
+        "Outer", "Outer", "NoFamily", "User",
+        [_member("b", "Inner", byte_offset=0), _member("c", "INT", byte_offset=4)],
+    )
+    data_types_map = {"INNER": inner_dt, "OUTER": outer_dt}
+
+    _apply_dead_member_byte_corrections(data_types_map)
+
+    b, c = outer_dt.members
+    assert b._byte_offset == 0
+    assert c._byte_offset == 4

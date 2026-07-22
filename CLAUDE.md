@@ -844,6 +844,21 @@ against a real 256-element array tag: all 256 values now match Studio 5000's own
 Covered by a synthetic unit test (`test_read_tag_initial_value_bool_array_bit_packing`) since the
 small fixture has no BOOL array tags.
 
+**Same bug, second location, found much later via the tag-value-blob-offset investigation above.**
+This fix was only ever applied to `_read_tag_initial_value` (a top-level *primitive tag*'s own
+value). `_decode_single_udt_element` — which decodes a UDT's own members, including array-typed
+ones — has a separate, parallel array-decode loop that never got the equivalent fix: a BOOL array
+**member** inside a UDT (e.g. `Encoder`'s `Ons`, `BOOL[32]`) was still read one raw byte per
+element (`elem_size = _get_type_size("BOOL", ...) = 1`), not from its shared packed DWORD. Found
+via a real Studio 5000 "Tag Name Collision / Data Compare" dialog: `EncTrm.Ons[5]` decoded as `1`
+instead of the real `0` — only **one** of 32 elements differed, since reading bit 0 of the wrong
+byte coincidentally reproduces the correct packed bit for most positions, making this an easy bug
+to miss without checking every element against real ground truth. Fixed the same way as above
+(read the correct DWORD, extract bit `i % 32`), scoped to array members whose own `data_type` is
+`BOOL`. Covered by `test_decode_single_udt_element_bool_array_member_bit_packing`. Verified against
+the real project: `EncTrm.Ons` and `Trim_Decision.Ons` (both `BOOL[32]`) now decode to all zeros,
+matching Studio's own "Existing Value" exactly.
+
 **2. Scalar offset was simply wrong (0x19E instead of 0x1A2).** This was caught as a *direct
 follow-on* to fix #1 above, and turned out to be much bigger: after fixing the array case,
 `SecFlasher` (a scalar BOOL) still decoded as `1` when the real project value is `0` (confirmed

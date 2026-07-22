@@ -265,6 +265,36 @@ def _member(name, data_type, byte_offset=0, dimension=0):
     )
 
 
+def test_decode_single_udt_element_bool_array_member_bit_packing():
+    # Regression test for a real bug: a UDT member that's a BOOL array
+    # (e.g. Encoder's "Ons", BOOL[32]) was decoded one raw byte per element
+    # (elem_size=1 from _get_type_size("BOOL", ...)) instead of extracting
+    # each element's bit from its shared, bit-packed 4-byte DWORD -- the
+    # same class of bug already fixed for a top-level primitive BOOL-array
+    # *tag* in _read_tag_initial_value, but never applied to this
+    # UDT-member decode path. Found via a real Studio 5000 "Tag Name
+    # Collision / Data Compare" dialog: EncTrm.Ons[5] decoded as 1 instead
+    # of the real 0 -- only one of 32 elements differed, since the wrong
+    # per-byte read coincidentally matches the true packed bit for most
+    # positions.
+    #
+    # Build a blob with only bit 5 and bit 20 set in the packed DWORD.
+    blob = bytearray(4)
+    struct.pack_into("<I", blob, 0, (1 << 5) | (1 << 20))
+    outer_dt = DataType(
+        "Outer", "Outer", "NoFamily", "User",
+        [_member("Ons", "BOOL", byte_offset=0, dimension=32)],
+    )
+    data_types_map = {"OUTER": outer_dt}
+
+    result = _decode_single_udt_element(bytes(blob), 0, outer_dt, data_types_map, 0)
+
+    expected = [0] * 32
+    expected[5] = 1
+    expected[20] = 1
+    assert result["Ons"] == expected
+
+
 def test_decode_single_udt_element_two_real_levels_of_struct_nesting():
     # Regression test for a real bug found via a real Studio 5000 import
     # rejection ("Data type mismatch"): the depth counter was incremented

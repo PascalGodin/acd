@@ -1385,6 +1385,32 @@ def _decode_single_udt_element(
 
         bn = member.bit_number if mdt_upper == "BOOL" else None
         if member.dimension > 0:
+            if mdt_upper == "BOOL":
+                # BOOL arrays are bit-packed 32 bits per 4-byte DWORD, the
+                # same convention _get_type_size() already uses for BOOL-
+                # array *sizing* and _read_tag_initial_value() already uses
+                # for a top-level primitive BOOL-array *tag* -- but this
+                # UDT-member path never got the equivalent fix, so a BOOL
+                # array MEMBER (e.g. Encoder's "Ons") was read one raw byte
+                # per element (elem_size=1 from _get_type_size("BOOL",...))
+                # instead of extracting the correct bit from its shared
+                # packed DWORD. Found via a real Studio 5000 "Tag Name
+                # Collision / Data Compare" dialog: EncTrm.Ons[5] decoded
+                # as 1 instead of the real 0 -- only one of 32 elements
+                # differed because bit 0 of the wrong byte happens to
+                # coincidentally match the true packed bit for most
+                # positions, making this the kind of bug that's easy to
+                # miss without checking every element.
+                arr = []
+                for i in range(member.dimension):
+                    dword_off = off + (i // 32) * 4
+                    if dword_off + 4 <= len(blob):
+                        dword = struct.unpack_from("<I", blob, dword_off)[0]
+                        arr.append((dword >> (i % 32)) & 1)
+                    else:
+                        arr.append(0)
+                result[mname] = arr
+                continue
             elem_size = _get_type_size(mdt_upper, data_types_map)
             if elem_size == 0:
                 continue

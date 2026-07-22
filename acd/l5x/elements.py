@@ -1059,6 +1059,51 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
     return max_end + (max_end % 2)  # round up to the next even byte count
 
 
+def _tag_value_blob_offset(raw_rec: bytes) -> int:
+    """Compute the absolute byte offset where a tag's data-table blob's real
+    value bytes begin, by parsing the record's own self-describing
+    RxGeneric structure instead of guessing a fixed constant.
+
+    A tag's `data_table_instance` comps record (a separate comps row from
+    the tag itself) is itself an ordinary RxGeneric record whose header
+    declares `count_record` attribute records, but whose Kaitai parser
+    (`RxGeneric._read()`) only parses `count_record - 1` of them into
+    `extended_records` -- the very last one (always attribute_id 0x66,
+    seen as the marker byte 0x66 immediately after the parsed records) is
+    left unparsed in the stream. That last, unparsed attribute record IS
+    the tag's own value blob: its own 4-byte len_value field always exactly
+    equals the tag's computed value size (n_elements * elem_size, or a
+    UDT's own declared struct size -- verified against a real project for
+    both scalar and array tags, any UDT type), and the real value bytes
+    are its own value payload, starting 8 bytes (attribute_id + len_value)
+    after where `extended_records` leaves off.
+
+    This replaces a former "0x1A2, +2 if is_array" fixed-offset guess. That
+    guess happened to match a large real project's array tags and its
+    Lug/LugWrk-typed scalar tags, but was proven wrong in general: a fresh
+    Studio 5000 project's own primitive/UDT array tags decode correctly at
+    the *unshifted* base, and a real project's Encoder-typed *scalar* tag
+    needed the +2 shift despite being a scalar. The actual, self-describing
+    length is `82 + sum(8 + len(value) for each extended_record)` -- this
+    varies by a couple of bytes between records/projects (observed 2 bytes
+    shorter in a fresh Studio 5000 V32 project than an older V38 one) but
+    is always computable from the record itself, with no need to guess
+    "is_array" or special-case any UDT type. Confirmed against a real
+    project's Trim_Decision tag (LugWrk-typed, scalar) via a Studio 5000
+    screenshot: its populated fields (pntrTpStrt=24, pntrTpStp=25,
+    pntrLug=183, Wrk[4]=32790) only decode correctly using this computed
+    offset together with each member's own *raw*, uncorrected stored
+    byte_offset -- see _apply_dead_member_byte_corrections's docstring for
+    the matching fix on the member-offset side.
+    """
+    try:
+        r = RxGeneric.from_bytes(raw_rec)
+        consumed = 82 + sum(8 + len(bytes(er.value)) for er in r.extended_records)
+        return consumed + 8
+    except Exception:
+        return 0x1A2
+
+
 def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
                             data_type: str, n_elements: int,
                             is_array: bool = False):
@@ -1100,27 +1145,9 @@ def _read_tag_initial_value(cur: Cursor, data_table_instance: int,
 
     raw_rec = bytes(rows[0][0])
 
-    # A genuine scalar's value region starts at 0x1A2 -- verified against a
-    # real project: comparing every controller-scope scalar BOOL tag (758)
-    # and DINT tag (812) against Studio 5000's own values, the previously-
-    # used scalar offset 0x19E matched only 21.4% (BOOL) / 2.8% (DINT) of
-    # the time, while 0x1A2 matched 100% for both. 0x19E was apparently
-    # never actually verified against real ground truth for scalars -- it
-    # happened to coincidentally produce a plausible-looking nonzero byte
-    # for many BOOL tags (silently wrong) and equally-wrong garbage for
-    # DINT/other scalar types.
-    #
-    # A declared ARRAY (is_array=True, including a genuine one-element
-    # array, Dimensions="1") needs 2 MORE bytes: 0x1A4, not 0x1A2. This was
-    # never actually verified for arrays when the 0x1A2 rule above was
-    # established (only scalars were checked) -- found via a real project
-    # where 273 of 347 primitive array tags, 14 of 22 BOOL array tags, and
-    # a real Dimensions="1" tag (Test_Bit_DINT) all silently decoded wrong
-    # (every value effectively multiplied by 65536 for tags whose true
-    # values were small enough to fit in 16 bits, since a value's real
-    # bytes land in the high 16 bits of a misaligned 4-byte read) --
-    # confirmed correct for every one of those tags once shifted +2.
-    offset = 0x1A2 + 2 if is_array else 0x1A2
+    # See _tag_value_blob_offset()'s own docstring for why this is computed
+    # from the record's own structure rather than a fixed 0x1A2 guess.
+    offset = _tag_value_blob_offset(raw_rec)
 
     # BOOL/BIT *arrays* are bit-packed by Rockwell -- 32 bits per 4-byte
     # DWORD, NOT one byte per element (a scalar BOOL, n_elements == 1, is
@@ -1211,15 +1238,12 @@ def _decode_udt_initial_value(
     if struct_size == 0:
         return None
 
-    # See the identical scalar-vs-array offset split in
-    # _read_tag_initial_value -- a declared array (is_array=True, including
-    # a genuine one-element array) starts 2 bytes later than a scalar.
-    # Confirmed via a real 200-element array of a UDT ("Lug"): its first
-    # element's own leading field sat at byte 0x1A4, not 0x1A2, with a
-    # per-element stride equal to the plain (non-dead-byte-adjusted)
-    # struct_size above -- see _get_type_size()'s own docstring for why
-    # dead-member bytes must NOT also be added here.
-    offset = 0x1A2 + 2 if is_array else 0x1A2
+    # See _tag_value_blob_offset()'s own docstring for why this is computed
+    # from the record's own structure rather than a fixed 0x1A2 guess. The
+    # per-element stride is the plain (non-dead-byte-adjusted) struct_size
+    # above -- see _get_type_size()'s own docstring for why dead-member
+    # bytes must NOT also be added here.
+    offset = _tag_value_blob_offset(raw_rec)
 
     results: list = []
     for elem_idx in range(n_elements):
@@ -2638,36 +2662,23 @@ class DataTypeBuilder(L5xElementBuilder):
             # Whatever's left in name_to_child is a member-collection child
             # with NO matching extended-record descriptor -- a deleted UDT
             # member. Deleting a member removes its type-level descriptor
-            # (data_type/dimension), but NOT its old byte range from any tag
-            # data table already allocated before the deletion -- verified
-            # against a real project (UDT "Lug", deleted member
+            # (data_type/dimension) but leaves the orphaned comps row behind
+            # -- verified against a real project (UDT "Lug", deleted member
             # "Z1_Nominal_Width", confirmed via an older Studio 5000 export
-            # of the same UDT to have been DataType="INT") where this caused
-            # a real Studio Import Routine rejection ("Data type mismatch"):
-            # every member declared after "Lug" in the containing UDT was
-            # being decoded 2 bytes too early, because neither the UDT's own
-            # declared total-size attribute nor any live sibling's own
-            # stored byte offset accounts for the dead member's footprint --
-            # both were computed from currently-visible members only. We
-            # cannot recover a dead member's real original type in general
-            # (its extended-record content was removed, not just marked
-            # dead, and its comps row alone carries no size/type hint --
-            # confirmed by direct comparison against a live member's comps
-            # row: the two are near-identical boilerplate, with 8 bytes at
-            # the very front of a live row -- likely a type reference -- are
-            # zeroed/absent in a dead one), so this assumes 2 bytes (an
-            # INT/UINT, the smallest non-BOOL primitive) per orphaned
-            # member as a best-effort default -- verified correct for the
-            # one real case found so far, but a guess for any other project
-            # until confirmed otherwise; logs a warning so a wrong guess is
-            # visible rather than silently corrupting other members' values.
+            # of the same UDT to have been DataType="INT"). This used to be
+            # treated as needing a byte-offset correction for every
+            # subsequent sibling member, but that theory was disproven by a
+            # real, populated tag (see _apply_dead_member_byte_corrections's
+            # docstring) -- Rockwell's own stored member offsets already
+            # account for this correctly with no adjustment needed.
+            # `_dead_member_bytes` is kept purely as a diagnostic (logged
+            # below) that this type has an orphaned member; it is no longer
+            # used in any byte-offset or size computation.
             if name_to_child:
                 log.warning(
                     f"DataType {name!r}: {len(name_to_child)} deleted member(s) "
                     f"with no type descriptor found ({sorted(name_to_child)}) -- "
-                    "assuming 2 bytes (INT-sized) each for size computation; "
-                    "if this DataType's struct size is still wrong, this guess "
-                    "may not match the real deleted member(s)' original type."
+                    "diagnostic only, no byte-offset correction is applied for this."
                 )
             dead_member_bytes = len(name_to_child) * 2
 
@@ -2688,90 +2699,30 @@ class DataTypeBuilder(L5xElementBuilder):
 
 
 def _apply_dead_member_byte_corrections(all_data_types_map: Dict[str, "DataType"]) -> None:
-    """Shift `_byte_offset` for every member declared after a scalar
-    (non-array) struct-typed member whose own nested DataType has
-    `_dead_member_bytes > 0` (see DataTypeBuilder.build()'s own comment for
-    what this corrects and why -- a deleted member's old byte range keeps
-    occupying real space in an already-allocated tag's data table even
-    though it has no live type descriptor anymore).
+    """No-op, kept only so existing callers don't need to change.
 
-    `_get_type_size()` already accounts for `_dead_member_bytes` when
-    computing an *array* element's stride, but a *scalar* struct-typed
-    member (dimension 0, e.g. LugWrk's own "BfrLug" -> "Lug") never
-    consults `_get_type_size()` at all -- its own byte offset, and every
-    subsequent sibling's, comes directly from Rockwell's own stored
-    per-member `0x60` value, which is equally blind to the dead member's
-    footprint. This is a separate, explicit post-processing pass (not done
-    inline while building each DataType) because it needs every DataType
-    already built first, to resolve a member's nested-type name to that
-    type's own `_dead_member_bytes` -- including forward references (a
-    UDT can reference another UDT declared later in Comps.Dat).
-
-    Verified against a real project: without this, every member declared
-    after LugWrk's "BfrLug" (Lug-typed) was read 2 bytes too early,
-    corrupting 5 scalar members' decoded values and producing a bare "[]"
-    for one further-nested member -- Studio 5000 rejected the resulting
-    export as "Data type mismatch". Fixed, and confirmed byte-exact
-    against a real Studio 5000 L5X export of the same tag.
-
-    The shift is NOT simply propagated flat to every subsequent member,
-    though -- a member whose own start is determined by alignment (a BOOL
-    array, 4-byte aligned since it's bit-packed into DINT-sized words, per
-    the same rule `_get_type_size()` already uses for its size) recomputes
-    its position from the previous member's true end instead, since
-    alignment padding can absorb part or all of a pending shift. Found via
-    the same real UDT: LugWrk's own trailing BOOL[32] member ("Ons") got a
-    flat +2 applied on top of an already-correctly-aligned stored offset,
-    making the computed total type size (650) 2 bytes larger than Studio
-    5000's own declared "Data Type Size" for the same UDT (648, confirmed
-    directly from the UDT's Properties dialog).
+    A previous version of this function shifted `_byte_offset` for every
+    member declared after a scalar struct-typed member whose own nested
+    DataType has `_dead_member_bytes > 0`, on the theory that a deleted
+    member's old byte range keeps occupying space in an already-allocated
+    tag's data table. That theory was disproven by a real Studio 5000
+    screenshot of a populated `Trim_Decision` tag (`LugWrk`-typed, its
+    nested `Lug`-typed `BfrLug` member has one dead/deleted member,
+    `Z1_Nominal_Width`): the tag's real values (`pntrTpStrt=24,
+    pntrTpStp=25, pntrLug=183, Wrk[4]=32790`) only decode correctly using
+    each member's own *raw*, uncorrected stored byte_offset -- applying
+    this pass's shift on top double-counts a correction that turned out to
+    belong entirely to `_tag_value_blob_offset()` (the tag's own data-table
+    blob start position, which already accounts for the record's real
+    layout on a per-tag basis and needs no per-type adjustment on top).
+    The earlier "verified exact" claim for this same tag was made against
+    an all-zero/unpopulated instance, which cannot distinguish a correct
+    offset from an off-by-2 one -- a real, populated instance was needed to
+    catch this. `_dead_member_bytes` is still computed and logged (see
+    DataTypeBuilder.build()) as a useful diagnostic that a type has an
+    orphaned member, but no longer feeds into any byte-offset math.
     """
-    for dt in all_data_types_map.values():
-        cumulative_shift = 0
-        prev_true_end = None
-        for member in dt.members:
-            if member.data_type == "BIT":
-                continue
-            original_offset = member._byte_offset
-            is_bool_array = member.dimension > 0 and member.data_type.upper() == "BOOL"
-            if is_bool_array and prev_true_end is not None:
-                # A BOOL array is 4-byte aligned (bit-packed into DINT-sized
-                # words -- see _get_type_size()'s own BOOL-array sizing).
-                # Its start is determined by ALIGNMENT from the previous
-                # member's true end, not by adding the pending shift on top
-                # of its own stored offset -- the alignment padding can
-                # partially or fully ABSORB a pending dead-byte shift.
-                # Found via a real UDT ("LugWrk"): its trailing BOOL[32]
-                # member ("Ons") got a flat +2 applied on top of an already-
-                # correctly-aligned stored offset, computing a total type
-                # size 2 bytes larger than Studio 5000's own declared size
-                # for the same UDT (650 vs the real 648).
-                true_offset = -(-prev_true_end // 4) * 4  # ceil division by 4
-            else:
-                true_offset = original_offset + cumulative_shift
-            member._byte_offset = true_offset
-            # The shift actually applied to *this* member (which may be less
-            # than cumulative_shift if alignment absorbed part of it) is what
-            # subsequent members should carry forward.
-            cumulative_shift = true_offset - original_offset
-
-            if member.dimension > 0:
-                if member.data_type.upper() == "BOOL":
-                    size = ((member.dimension + 31) // 32) * 4
-                else:
-                    size = _get_type_size(member.data_type, all_data_types_map) * member.dimension
-                prev_true_end = true_offset + size
-            else:
-                size = _get_type_size(member.data_type, all_data_types_map)
-                # A scalar struct-typed member's own TRUE physical extent
-                # includes its nested type's dead bytes -- needed so a BOOL
-                # array immediately following it (no other member in
-                # between) aligns from the correct true end, not one that's
-                # still missing the dead-byte footprint.
-                nested_dt = all_data_types_map.get(member.data_type.upper())
-                dead_bytes = nested_dt._dead_member_bytes if nested_dt is not None else 0
-                prev_true_end = true_offset + size + dead_bytes
-                cumulative_shift += dead_bytes
+    return
 
 
 # Connection Type CIP enum, read at absolute offset 90 (u16le) of a

@@ -59,6 +59,26 @@ def test_escape_xml_attr_keeps_attribute_well_formed():
     assert parsed.documentElement.tagName == "AOI"
 
 
+def _build_dti_record(value_blob: bytes, attr1_len: int = 288) -> bytes:
+    """Build a synthetic data-table-instance comps record matching the real
+    RxGeneric layout: a fixed 82-byte header, 3 parsed AttributeRecords
+    (attribute_id 0x1/0x64/0x65 -- arbitrary content, only their lengths
+    matter), then a 4th, deliberately *unparsed* AttributeRecord (see
+    RxGeneric._read(): `for i in range(self.count_record - 1)` always
+    leaves the last one unread) whose own value IS the tag's value blob.
+    This mirrors real ACD data rather than assuming any fixed byte offset.
+    """
+    header = struct.pack("<IIHHH", 0, 0, 40, 106, 0)  # parent_id, uid, rfv, cip_type, comment_id
+    main_record = b"\x00" * 60
+    attr1 = struct.pack("<II", 0x1, attr1_len) + b"\x00" * attr1_len
+    attr64 = struct.pack("<II", 0x64, 16) + b"\x00" * 16
+    attr65 = struct.pack("<II", 0x65, 2) + b"\x00" * 2
+    count_record = 4  # 3 parsed + 1 left unparsed (the value blob itself)
+    len_and_count = struct.pack("<II", 0, count_record)
+    value_attr = struct.pack("<II", 0x66, len(value_blob)) + value_blob
+    return header + main_record + len_and_count + attr1 + attr64 + attr65 + value_attr
+
+
 def test_read_tag_initial_value_bool_array_bit_packing():
     # Regression test for a real bug found while verifying export_routine()
     # against a real Studio 5000 import: BOOL *array* values were read one
@@ -70,16 +90,17 @@ def test_read_tag_initial_value_bool_array_bit_packing():
     # BOOL array tag's exported initial value project-wide.
     #
     # Build a synthetic data-table blob: 40 logical bits spanning two
-    # packed DWORDs at offset 0x1A2 (the array read offset), with only
-    # bit 2 of the first DWORD and bit 5 of the second DWORD set.
+    # packed DWORDs, with only bit 2 of the first DWORD and bit 5 of the
+    # second DWORD set.
     n_elements = 40
-    blob = bytearray(0x1A2 + 8)
-    struct.pack_into("<I", blob, 0x1A2, 1 << 2)
-    struct.pack_into("<I", blob, 0x1A2 + 4, 1 << 5)
+    value_blob = bytearray(8)
+    struct.pack_into("<I", value_blob, 0, 1 << 2)
+    struct.pack_into("<I", value_blob, 4, 1 << 5)
+    blob = _build_dti_record(bytes(value_blob))
 
     db = sqlite3.connect(":memory:")
     db.execute("CREATE TABLE comps (object_id INTEGER, record BLOB)")
-    db.execute("INSERT INTO comps VALUES (1, ?)", (bytes(blob),))
+    db.execute("INSERT INTO comps VALUES (1, ?)", (blob,))
     cur = db.cursor()
 
     values = _read_tag_initial_value(cur, 1, "BOOL", n_elements)
@@ -91,57 +112,44 @@ def test_read_tag_initial_value_bool_array_bit_packing():
     assert values == expected
 
 
-def test_read_tag_initial_value_scalar_uses_0x1a2_offset():
-    # Regression test for a major, previously-undiscovered bug: scalar
-    # (non-array) primitive tags were read at offset 0x19E, not 0x1A2 (the
-    # same offset already used for arrays -- there was never a real
-    # scalar/array distinction). Verified against a real project: 758
-    # controller-scope scalar BOOL tags and 812 DINT tags compared against
-    # Studio 5000's own values -- the old 0x19E offset matched only
-    # 21.4%/2.8% of the time, while 0x1A2 matched 100% for both. This
-    # affected every scalar primitive tag's decoded initial value
-    # project-wide (BOOL, DINT, REAL, etc.), not just BOOL.
+def test_read_tag_initial_value_uses_structural_offset_not_fixed_constant():
+    # Regression test for a major bug: the value blob's start was assumed
+    # to be a fixed absolute offset (0x1A2, +2 for arrays), but this was
+    # disproven by a real Studio 5000 screenshot of a populated tag
+    # (Trim_Decision) whose real values only decoded correctly using the
+    # record's own *computed* offset (see _tag_value_blob_offset), which
+    # varies by a couple of bytes depending on the record's own
+    # extended_records lengths -- not on whether the tag is a scalar or an
+    # array, and not on which UDT type is involved.
     #
-    # Build a synthetic data-table blob where 0x19E and 0x1A2 hold
-    # deliberately different values, and confirm the function reads from
-    # 0x1A2.
-    blob = bytearray(0x1A2 + 4)
-    struct.pack_into("<i", blob, 0x19E, 999)  # decoy -- must NOT be read
-    struct.pack_into("<i", blob, 0x1A2, 42)   # the real value
+    # Build two synthetic records whose "attr 0x1" boilerplate blob differs
+    # in length (as real ACD records from different projects do), and
+    # confirm the same logical value decodes correctly from each despite
+    # sitting at a different absolute byte offset.
+    for attr1_len in (286, 288):
+        blob = _build_dti_record(struct.pack("<i", 42), attr1_len=attr1_len)
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE comps (object_id INTEGER, record BLOB)")
+        db.execute("INSERT INTO comps VALUES (1, ?)", (blob,))
+        cur = db.cursor()
+
+        value = _read_tag_initial_value(cur, 1, "DINT", 1)
+
+        assert value == 42
+
+
+def test_read_tag_initial_value_array_uses_structural_offset():
+    # A genuine one-element array (Dimensions="1") must decode via the same
+    # structurally-computed offset as any other array -- n_elements alone
+    # can't distinguish scalar vs array, only is_array can (see the
+    # identical distinction for collapsing to a scalar return value).
+    blob = _build_dti_record(struct.pack("<i", 42))
 
     db = sqlite3.connect(":memory:")
     db.execute("CREATE TABLE comps (object_id INTEGER, record BLOB)")
-    db.execute("INSERT INTO comps VALUES (1, ?)", (bytes(blob),))
+    db.execute("INSERT INTO comps VALUES (1, ?)", (blob,))
     cur = db.cursor()
 
-    value = _read_tag_initial_value(cur, 1, "DINT", 1)
-
-    assert value == 42
-
-
-def test_read_tag_initial_value_array_uses_0x1a2_plus_2_offset():
-    # Regression test for a major, project-wide bug found immediately after
-    # a real Studio 5000 import rejection was traced to something else
-    # entirely: the 0x1A2 offset above was only ever verified against
-    # SCALAR tags. A declared array (is_array=True, including a genuine
-    # one-element array) actually starts 2 bytes later, at 0x1A4 -- found
-    # via a real project where 273 of 347 primitive array tags and 14 of 22
-    # BOOL array tags decoded every value as if multiplied by 65536 (a
-    # value's real bytes landing in the high 16 bits of a 4-byte read
-    # started 2 bytes too early), confirmed correct once shifted +2.
-    blob = bytearray(0x1A2 + 8)
-    struct.pack_into("<i", blob, 0x1A2, 999)      # decoy -- must NOT be read
-    struct.pack_into("<i", blob, 0x1A2 + 2, 42)   # the real value
-
-    db = sqlite3.connect(":memory:")
-    db.execute("CREATE TABLE comps (object_id INTEGER, record BLOB)")
-    db.execute("INSERT INTO comps VALUES (1, ?)", (bytes(blob),))
-    cur = db.cursor()
-
-    # A genuine one-element array (Dimensions="1") must use the array
-    # offset too, not the scalar one -- n_elements alone can't distinguish
-    # the two cases, only is_array can (see the identical distinction for
-    # collapsing to a scalar return value, tested above).
     value = _read_tag_initial_value(cur, 1, "DINT", 1, is_array=True)
 
     assert value == [42]
@@ -305,13 +313,20 @@ def test_get_type_size_does_not_add_dead_member_bytes():
     assert _get_type_size("INNER", data_types_map) == 4
 
 
-def test_apply_dead_member_byte_corrections_shifts_subsequent_members():
-    # Regression test for the real bug this exists to fix: a scalar
-    # (non-array) struct-typed member ("b", typed "Inner") whose nested
-    # DataType has dead bytes must shift every member declared AFTER it in
-    # the outer struct -- reproduces the real LugWrk/Lug/pntrTpStrt shape
-    # (BfrLug -> Lug, which had a deleted member, followed by 6 scalar
-    # members that were each read 2 bytes too early before this fix).
+def test_apply_dead_member_byte_corrections_is_a_noop():
+    # Regression test for a real, disproven theory: a scalar struct-typed
+    # member ("b", typed "Inner") whose nested DataType has dead/deleted
+    # bytes used to shift every member declared AFTER it in the outer
+    # struct, on the theory that a deleted member's old byte range keeps
+    # occupying space in an already-allocated tag's data table. A real
+    # Studio 5000 screenshot of a populated tag with exactly this shape
+    # (Trim_Decision: LugWrk.BfrLug -> Lug, which has a deleted member)
+    # proved this wrong -- the real values only decode correctly using
+    # each member's own *raw*, uncorrected stored byte_offset (the +2 the
+    # tag's real data needed came entirely from _tag_value_blob_offset()'s
+    # own, per-tag structural offset, not from any member-level shift).
+    # This function is now a no-op; member offsets must be left exactly as
+    # DataTypeBuilder stored them, dead bytes or not.
     inner_dt = DataType(
         "Inner", "Inner", "NoFamily", "User",
         [_member("a", "DINT", byte_offset=0)],
@@ -330,9 +345,9 @@ def test_apply_dead_member_byte_corrections_shifts_subsequent_members():
     _apply_dead_member_byte_corrections(data_types_map)
 
     b, c, d = outer_dt.members
-    assert b._byte_offset == 0  # unaffected -- nothing precedes it
-    assert c._byte_offset == 6  # shifted by Inner's 2 dead bytes
-    assert d._byte_offset == 8
+    assert b._byte_offset == 0
+    assert c._byte_offset == 4  # unchanged -- no correction applied
+    assert d._byte_offset == 6  # unchanged -- no correction applied
 
 
 def test_apply_dead_member_byte_corrections_noop_when_no_dead_bytes():
@@ -350,41 +365,6 @@ def test_apply_dead_member_byte_corrections_noop_when_no_dead_bytes():
     b, c = outer_dt.members
     assert b._byte_offset == 0
     assert c._byte_offset == 4
-
-
-def test_apply_dead_member_byte_corrections_bool_array_absorbs_shift_via_alignment():
-    # Regression test for a real bug found immediately after the fix above:
-    # a BOOL array member (4-byte aligned -- bit-packed into DINT-sized
-    # words) must NOT receive the flat pending shift on top of its own
-    # stored offset; its true position is recomputed by aligning up from
-    # the previous member's true end, since alignment padding can absorb
-    # part or all of the shift. Reproduces the real LugWrk shape: BfrLug
-    # (Lug-typed, 2 dead bytes) followed by several scalar INT members,
-    # then a trailing BOOL[32] member ("Ons") whose own stored offset was
-    # already correctly 4-byte-aligned -- applying the flat +2 on top of it
-    # anyway made the computed total type size 2 bytes larger than Studio
-    # 5000's own declared size for the same real UDT (650 vs the real 648).
-    inner_dt = DataType(
-        "Inner", "Inner", "NoFamily", "User",
-        [_member("a", "DINT", byte_offset=0)],  # size 4
-        _dead_member_bytes=2,
-    )
-    outer_dt = DataType(
-        "Outer", "Outer", "NoFamily", "User",
-        [
-            _member("b", "Inner", byte_offset=0),
-            _member("c", "SINT", byte_offset=4),  # 1 byte, stored pre-shift
-            _member("d", "BOOL", byte_offset=5, dimension=32),  # already 4-aligned pre-shift... but true end of c is 4+2+1=7, so d must align to 8
-        ],
-    )
-    data_types_map = {"INNER": inner_dt, "OUTER": outer_dt}
-
-    _apply_dead_member_byte_corrections(data_types_map)
-
-    b, c, d = outer_dt.members
-    assert b._byte_offset == 0
-    assert c._byte_offset == 6  # shifted by Inner's 2 dead bytes (4 -> 6)
-    assert d._byte_offset == 8  # aligned up from c's true end (6+1=7 -> 8), NOT 5+2=7
 
 
 def test_decode_string_family_value_uses_latin1_never_replacement_char():

@@ -245,7 +245,17 @@ def test_member_to_xml_plain_bool_array_omits_bit_number():
 
 
 def test_decorated_real_literal_finite_uses_short_form():
-    assert _decorated_real_literal(0.4047619, in_array=False) == "0.404762"
+    # Regression test for a real precision bug: a naive "%.6g" truncates
+    # any value needing more than 6 significant digits to round-trip to
+    # the same float32 bit pattern -- found via a real Studio 5000 "Tag
+    # Name Collision / Data Compare" dialog showing several REAL members
+    # (LugMn, Frequency, RPM, etc.) each differing from ours only in
+    # digit count despite the underlying decoded bytes being correct. The
+    # value below (a real float32 bit pattern) needs 7 significant digits
+    # to round-trip -- "%.6g" silently produces "0.404762", which does NOT
+    # round-trip to the same float32 bits (verified: struct.pack("<f",
+    # 0.404762) != struct.pack("<f", 0.4047619)).
+    assert _decorated_real_literal(0.4047619, in_array=False) == "0.4047619"
 
 
 def _member(name, data_type, byte_offset=0, dimension=0):

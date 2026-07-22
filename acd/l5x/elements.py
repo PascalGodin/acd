@@ -341,21 +341,49 @@ def _l5k_real_literal(value: float) -> str:
     return f"{mantissa}e{sign}{exp_digits}"
 
 
+def _shortest_float32_repr(value: float) -> str:
+    """Return the shortest fixed-point decimal string that round-trips to
+    the same float32 bit pattern as *value* (a Python float already holding
+    an exact-upconverted float32, e.g. via struct.unpack("<f", ...)).
+
+    A REAL tag is stored as IEEE-754 single precision, but Python floats
+    are double precision -- struct.unpack("<f", ...) upconverts exactly,
+    so the resulting double carries the float32's full double-precision
+    expansion (e.g. 81.0063247680664 for what was originally "81.006325"),
+    not the "nice" short decimal a human (or Studio) would write. A naive
+    fixed precision like "%.6g" either truncates real precision the value
+    actually has (81.006325 -> "81.0063", silently wrong) or, for a
+    different value, shows more digits than the float32 actually carries.
+    Neither matches Studio 5000, which shows the shortest decimal that
+    uniquely identifies the same float32 value -- found via a real Studio
+    "Tag Name Collision / Data Compare" dialog showing several float
+    members (SmltnPstn, LugMn, LugMnAvrg, Frequency, RPM, RPMSum) each
+    differing from ours only in significant-digit count (e.g. real
+    "81.006325" vs our "%.6g"-truncated "81.0063") even though the
+    underlying decoded bytes were already correct.
+    """
+    target_bits = struct.pack("<f", value)
+    for decimals in range(0, 15):
+        candidate = f"{value:.{decimals}f}"
+        if struct.pack("<f", float(candidate)) == target_bits:
+            return candidate
+    return f"{value:.6g}"  # pathological magnitude (subnormal/huge) fallback
+
+
 def _decorated_real_literal(value: float, in_array: bool) -> str:
     """Format a REAL/LREAL value for a Decorated Value="..." attribute
     (DataValue/DataValueMember for a scalar, Array Element for an array).
 
-    Finite values use the normal "%.6g"-style short form Studio 5000 uses
-    for Decorated (distinct from L5K's fixed 8-digit scientific notation,
-    see _l5k_real_literal), with a mandatory decimal point even for a
-    whole-number value -- confirmed against a real AOI instance tag's own
-    Decorated value (TestFPM, DataType AOI_RPMtoFPM): MotorRPM=1800.0,
-    MotorDriverSheaveDiameter=6.0, MotorDrivenSheaveDiameter=12.0,
-    DrivenRoll_SprocketDiameter=14.0 all render with an explicit ".0" in
-    real Studio output, but Python's bare "%.6g" strips the decimal point
-    for exact whole numbers (f"{1800.0:.6g}" == "1800", not "1800.0") --
-    this went undetected in every earlier verification sample because none
-    happened to include a REAL value that was an exact whole number.
+    Finite values use the shortest decimal that round-trips to the same
+    float32 bit pattern (see _shortest_float32_repr) -- distinct from
+    L5K's fixed 8-digit scientific notation (_l5k_real_literal) -- with a
+    mandatory decimal point even for a whole-number value: confirmed
+    against a real AOI instance tag's own Decorated value (TestFPM,
+    DataType AOI_RPMtoFPM): MotorRPM=1800.0, MotorDriverSheaveDiameter=6.0,
+    MotorDrivenSheaveDiameter=12.0, DrivenRoll_SprocketDiameter=14.0 all
+    render with an explicit ".0" in real Studio output, but
+    _shortest_float32_repr's plain fixed-point formatting omits the
+    decimal point for an exact whole number (e.g. "1800", not "1800.0").
     NaN/Infinity: confirmed against a real project's own Studio 5000 export
     that a *scalar* tag's Decorated NaN value is the bare label "1.#QNAN"
     (no padding/exponent, unlike L5K) -- the analogous "1.#INF" for scalar
@@ -374,7 +402,7 @@ def _decorated_real_literal(value: float, in_array: bool) -> str:
         label = "#QNAN" if math.isnan(value) else "#INF"
         sign = "-" if math.copysign(1.0, value) < 0 else ""
         return f"{sign}1.{label}"
-    formatted = f"{value:.6g}"
+    formatted = _shortest_float32_repr(value)
     if "." not in formatted and "e" not in formatted and "E" not in formatted:
         formatted += ".0"
     return formatted

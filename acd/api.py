@@ -25,11 +25,14 @@ from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
 from acd.l5x.elements import (
+    DataType,
     DumpCompsRecords,
+    Member,
     RSLogix5000Content,
     Routine,
     _escape_xml_attr,
     _multiline_xml_text,
+    new_member,
 )
 
 
@@ -954,6 +957,116 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         f'</Routines>\n'
         f'</Program>\n'
         f'</Programs>\n'
+        f'</Controller>\n'
+        f'</RSLogix5000Content>\n'
+    )
+
+    Path(output_path).write_text(xml, encoding="utf-8")
+
+
+def export_datatype(project: RSLogix5000Content, data_type: DataType, output_path, owner: str = None) -> None:
+    """Export a single DataType (UDT) as a standalone, partial L5X file, for
+    Studio 5000's native "Import Data Type..." command (right-click the
+    Data Types folder) -- the same "native-import escape hatch" strategy
+    `export_routine()` uses for rungs/tags, sidestepping the raw-binary
+    `save_acd()`/`patch_rungs()` limitations (`FileInfo.Dat`'s checksum is
+    enforced on open and this library cannot re-sign it) for the common
+    case of creating or modifying a UDT.
+
+    To **modify** an existing UDT: get it from `project.controller.data_types`,
+    mutate its `.members` list in place (e.g. `dt.members.insert(i,
+    new_member("Foo", "DINT"))` to add a field at a specific position, or
+    edit/remove entries directly), then export it. To **create** a brand-new
+    UDT: construct a `DataType` and append it to `project.controller.data_types`
+    first, then export it the same way -- no special-casing needed for
+    "new" vs "existing", matching the same pattern already proven for tags
+    via the routine-carrier mechanism (see CLAUDE.md).
+
+    Member `_byte_offset` is irrelevant here and never emitted in the XML at
+    all (`Member.to_xml()` skips every underscore-prefixed field) -- Studio
+    5000 recomputes each member's real physical offset from the member
+    *order* you provide, the same way it would if you dragged a new row
+    into the UDT editor's grid.
+
+    Any other DataType this one depends on (a member typed as another
+    project UDT, transitively) is automatically included as additional
+    context via `_resolve_type_closure()` -- the same dependency-resolution
+    logic already verified for `export_routine()`'s own `<DataTypes
+    Use="Context">` section.
+
+    CAUTION -- unverified wrapper shape: unlike `export_routine()` (whose
+    exact XML shape was calibrated against multiple real Studio 5000
+    "Export Routine" outputs and real import trial-and-error), this
+    function's wrapper is a best-effort guess built by direct symmetry with
+    that already-verified case -- it has NOT yet been confirmed against a
+    real Studio 5000 "Export Data Type" output or a real "Import Data
+    Type..." attempt. Test on a COPY of your project first, and expect this
+    may need adjustment based on what Studio's importer actually accepts or
+    rejects (see CLAUDE.md's "Partial/context L5X exports" section for how
+    many real-import rounds it took to get export_routine()'s shape right).
+
+    Args:
+        project: The loaded project (from load_acd()) that owns `data_type`
+            (or that you've just appended a brand-new `data_type` to).
+        data_type: The DataType to export -- must already be an element of
+            `project.controller.data_types`.
+        output_path: Destination .L5X file path.
+        owner: Optional "Owner" attribute value, as in export_routine().
+
+    Raises:
+        ValueError: if `data_type` isn't in `project.controller.data_types`.
+
+    Example:
+        project = load_acd("MyController.ACD")
+        lug = next(dt for dt in project.controller.data_types if dt.name == "Lug")
+        member = new_member("NewField", "DINT", description="Added via acd-tools")
+        insert_at = next(i for i, m in enumerate(lug.members) if m.name == "Z1_Board_Length") + 1
+        lug.members.insert(insert_at, member)
+        export_datatype(project, lug, "Lug_modified.L5X")
+        # Studio 5000: right-click Data Types -> Import Data Type... -> select the file
+    """
+    import datetime
+
+    if not any(dt is data_type for dt in project.controller.data_types):
+        raise ValueError(
+            "data_type not found in project.controller.data_types -- append "
+            "it there first (for a brand-new UDT) or pass the same DataType "
+            "object obtained from project.controller.data_types"
+        )
+
+    controller_name = project.controller.name
+    export_date = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    export_options = (
+        "References NoRawData L5KData DecoratedData Context Dependencies "
+        "ForceProtectedEncoding AllProjDocTrans"
+    )
+
+    referenced_data_types, _referenced_aois = _resolve_type_closure(
+        {data_type.name.upper()}, project
+    )
+
+    # Individual <DataType> elements never carry a Use= attribute themselves
+    # except the one actually being targeted -- same rule already verified
+    # for export_routine()'s <Tag>/<Routine> elements (see its own docstring
+    # for the real Studio 5000 crash this rule was found from).
+    data_types_xml = "".join(
+        _inject_use_attr(dt.to_xml(), "DataType", "Target")
+        if dt is data_type else dt.to_xml()
+        for dt in referenced_data_types
+    )
+
+    owner_attr = f' Owner="{_escape_xml_attr(owner)}"' if owner else ""
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        f'<RSLogix5000Content SchemaRevision="{project.schema_revision}" '
+        f'SoftwareRevision="{project.software_revision}" '
+        f'TargetName="{_escape_xml_attr(data_type.name)}" '
+        f'TargetType="DataType"'
+        f'{owner_attr} ContainsContext="true" ExportDate="{export_date}" '
+        f'ExportOptions="{export_options}">\n'
+        f'<Controller Use="Context" Name="{_escape_xml_attr(controller_name)}">\n'
+        f'<DataTypes Use="Context">\n{data_types_xml}\n</DataTypes>\n'
         f'</Controller>\n'
         f'</RSLogix5000Content>\n'
     )

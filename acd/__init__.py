@@ -45,10 +45,12 @@ and CLAUDE.md for internals/gotchas if modifying this library itself.
 
 Writing changes back to a real `.ACD` that Studio 5000 will open: prefer
 `export_routine()` (a partial L5X imported via Studio's own "Import
-Routine" feature) over `save_acd()`/`patch_rungs()` -- Studio enforces a
-`FileInfo.Dat` checksum on open that this library cannot re-sign without a
-key it does not have, so `save_acd()` only produces an openable file for a
-completely unmodified round-trip.
+Routine" feature) for rungs/tags, or `export_datatype()` (imported via
+Studio's own "Import Data Type..." feature) for creating/modifying a UDT
+-- e.g. inserting a new member -- over `save_acd()`/`patch_rungs()`.
+Studio enforces a `FileInfo.Dat` checksum on open that this library
+cannot re-sign without a key it does not have, so `save_acd()` only
+produces an openable file for a completely unmodified round-trip.
 """
 
 from acd.api import (  # noqa: F401
@@ -56,9 +58,11 @@ from acd.api import (  # noqa: F401
     save_acd,
     patch_rungs,
     export_routine,
+    export_datatype,
     find_io_addresses,
     io_addresses_by_routine,
     diff_io_addresses,
     diff_project,
     diff_routine,
 )
+from acd.l5x.elements import new_member  # noqa: F401

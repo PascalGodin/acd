@@ -185,6 +185,36 @@ class Member(L5xElement):
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
+def new_member(name: str, data_type: str, dimension: int = 0,
+               radix: Union[str, None] = None,
+               description: Union[str, None] = None) -> Member:
+    """Construct a new, plain (non-BIT, non-hidden) UDT `Member` for
+    insertion into an existing (or brand-new) `DataType.members` list --
+    e.g. to add a field to a UDT before calling `export_datatype()`.
+
+    `radix` defaults to the conventional value for `data_type`
+    (`_PRIMITIVE_RADIX` -- "Decimal" for integer types, "Float" for
+    REAL/LREAL) if not given, or "NullType" for a struct-typed member
+    (a UDT/AOI name, matching how a real Studio 5000 UDT member typed as
+    another struct is declared). `target`/`bit_number` are always `None` --
+    this only builds a plain member; a BIT-overlay pseudo-member needs a
+    hidden backing field and `_resolve_bit_target`, which only applies to
+    members actually read back from a real ACD record, not one authored
+    fresh in Python.
+
+    Byte offset is never included -- Member._byte_offset is a decode-only
+    detail, never emitted in XML (Studio 5000 recomputes a UDT's real
+    physical member layout itself on import), so a newly-authored member
+    needs no offset of its own.
+    """
+    if radix is None:
+        radix = _PRIMITIVE_RADIX.get(data_type.upper(), "NullType")
+    return Member(
+        name, name, data_type, dimension, radix, False, None, None,
+        "Read/Write", _description=description,
+    )
+
+
 @dataclass
 class DataType(L5xElement):
     name: str

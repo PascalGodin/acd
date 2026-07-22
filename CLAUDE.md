@@ -705,6 +705,43 @@ exercised through `export_routine()` specifically yet (though the underlying `_l
     own parameter/local-tag default values, should start here rather than assume the existing UDT
     value-decode pipeline already handles AOIs correctly.
 
+## `export_datatype()` — create/modify a UDT (NOT YET VERIFIED against real Studio 5000)
+
+Added per user request (concrete example: insert a new member in the middle of the real `Lug`
+UDT). Same "native-import escape hatch" architecture as `export_routine()`: exports a single
+`DataType` (plus its transitive dependency closure via the already-existing `_resolve_type_closure()`)
+as a standalone partial L5X, for Studio 5000's own **"Import Data Type..."** command (right-click
+the Data Types folder) — sidestepping `save_acd()`/raw `Comps.Dat` writing entirely, the same way
+`export_routine()` sidesteps it for rungs/tags.
+
+- `new_member(name, data_type, dimension=0, radix=None, description=None)` (`acd/l5x/elements.py`)
+  builds a plain (non-BIT, non-hidden) `Member` with a sensible default `Radix` (`_PRIMITIVE_RADIX`
+  lookup, or `"NullType"` for a struct-typed member) — constructing `Member` directly is awkward
+  (duplicate `_name`/`name` positional args, no radix default).
+- To modify an existing UDT: mutate `dt.members` directly (`dt.members.insert(i, new_member(...))`
+  inserts at a specific position — Studio recomputes the real byte layout on import, since
+  `Member._byte_offset` is an internal decode-only field never emitted in XML at all). To create a
+  brand-new UDT: build a `DataType` and append it to `project.controller.data_types` first, then
+  export the same way — no special-casing needed, matching the already-proven "new vs existing tag"
+  pattern (see "Native-import escape hatches" above).
+- Wrapper shape (`<DataTypes Use="Context">` containing every dependency's full `<DataType>` element
+  plus the one being edited/created with `Use="Target"` injected via the existing
+  `_inject_use_attr()` helper, `TargetType="DataType"`, no `<Tags>`/`<Programs>`/`<Modules>`
+  sections) was built by **direct symmetry** with `export_routine()`'s already-verified wrapper —
+  it has **not** been confirmed against a real Studio 5000 "Export Data Type" output, nor against a
+  real "Import Data Type..." attempt. Given how many real-import rounds it took to get
+  `export_routine()`'s shape exactly right (see "Partial/context L5X exports" below — a crash, a
+  missing `Use=` rule, several tag-rendering gaps, all only found via actual import attempts), expect
+  this to need the same kind of iteration once tested against real Studio 5000.
+- Verified so far (without Studio 5000): generated XML is well-formed, the target `DataType`
+  carries `Use="Target"` and nothing else does, and a member inserted at a given list index appears
+  at the correct position in the rendered `<Members>` — covered by
+  `test_export_datatype_inserts_member_at_requested_position` (`test/test_api.py`), using the
+  `UDT_Test` fixture in `resources/ACDTestsWithAOI.ACD`. Also manually generated and inspected a
+  real `Lug_modified.L5X` (new `DINT` member inserted right after `Z1_Board_Length`) against the
+  real `BPM_TrimmerSorter_VAB_20260721.ACD` project — well-formed, correct member order — but this
+  has **not yet been imported into real Studio 5000**; do that on a **copy** of the project first.
+
 ## Routine-level Description (leading XML comment newline pitfall)
 
 The leading `<!--description-->` XML comment `export_routine()` emits (see item 7 above) must

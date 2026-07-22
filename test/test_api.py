@@ -8,12 +8,15 @@ from acd.api import (
     Extract,
     ExtractAcdDatabase,
     DumpCompsRecordsToFile,
+    export_datatype,
     find_io_addresses,
     io_addresses_by_routine,
     diff_io_addresses,
     diff_project,
     diff_routine,
+    load_acd,
 )
+from acd.l5x.elements import new_member
 
 
 def test_import_from_file():
@@ -350,3 +353,70 @@ def test_diff_routine_reproduces_real_jsr_removal_scenario():
             "new": [],
         }
     ]
+
+
+def test_new_member_defaults_radix_by_data_type():
+    dint_member = new_member("Foo", "DINT")
+    assert dint_member.radix == "Decimal"
+
+    real_member = new_member("Bar", "REAL")
+    assert real_member.radix == "Float"
+
+    struct_member = new_member("Baz", "SomeUdt")
+    assert struct_member.radix == "NullType"
+
+
+def test_new_member_is_plain_non_bit_non_hidden():
+    member = new_member("Foo", "DINT", dimension=5, description="a field")
+    assert member.name == "Foo"
+    assert member.data_type == "DINT"
+    assert member.dimension == 5
+    assert member.hidden is False
+    assert member.target is None
+    assert member.description == "a field"
+
+
+def test_export_datatype_raises_if_data_type_not_in_project():
+    from acd.l5x.elements import DataType
+
+    project = load_acd(os.path.join("..", "resources", "ACDTestsWithAOI.ACD"))
+    foreign_dt = DataType(_name="Foreign", name="Foreign", family="NoFamily", cls="User", members=[])
+    try:
+        export_datatype(project, foreign_dt, "unused.L5X")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_export_datatype_inserts_member_at_requested_position(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "ACDTestsWithAOI.ACD"))
+    dt = next(d for d in project.controller.data_types if d.name == "UDT_Test")
+    original_names = [m.name for m in dt.members]
+
+    member = new_member("InsertedField", "DINT", description="test insert")
+    insert_at = next(i for i, m in enumerate(dt.members) if m.name == "TestDINT") + 1
+    dt.members.insert(insert_at, member)
+
+    out_path = tmp_path / "UDT_Test_modified.L5X"
+    export_datatype(project, dt, str(out_path))
+
+    xml_text = out_path.read_text(encoding="utf-8")
+    parsed = minidom.parseString(xml_text)  # raises on malformed XML
+
+    root = parsed.documentElement
+    assert root.getAttribute("TargetName") == "UDT_Test"
+    assert root.getAttribute("TargetType") == "DataType"
+
+    data_type_elems = parsed.getElementsByTagName("DataType")
+    assert len(data_type_elems) == 1
+    target_elem = data_type_elems[0]
+    assert target_elem.getAttribute("Use") == "Target"
+    assert target_elem.getAttribute("Name") == "UDT_Test"
+
+    member_names = [
+        m.getAttribute("Name")
+        for m in target_elem.getElementsByTagName("Member")
+    ]
+    expected_names = list(original_names)
+    expected_names.insert(insert_at, "InsertedField")
+    assert member_names == expected_names

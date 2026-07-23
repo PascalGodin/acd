@@ -9,6 +9,7 @@ from acd.api import (
     ExtractAcdDatabase,
     DumpCompsRecordsToFile,
     export_datatype,
+    export_routine,
     find_io_addresses,
     io_addresses_by_routine,
     diff_io_addresses,
@@ -77,6 +78,38 @@ def test_st_routine_content():
     assert '<Line Number="0"><![CDATA[' in xml
     # Line numbering must match source positions (blank lines preserved)
     assert f'<Line Number="{len(st._st_lines) - 1}">' in xml
+
+
+def test_export_routine_st_routine_pulls_in_referenced_tags(tmp_path):
+    # Regression test: export_routine()'s dependency scan used to only look
+    # at routine.rungs (RLL text), which is empty for an ST routine (its
+    # source lives in ._st_lines instead) -- so exporting an ST routine
+    # silently produced an empty <Tags Use="Context"> with none of its real
+    # tag references included. Fixed by routing every scan through
+    # _routine_lines(), which already picks the right list per routine type.
+    project = load_acd(os.path.join("..", "resources", "ACDTestsNonRedundant.ACD"))
+    program = next(p for p in project.controller.programs if p.name == "MainProgram")
+    st_routine = next(r for r in program.routines if r.type == "ST")
+    assert st_routine._st_lines, "fixture ST routine should have source lines"
+
+    out_path = tmp_path / "STRoutine_export.L5X"
+    export_routine(project, st_routine, str(out_path))
+
+    xml_text = out_path.read_text(encoding="utf-8")
+    parsed = minidom.parseString(xml_text)  # raises on malformed XML
+
+    root = parsed.documentElement
+    assert root.getAttribute("TargetType") == "Routine"
+    assert root.getAttribute("TargetSubType") == "ST"
+    assert "<STContent>" in xml_text
+    assert "<RLLContent>" not in xml_text
+
+    # The routine's real source references controller-scope tags literally
+    # named "DINT"/"UDINT"/"ULINT" (this fixture's own naming convention) --
+    # these must show up as full <Tag> context elements, proving the ST
+    # source was actually scanned for dependencies, not just rendered.
+    tag_names = {t.getAttribute("Name") for t in parsed.getElementsByTagName("Tag")}
+    assert {"DINT", "UDINT", "ULINT"} <= tag_names
 
 
 def test_find_io_addresses():

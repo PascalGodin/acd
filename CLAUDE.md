@@ -705,6 +705,27 @@ exercised through `export_routine()` specifically yet (though the underlying `_l
     own parameter/local-tag default values, should start here rather than assume the existing UDT
     value-decode pipeline already handles AOIs correctly.
 
+## `export_routine()` for ST routines — dependency scan was RLL-only
+
+`Routine.to_xml()` already rendered ST routine content correctly (`<STContent><Line .../>`, see
+"Structured Text (ST) routine content" below) since that was built independently of
+`export_routine()`. But `export_routine()`'s own dependency discovery (which controller-/program-
+scope tags, UDTs, Modules, and called routines to pull in as `Use="Context"`) scanned only
+`routine.rungs` — always empty for an ST routine, whose source lives in `._st_lines` instead — so
+exporting an ST routine silently produced an empty `<Tags Use="Context">` with none of its real
+tag/module/routine references included, even though the routine's own `<STContent>` rendered fine.
+Fixed by routing every scan (`_referenced_tag_names`, `_referenced_modules`,
+`_referenced_called_routines`) through `_routine_lines(routine)` — a small existing helper (already
+used by `diff_routine()`) that returns `.rungs` for RLL or `._st_lines` for ST. No new ST-specific
+scanning logic was needed: an ST routine's identifier syntax (member access via `.`, instruction/JSR
+calls via `(`) is the same as RLL's for the purposes of these regex-based scans. `TargetSubType` in
+the wrapper was already generic (`routine.type`), so `"ST"` was already correctly emitted once the
+dependency scan was fixed. Verified against the real `ACDTestsNonRedundant.ACD` fixture's `STRoutine`
+(source references controller-scope tags literally named `DINT`/`UDINT`/`ULINT`, this fixture's own
+naming convention): all three now correctly appear as full `<Tag>` context elements in the export.
+Covered by `test_export_routine_st_routine_pulls_in_referenced_tags` (`test/test_api.py`) — confirmed
+this test fails without the fix, not just that it passes with it.
+
 ## `export_datatype()` — create/modify a UDT (NOT YET VERIFIED against real Studio 5000)
 
 Added per user request (concrete example: insert a new member in the middle of the real `Lug`

@@ -753,15 +753,31 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     the real <Routine Use="Target">-- also verified against that same
     export (Main_Motors calls JSR(Infeed_LandingTable,0)).
 
+    ST routines are supported the same way: `Routine.to_xml()` already
+    renders an ST routine's own content as <STContent><Line .../></STContent>
+    (see CLAUDE.md's "Structured Text (ST) routine content" section) rather
+    than <RLLContent>, and every dependency scan above (tags, modules,
+    called routines) uses `_routine_lines(routine)` -- a small helper
+    (shared with `diff_routine()`) that returns `.rungs` for an RLL routine
+    or `._st_lines` for an ST one, since `.rungs` is simply empty for the
+    latter. An ST routine's identifier syntax (member access via ".",
+    instruction/JSR calls via "(") is the same as RLL's for the purposes of
+    these regex-based scans, so no ST-specific scanning logic was needed --
+    only routing to the right source list. ST routines have no rung-comment
+    concept (`_rung_comments` only applies to RLL).
+
     Args:
         project: The loaded project (from load_acd()) that owns `routine`
             -- used to find which Program contains it, resolve referenced
             tags/data types, and source SoftwareRevision/SchemaRevision.
         routine: The Routine object to export (e.g.
-            project.controller.programs[0].routines[0]). Edit its `.rungs`
-            (append new rung text, or edit existing entries) and/or
-            `._rung_comments` (dict of {rung_index: comment_text}) before
-            calling this to include those changes in the export.
+            project.controller.programs[0].routines[0]). For an RLL
+            routine, edit `.rungs` (append new rung text, or edit existing
+            entries) and/or `._rung_comments` (dict of {rung_index:
+            comment_text}) before calling this. For an ST routine
+            (`routine.type == "ST"`), edit `._st_lines` (list[str], one
+            source line each) instead -- `.rungs`/`._rung_comments` don't
+            apply to ST.
         output_path: Destination .L5X file path.
         owner: Optional "Owner" attribute value (the registered Studio 5000
             license owner, e.g. "MyCompany, MyCompany" -- a real export
@@ -771,7 +787,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     Raises:
         ValueError: if `routine` isn't found in any program of `project`.
 
-    Example:
+    Example (RLL):
         project = load_acd("MyController.ACD")
         routine = project.controller.programs[0].routines[0]
         routine.rungs.append("XIC(NewTag)OTE(AnotherTag);")
@@ -779,6 +795,11 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         export_routine(project, routine, "MyRoutine_export.L5X")
         # Then, in Studio 5000: right-click the Routines folder ->
         # Import Routine... -> select MyRoutine_export.L5X
+
+    Example (ST):
+        st_routine = next(r for r in project.controller.programs[0].routines if r.type == "ST")
+        st_routine._st_lines.append("NewTag := AnotherTag + 1;")
+        export_routine(project, st_routine, "MySTRoutine_export.L5X")
     """
     import datetime
 
@@ -799,7 +820,12 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         "ForceProtectedEncoding AllProjDocTrans"
     )
 
-    referenced_names = set(_referenced_tag_names(routine.rungs))
+    # ST routines keep their source in ._st_lines, not .rungs (which is empty
+    # for them) -- _routine_lines() (already used by diff_routine()) picks
+    # whichever one is actually populated, so every dependency scan below
+    # (tags, modules, called routines) works the same way for either type.
+    routine_lines = _routine_lines(routine)
+    referenced_names = set(_referenced_tag_names(routine_lines))
 
     # An Alias tag's target must also be included -- Studio 5000's own
     # export does this too (e.g. a routine using alias "Sort_Enc_Calibrated"
@@ -886,7 +912,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # full definition -- confirmed against the real export. Also scans
     # alias_io_targets (see above) so an alias's I/O target pulls in its
     # owning Module(s) too.
-    referenced_modules = _referenced_modules(list(routine.rungs) + alias_io_targets, project)
+    referenced_modules = _referenced_modules(list(routine_lines) + alias_io_targets, project)
     modules_xml = "".join(
         f'<Module Use="Reference" Name="{_escape_xml_attr(m.name)}">\n</Module>\n'
         for m in referenced_modules
@@ -906,7 +932,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # Routines called via JSR within the same program: empty Use="Reference"
     # stubs alongside the real Use="Target" routine -- verified against that
     # same real export (Main_Motors calls JSR(Infeed_LandingTable,0)).
-    referenced_routines = _referenced_called_routines(routine.rungs, program)
+    referenced_routines = _referenced_called_routines(routine_lines, program)
     called_routines_xml = "".join(
         f'<Routine Use="Reference" Name="{_escape_xml_attr(r.name)}">\n</Routine>\n'
         for r in referenced_routines

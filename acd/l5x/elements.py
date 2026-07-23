@@ -3914,9 +3914,35 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
     lines.sort()
     texts = [text for _seq, text in lines]
 
-    # Batch-resolve @hexid@ tag references to comp names.
-    all_hex = set(re.findall(r"@([0-9a-fA-F]{1,8})@", " ".join(texts)))
-    if all_hex:
+# Batch-resolve @hexid@ and &hexid: tag references to comp names. Both
+    # point at the same comps table by object_id; @...@ is an ordinary tag
+    # reference, &...:  is used specifically for module I/O addresses
+    # (e.g. &2a47752d:5:I.Ch6Data -> N2:5:I.Ch6Data) and keeps its
+    # trailing colon on resolution, since that colon is real address
+    # syntax, not placeholder delimiter syntax the way both @ signs are.
+    #
+    # Resolution is iterated to a fixed point rather than done in one
+    # pass: some comps names are themselves still-unresolved &hexid:
+    # placeholder text (a composite/derived module-address reference
+    # stored that way in the comps table), so the name looked up for one
+    # placeholder can itself contain a further placeholder that a single
+    # pass would leave untouched. Bounded to guard against a
+    # pathological circular reference.
+    _ref_re = re.compile(r"([@&])([0-9a-fA-F]{1,8})([@:])")
+
+    def _resolve_once(line: str, id_to_name: Dict[str, str]) -> str:
+        def _repl(m: "re.Match[str]") -> str:
+            delim_open, hex_id, delim_close = m.group(1), m.group(2), m.group(3)
+            name = id_to_name.get(hex_id)
+            if name is None:
+                return m.group(0)
+            return name + delim_close if delim_open == "&" else name
+        return _ref_re.sub(_repl, line)
+
+    for _ in range(5):
+        all_hex = {m.group(2) for t in texts for m in _ref_re.finditer(t)}
+        if not all_hex:
+            break
         id_to_name: Dict[str, str] = {}
         for hex_id in all_hex:
             cur.execute(
@@ -3925,16 +3951,13 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
             row = cur.fetchone()
             if row and row[0]:
                 id_to_name[hex_id] = row[0]
-        if id_to_name:
-            def _resolve(line: str) -> str:
-                return re.sub(
-                    r"@([0-9a-fA-F]{1,8})@",
-                    lambda m: id_to_name.get(m.group(1), m.group(0)),
-                    line,
-                )
-            texts = [_resolve(t) for t in texts]
+        if not id_to_name:
+            break
+        new_texts = [_resolve_once(t, id_to_name) for t in texts]
+        if new_texts == texts:
+            break
+        texts = new_texts
     return texts
-
 
 def _lookup_object_description(cur: Cursor, r, record: bytes) -> Union[str, None]:
     """Look up a comps object's own whole-object Description via the comments

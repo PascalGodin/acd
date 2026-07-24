@@ -325,6 +325,43 @@ records, the remaining (real, numbered) lines were byte-for-byte identical betwe
 confirming both the fix and that the excluded records were never genuine source. Fixed by skipping
 `seq == 0xFFFFFFFF` records entirely in `_st_routine_lines()`.
 
+## Phantom UDT members: deleted-member child rows resurrected via a stale extended record
+
+The "Phantom `<Program>`/`<Module>`/`<Tag>`/`<Routine>` elements" fix (see "Whole-project
+element-count verification" above) filters out deleted-but-not-purged comps records for those four
+object kinds via a distinct `record_type`/enum value — but this was never applied to **UDT
+members**, and a real project turned up the exact same class of bug there too. Found via a user
+report: `project.controller.data_types` for a real, freshly re-saved project (`Trimmer`, edited in
+Studio 5000 to consolidate 16 scalar `DINT` members into a single `Saw_Pos[32]` array) returned 16
+members instead of the expected 1.
+
+Root cause, confirmed directly against the raw comps data: a member-collection child's own
+`record_type` is `256` for a live member, `512` for a deleted one — the same convention already
+established elsewhere in this file. Deleting a member correctly flips its own child row to `512`,
+and correctly updates the type's own declared `member_count` (extended-record attribute `0x64`,
+verified to read back as `1` for the real `Trimmer` case) — but does **not** reliably purge that
+member's own extended-record descriptor from the *type's* own comps row. `DataTypeBuilder.build()`
+never checked either signal: it matched every extended-record descriptor (attribute_id `>= 0x6E`)
+against *any* same-named member-collection child regardless of that child's own `record_type`,
+so a stale descriptor for a deleted member, paired with its equally-stale-but-still-present
+`record_type=512` child row, silently resurrected it as if it were live.
+
+Fixed in `DataTypeBuilder.build()` by filtering member-collection children to `record_type == 256`
+*before* matching them against extended records — a stale descriptor for a name with no *live*
+child now falls through to the same "no descriptor found" path already used for a fully-purged
+deletion (folded into the same `_dead_member_bytes` diagnostic count/warning). Also added a
+diagnostic (not authoritative — its exact counting convention, e.g. whether it includes hidden
+BIT-backing members, isn't independently verified) cross-check comparing the final built member
+count against the type's own declared `member_count`, which would have caught this immediately had
+it existed already (it correctly said `1` while 16 members were about to be returned).
+
+Verified: `Trimmer` now correctly returns exactly `[Saw_Pos (DINT, dimension=32)]`, matching the
+live Studio 5000 project exactly. Covered by
+`test_datatype_builder_excludes_deleted_member_with_stale_extended_record`
+(`test/test_elements_helpers.py`) — a synthetic comps DB reproducing the exact shape (a live
+member's extended record + child row, plus a stale extended record whose only matching child is
+`record_type=512`) — confirmed this test fails without the fix, not just passes with it.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*

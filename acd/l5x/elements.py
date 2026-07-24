@@ -2680,16 +2680,40 @@ class DataTypeBuilder(L5xElementBuilder):
             member_collection_id = member_results[0][1]
 
             self._cur.execute(
-                f"SELECT comp_name, object_id, parent_id, seq_number, record FROM comps WHERE parent_id={member_collection_id} ORDER BY seq_number"
+                f"SELECT comp_name, object_id, parent_id, seq_number, record, record_type "
+                f"FROM comps WHERE parent_id={member_collection_id} ORDER BY seq_number"
             )
             children_results = self._cur.fetchall()
 
             # Build a name→child map so we pair members by name instead of
             # by seq_number position (seq_number can be stale when members
             # are deleted and re-added over a project's lifetime).
+            #
+            # A member-collection child's own record_type is 256 for a live
+            # member, 512 for a deleted one -- the same live/deleted marker
+            # already used elsewhere for Program/Module/Tag/Routine phantom
+            # filtering, but never applied here until now. Deleting a member
+            # marks its own child row 512 but does NOT necessarily remove its
+            # extended-record descriptor from the *type's* own comps row (see
+            # the member_keys loop below) -- found via a real project (UDT
+            # "Trimmer", 15 scalar DINT members consolidated into an array
+            # "Saw_Pos[32]" and re-saved): the type's own declared
+            # member_count (attribute 0x64) correctly read back as 1, but 15
+            # stale extended-record descriptors for the deleted scalars were
+            # still present and, before this fix, got matched against their
+            # equally-stale-but-still-present record_type=512 child rows,
+            # silently resurrecting them as 15 phantom live members. Excluding
+            # record_type=512 rows from name_to_child means a stale extended
+            # record with no *live* child match falls through to the same
+            # "no descriptor found" path already used for a fully-purged
+            # deletion (see below), rather than being treated as live.
             name_to_child: Dict[str, Tuple] = {}
+            deleted_child_names: List[str] = []
             for child in children_results:
-                name_to_child[child[0]] = child
+                if child[5] == 256:
+                    name_to_child[child[0]] = child
+                else:
+                    deleted_child_names.append(child[0])
 
             # Gather member extended record keys (attribute_id >= 0x6E) in
             # declaration order (Logix Designer may renumber them to be
@@ -2743,11 +2767,12 @@ class DataTypeBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
-            # Whatever's left in name_to_child is a member-collection child
-            # with NO matching extended-record descriptor -- a deleted UDT
-            # member. Deleting a member removes its type-level descriptor
-            # (data_type/dimension) but leaves the orphaned comps row behind
-            # -- verified against a real project (UDT "Lug", deleted member
+            # Whatever's left in name_to_child (after excluding record_type=512
+            # rows up front, see above) is a *live-marked* member-collection
+            # child with NO matching extended-record descriptor -- a deleted
+            # UDT member whose child row was never marked 512 at all, just
+            # left with no type-level descriptor (data_type/dimension) --
+            # verified against a real project (UDT "Lug", deleted member
             # "Z1_Nominal_Width", confirmed via an older Studio 5000 export
             # of the same UDT to have been DataType="INT"). This used to be
             # treated as needing a byte-offset correction for every
@@ -2756,15 +2781,41 @@ class DataTypeBuilder(L5xElementBuilder):
             # docstring) -- Rockwell's own stored member offsets already
             # account for this correctly with no adjustment needed.
             # `_dead_member_bytes` is kept purely as a diagnostic (logged
-            # below) that this type has an orphaned member; it is no longer
-            # used in any byte-offset or size computation.
+            # below) that this type has an orphaned/deleted member; it is no
+            # longer used in any byte-offset or size computation.
             if name_to_child:
                 log.warning(
                     f"DataType {name!r}: {len(name_to_child)} deleted member(s) "
                     f"with no type descriptor found ({sorted(name_to_child)}) -- "
                     "diagnostic only, no byte-offset correction is applied for this."
                 )
-            dead_member_bytes = len(name_to_child) * 2
+            if deleted_child_names:
+                log.warning(
+                    f"DataType {name!r}: {len(deleted_child_names)} member-collection "
+                    f"child row(s) marked deleted (record_type=512) filtered out "
+                    f"({sorted(deleted_child_names)}) -- a stale extended-record "
+                    "descriptor for one of these may still be present on the type's "
+                    "own comps row (Rockwell doesn't always purge it on deletion), "
+                    "but is now correctly ignored rather than resurrecting a phantom "
+                    "member."
+                )
+            dead_member_bytes = (len(name_to_child) + len(deleted_child_names)) * 2
+
+            # Cross-check against the type's own declared member_count
+            # (attribute 0x64) -- diagnostic only, not used to include/exclude
+            # anything, since its exact counting convention (does it include
+            # hidden BIT-backing members?) isn't independently verified yet.
+            # Still a useful free signal: it correctly read back as 1 for the
+            # real "Trimmer" case above while this function was about to
+            # return 16 members, which would have been an immediate, obvious
+            # red flag had this check existed already.
+            if member_count and len(children) != member_count:
+                log.warning(
+                    f"DataType {name!r}: declared member_count={member_count} but "
+                    f"{len(children)} member(s) were actually built -- possible "
+                    "remaining stale/phantom member data; investigate if this "
+                    "type's members look wrong."
+                )
 
         # --- Description ---
         description: Union[str, None] = None

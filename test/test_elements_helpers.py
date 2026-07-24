@@ -6,6 +6,7 @@ from xml.dom import minidom
 
 from acd.l5x.elements import (
     DataType,
+    DataTypeBuilder,
     Member,
     _apply_dead_member_byte_corrections,
     _decode_single_udt_element,
@@ -435,3 +436,116 @@ def test_l5k_string_padded_escapes_non_ascii_bytes():
 def test_l5k_string_padded_still_escapes_control_chars():
     result = _l5k_string_padded("\x00\x1b", capacity=2)
     assert result == "'$00$1B'"
+
+
+def _rx_generic_header(cip_type=999):
+    # 14-byte fixed header + 60-byte opaque main_record, enough for
+    # RxGeneric.from_bytes() to parse regardless of cip_type (main_record
+    # content is never consulted by DataTypeBuilder/MemberBuilder).
+    header = struct.pack("<IIHHH", 0, 0, 40, cip_type, 0)
+    main_record = b"\x00" * 60
+    return header + main_record
+
+
+def _member_ext_record_value(name: str, data_type_id: int, dimension: int = 0,
+                              byte_offset: int = 0, radix: int = 4) -> bytes:
+    # The "value" payload of a member's own extended record (attribute_id
+    # >= 0x6E on the owning DataType's comps row) -- decoded for its name by
+    # DataTypeBuilder._decode_member_name and for its type/dimension/offset
+    # etc. by MemberBuilder.build(), both via fixed byte offsets into this
+    # same blob. Must be at least 0x7C bytes for every offset MemberBuilder
+    # reads (up to 0x78) to stay in bounds.
+    blob = bytearray(0x7C)
+    encoded_name = name.encode("utf-16-le") + b"\x00\x00"
+    blob[0:len(encoded_name)] = encoded_name
+    struct.pack_into("<I", blob, 0x54, radix)
+    struct.pack_into("<I", blob, 0x58, data_type_id)
+    struct.pack_into("<I", blob, 0x5C, dimension)
+    struct.pack_into("<I", blob, 0x60, byte_offset)
+    struct.pack_into("<I", blob, 0x68, 0x800)
+    struct.pack_into("<I", blob, 0x6C, 0xFFFFFFFF)
+    return bytes(blob)
+
+
+def _child_record() -> bytes:
+    # A minimal member-collection child's own comps record -- just needs to
+    # parse via RxGeneric (member_ref at byte [14:18] left 0 so MemberBuilder
+    # skips the comment lookup entirely).
+    return _rx_generic_header() + struct.pack("<II", 0, 1)  # len_record, count_record=1 (0 parsed)
+
+
+def test_datatype_builder_excludes_deleted_member_with_stale_extended_record():
+    # Regression test for a real bug: deleting a UDT member marks its own
+    # member-collection child row's record_type 512 (the same live/deleted
+    # marker already used elsewhere for Program/Module/Tag/Routine phantom
+    # filtering), but does NOT necessarily remove that member's own
+    # extended-record descriptor from the *type's* own comps row. Before
+    # this fix, DataTypeBuilder matched a stale extended record's name
+    # against ANY child row regardless of record_type, silently resurrecting
+    # a deleted member as if it were live. Found via a real project (UDT
+    # "Trimmer", 15 scalar members consolidated into an array "Saw_Pos[32]"
+    # and re-saved): the type's own declared member_count correctly read
+    # back as 1, but 15 stale extended records for the deleted scalars were
+    # still present, each matching its own still-present (record_type=512)
+    # child row.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute(
+        "CREATE TABLE comments(parent int, member_ref int, record_string text)"
+    )
+    cur = db.cursor()
+
+    DINT_ID = 100
+    TYPE_ID = 200
+    MEMBER_COLLECTION_ID = 300
+    LIVE_CHILD_ID = 400
+    DELETED_CHILD_ID = 401
+
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (DINT_ID, 0, "DINT", 0, 256, b""),
+    )
+
+    foo_member = _member_ext_record_value("Foo", DINT_ID, dimension=0, byte_offset=0)
+    old_member = _member_ext_record_value("OldMember", DINT_ID, dimension=0, byte_offset=4)
+    extended_records = (
+        struct.pack("<II", 0x6C, 4) + struct.pack("<I", 0) +   # string_family = NoFamily
+        struct.pack("<II", 0x67, 4) + struct.pack("<I", 0) +   # built_in = 0
+        struct.pack("<II", 0x69, 4) + struct.pack("<I", 0) +   # module_defined = 0
+        struct.pack("<II", 0x64, 4) + struct.pack("<I", 1) +   # declared member_count = 1
+        struct.pack("<II", 0x6E, len(foo_member)) + foo_member +
+        struct.pack("<II", 0x6F, len(old_member)) + old_member
+    )
+    count_record = 7  # 6 parsed + 1 always left unparsed by RxGeneric._read()
+    type_record = (
+        _rx_generic_header() + struct.pack("<II", 0, count_record) + extended_records
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (TYPE_ID, 0, "TestType", 0, 256, type_record),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (MEMBER_COLLECTION_ID, TYPE_ID, "RxTypeMemberCollection", 0, 0, b""),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (LIVE_CHILD_ID, MEMBER_COLLECTION_ID, "Foo", 0, 256, _child_record()),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (DELETED_CHILD_ID, MEMBER_COLLECTION_ID, "OldMember", 1, 512, _child_record()),
+    )
+    db.commit()
+
+    dt = DataTypeBuilder(cur, TYPE_ID).build()
+
+    member_names = [m.name for m in dt.members]
+    assert member_names == ["Foo"], (
+        "deleted member 'OldMember' (record_type=512) must not be resurrected "
+        "just because a stale extended record still names it"
+    )
+    assert dt._dead_member_bytes == 2

@@ -4429,8 +4429,20 @@ class TaskBuilder(L5xElementBuilder):
 @dataclass
 class ControllerBuilder(L5xElementBuilder):
     def build(self) -> Controller:
+        # A real project can have OTHER root-level (parent_id=0) objects besides
+        # the controller itself -- e.g. "Recycling Bin"/"DataSet Data" administrative
+        # objects, seen in a real project, both with record_type=0 so they never
+        # collide with this query. But a real, freshly re-saved project turned up a
+        # second parent_id=0 row that DOES share the controller's own record_type
+        # (256): object_id=1, comp_name='' (empty), no children, its raw record all
+        # zero bytes except a handful of 0xFFFFFFFF sentinel values -- isolated
+        # scratch/reserved data, not a second controller (a real controller always
+        # has a real project name; Studio 5000 has no concept of an unnamed one).
+        # Filtering to a non-empty comp_name excludes this without needing to
+        # otherwise distinguish it structurally.
         self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE parent_id=0 AND record_type=256"
+            "SELECT comp_name, object_id, parent_id, record_type, record FROM comps "
+            "WHERE parent_id=0 AND record_type=256 AND comp_name != ''"
         )
         results = self._cur.fetchall()
         if len(results) != 1:

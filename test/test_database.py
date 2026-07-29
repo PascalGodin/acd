@@ -1,6 +1,7 @@
 import pytest
 
 from acd.database.dbextract import DbExtract
+from acd.l5x.elements import ControllerBuilder
 from acd.l5x.export_l5x import ExportL5x, _dedupe_comps_records
 from acd.zip.unzip import Unzip
 
@@ -178,3 +179,28 @@ def test_dedupe_comps_records_still_collapses_truncated_duplicate_under_same_par
     assert len(result) == 1
     kept = next(iter(result.values()))
     assert len(kept[5]) == 500
+
+
+def test_controller_builder_ignores_nameless_root_object():
+    # Regression test for a real bug: a project re-saved from Studio 5000
+    # turned up a second parent_id=0 row sharing the real controller's own
+    # record_type (256): object_id=1, comp_name="" (empty), no children, its
+    # raw record all zero bytes except a couple of 0xFFFFFFFF sentinel
+    # values -- isolated scratch/reserved data, not a second controller (a
+    # real controller always has a real project name). ControllerBuilder's
+    # "exactly one root controller node" query used to match both rows,
+    # raising "Does not contain exactly one root controller node" and
+    # making the whole project unloadable.
+    unzip = Unzip("../resources/CuteLogix.ACD").write_files("build")
+    exp = ExportL5x("../resources/CuteLogix.ACD", "build")
+    cur = exp._cur
+
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (999999999, 0, "", 0, 256, b"\x00" * 154),
+    )
+    exp._db.commit()
+
+    controller = ControllerBuilder(cur).build()
+
+    assert controller.name == "CuteLogix"

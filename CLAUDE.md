@@ -416,6 +416,32 @@ this manifesting as an actual bug has been found (the whole-project export for t
 completes and looks correct) — revisit only if a concrete case turns up, per this project's own
 "don't guess a fix without real data" rule.
 
+## A second root-level object can share the controller's own `record_type`
+
+Same project, next re-save from Studio 5000 (after further edits, same general "one real object
+plus one inert impostor at the same structural level" shape as the `object_id` collision above, but
+a different symptom): `ControllerBuilder.build()`'s very first query — "find the exactly-one
+`parent_id=0 AND record_type=256` row, that's the controller" — matched **two** rows instead of
+one, raising `Exception("Does not contain exactly one root controller node")` and making the whole
+project unloadable again.
+
+The second row: `object_id=1`, `comp_name=""` (empty), `record_type=256` (the same marker a real
+controller has), **no children**, and a 154-byte raw record that's all zero bytes except a couple
+of `0xFFFFFFFF` sentinel values at the tail — not tangled into the real project structure at all
+(nothing references it, it references nothing), just inert. The project already has other
+legitimate root-level (`parent_id=0`) administrative objects — "Recycling Bin", "DataSet Data" —
+but those have `record_type=0`, so they never collided with this query; `object_id=1` is the first
+one seen that happens to coincidentally share `record_type=256` too.
+
+Fixed by adding `AND comp_name != ''` to the query — a real controller always has a real project
+name (Studio 5000 has no concept of an unnamed one), so this excludes the empty-name impostor
+without needing any deeper structural distinction. Verified: the real project loads again (101
+DataTypes, 12 Programs, 3664 tags, full whole-project export with no errors). Covered by
+`test_controller_builder_ignores_nameless_root_object` (`test/test_database.py`) — reuses the real
+`CuteLogix.ACD` fixture's already-fully-populated comps table and injects one synthetic
+empty-name/`record_type=256`/`parent_id=0` row directly, rather than trying to construct an entire
+synthetic controller from scratch — confirmed this test fails without the fix.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*

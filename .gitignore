@@ -18,3 +18,7 @@ nul
 opencode.json
 out.L5X/
 resources/*/
+
+# Studio 5000 help docs (Rockwell copyrighted content, ~325MB) -- kept
+# locally for agents to consult, never committed. See CLAUDE.md.
+/Help/

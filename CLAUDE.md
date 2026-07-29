@@ -18,6 +18,17 @@ The `.ACD` file is a zip-like archive containing several proprietary binary data
 `SbRegion.Dat` (ladder rung text), `Comments.Dat` (tag/element descriptions and comments),
 `Nameless.Dat`, plus `QuickInfo.XML` / `TagInfo.XML` (some metadata is in ordinary XML).
 
+## Studio 5000 Help docs (local only, not in git)
+
+If a `Help/` directory exists at the repo root (`Help/ENU/rs5000/...`), it's the real Studio 5000
+help guide (Rockwell copyrighted content, ~325MB) — gitignored intentionally, never committed
+(licensing + repo-bloat concerns, not a mistake). Check it when a question is about Logix/PLC
+coding rules, instruction semantics, or L5X/UDT conventions themselves (as opposed to this
+library's own binary-parsing internals, which is what the rest of this file covers) — e.g.
+`Help/ENU/rs5000/common-content/comm-attributes/structured-text-syntax.html` for ST syntax rules,
+or the `common-content/comm-attributes/` directory generally for tag/data-type/addressing
+conventions. It won't be present in a fresh clone of this repo; don't assume it exists.
+
 ## Commands
 
 ```bash

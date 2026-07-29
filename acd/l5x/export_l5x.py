@@ -24,6 +24,38 @@ from acd.record.nameless import NamelessRecord
 from acd.record.sbregion import SbRegionRecord
 
 
+def _dedupe_comps_records(tuples: List[tuple]) -> Dict[tuple, tuple]:
+    """Deduplicate parsed Comps.Dat record tuples (object_id, parent_id,
+    comp_name, seq_number, record_type, record) by (object_id, parent_id),
+    not object_id alone.
+
+    object_id is usually unique, but a real, heavily-edited production
+    project turned up a genuine 3-way collision: one object_id shared by
+    the real "RxDataTypeCollection" (parent = the controller) and two
+    entirely unrelated objects with different parents
+    ("B_Manual_Solution", "ZZZ_TEMPORARY_IMPORT_DATATYPE_NAME_000" -- the
+    latter's name suggests a leftover artifact of some prior import/edit
+    operation). Deduping by bare object_id (the original logic, kept for
+    the scenario it was actually designed for: a routine appearing twice
+    in Comps.Dat with different record_type values, e.g. 271 vs 259, where
+    the smaller one is a truncated/partial parse of the SAME object under
+    the SAME parent) picked whichever of the three had the largest record
+    -- silently discarding the tiny (78-byte) RxDataTypeCollection in
+    favor of an unrelated, larger object, which then crashed
+    ControllerBuilder.build() with an IndexError (no data-type collection
+    found under the controller at all). Keying by (object_id, parent_id)
+    instead still correctly collapses the original truncated-vs-full
+    same-object case (same parent both times) while keeping genuinely
+    different objects that happen to share a raw object_id apart.
+    """
+    comps_by_id: Dict[tuple, tuple] = {}
+    for t in tuples:
+        key = (t[0], t[1])
+        if key not in comps_by_id or len(t[5]) > len(comps_by_id[key][5]):
+            comps_by_id[key] = t
+    return comps_by_id
+
+
 def _parse_records(dat_path: str, parse_one, label: str) -> List[tuple]:
     """Parse every record of a .Dat file, skipping records that fail.
 
@@ -135,24 +167,20 @@ class ExportL5x:
                 self._raw_files[record.filename] = acd_fh.read(record.file_length)
 
         log.info("Getting records from ACD Comps file and storing in sqllite database")
-        # Deduplicate by object_id. When duplicate object_ids exist (e.g. a routine that
-        # appears twice in Comps.Dat with different record_type values), keep the entry
-        # with the largest record because the smaller/later entry is typically a truncated
-        # or partial record (e.g. record_type=271 vs 259 for routines) that fails to parse
-        # correctly with RxGeneric. The full record is always the largest one.
-        comps_by_id = {}
-        for t in _parse_records(
-            os.path.join(self._temp_dir, "Comps.Dat"), CompsRecord.parse, "Comps"
-        ):
-            oid = t[0]
-            if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
-                comps_by_id[oid] = t
+        comps_by_id = _dedupe_comps_records(
+            _parse_records(
+                os.path.join(self._temp_dir, "Comps.Dat"), CompsRecord.parse, "Comps"
+            )
+        )
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
         self._db.commit()
 
         # Build name lookup for SbRegion tag reference resolution (object_id → comp_name).
         # Store on self for use during write-back (patch_sbregion_dat needs id_to_name).
-        name_lookup = {oid: t[2] for oid, t in comps_by_id.items()}
+        # A colliding object_id (see above) resolves to whichever of its entries was
+        # inserted last here -- an accepted, pre-existing ambiguity for the rare real
+        # case an object_id genuinely isn't unique, not something introduced by this fix.
+        name_lookup = {t[0]: t[2] for t in comps_by_id.values()}
         self._id_to_name: Dict[int, str] = name_lookup
 
         log.info(
@@ -163,7 +191,7 @@ class ExportL5x:
         log.info(
             "Getting records from ACD RegnLink file and storing in sqllite database"
         )
-        self.populate_regnlink(set(comps_by_id.keys()))
+        self.populate_regnlink({t[0] for t in comps_by_id.values()})
 
         log.info(
             "Getting records from ACD SbRegion file and storing in sqllite database"

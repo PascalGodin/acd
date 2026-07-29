@@ -1,7 +1,7 @@
 import pytest
 
 from acd.database.dbextract import DbExtract
-from acd.l5x.export_l5x import ExportL5x
+from acd.l5x.export_l5x import ExportL5x, _dedupe_comps_records
 from acd.zip.unzip import Unzip
 
 from loguru import logger as log
@@ -128,3 +128,53 @@ def test_parse_comments_dat():
 
 def test_parse_nameless_dat():
     db: DbExtract = DbExtract("build/Nameless.Dat")
+
+
+def _comps_tuple(object_id, parent_id, comp_name, record_len):
+    # (object_id, parent_id, comp_name, seq_number, record_type, record) --
+    # only object_id/parent_id/comp_name/record length matter for dedup.
+    return (object_id, parent_id, comp_name, 0, 256, b"\x00" * record_len)
+
+
+def test_dedupe_comps_records_keeps_unrelated_objects_sharing_an_object_id():
+    # Regression test for a real bug found via a real project that failed to
+    # load entirely (IndexError in ControllerBuilder.build()): a genuine
+    # object_id collision between three UNRELATED objects with different
+    # parents -- the real "RxDataTypeCollection" (small, 78 bytes) and two
+    # unrelated objects with much larger records. The old dedup (keyed by
+    # bare object_id, "keep the largest") silently discarded the small but
+    # correct RxDataTypeCollection in favor of an unrelated, larger object.
+    # Keying by (object_id, parent_id) instead must keep all three, since
+    # they have different parents.
+    same_oid = 3954991832
+    tuples = [
+        _comps_tuple(same_oid, 4240912631, "RxDataTypeCollection", 78),
+        _comps_tuple(same_oid, 4259926, "B_Manual_Solution", 7410),
+        _comps_tuple(same_oid, 5898330, "ZZZ_TEMPORARY_IMPORT_DATATYPE_NAME_000", 6874),
+    ]
+
+    result = _dedupe_comps_records(tuples)
+
+    assert len(result) == 3
+    names_by_parent = {t[1]: t[2] for t in result.values()}
+    assert names_by_parent[4240912631] == "RxDataTypeCollection"
+    assert names_by_parent[4259926] == "B_Manual_Solution"
+    assert names_by_parent[5898330] == "ZZZ_TEMPORARY_IMPORT_DATATYPE_NAME_000"
+
+
+def test_dedupe_comps_records_still_collapses_truncated_duplicate_under_same_parent():
+    # The original scenario this dedup logic was designed for: the SAME
+    # object appears twice under the SAME parent (e.g. a routine with two
+    # record_type variants, one a truncated/partial parse) -- must still
+    # collapse to a single entry, keeping the larger (fuller) record.
+    same_oid, same_parent = 111, 222
+    tuples = [
+        _comps_tuple(same_oid, same_parent, "SomeRoutine", 50),   # truncated
+        _comps_tuple(same_oid, same_parent, "SomeRoutine", 500),  # full
+    ]
+
+    result = _dedupe_comps_records(tuples)
+
+    assert len(result) == 1
+    kept = next(iter(result.values()))
+    assert len(kept[5]) == 500

@@ -362,6 +362,49 @@ live Studio 5000 project exactly. Covered by
 member's extended record + child row, plus a stale extended record whose only matching child is
 `record_type=512`) — confirmed this test fails without the fix, not just passes with it.
 
+## `object_id` is not always unique — a genuine 3-way collision crashed the whole load
+
+A different, real project (`BPM_TrimmerSorter_VAB_20260727.ACD`) failed to load entirely:
+`IndexError: list index out of range` in `ControllerBuilder.build()`, at the line resolving
+`RxDataTypeCollection` (the controller's own list of DataTypes) — `results` was empty, meaning no
+child named `RxDataTypeCollection` was found under the controller at all, even though the string
+provably exists (found via a raw grep of the decompressed `Comps.Dat` bytes) with a live (`fa fa`)
+marker.
+
+Root cause: `Comps.Dat` contained **three entirely unrelated objects sharing the exact same
+`object_id`** (a real, heavily-edited production project's Comps.Dat, not a corrupted file) — the
+genuine `RxDataTypeCollection` (parent = the controller, a tiny 78-byte record), and two unrelated
+objects with different parents (`B_Manual_Solution`, 7410 bytes; `ZZZ_TEMPORARY_IMPORT_DATATYPE_
+NAME_000`, 6874 bytes — the latter's name suggests a leftover artifact of some prior import/edit
+operation). `ExportL5x.__post_init__`'s Comps.Dat dedup step (comment at the time: "a routine that
+appears twice in Comps.Dat with different record_type values, keep the entry with the largest
+record" — a real, correct fix for *that* scenario, see "Whole-project element-count verification")
+keyed purely by `object_id`, picking whichever of the three colliding records was physically
+largest — silently discarding the tiny-but-correct `RxDataTypeCollection` in favor of an unrelated
+object, which then made the entire project unloadable.
+
+Fixed by extracting the dedup loop into `_dedupe_comps_records()` (`acd/l5x/export_l5x.py`) and
+keying it by **`(object_id, parent_id)`** instead of `object_id` alone — this still correctly
+collapses the *original* truncated-vs-full same-object case (same parent both times, different
+`record_type`) while keeping genuinely different objects that happen to share a raw `object_id`
+apart, since they have different parents. Verified: the real project now loads successfully (102
+DataTypes, 12 Programs, 3664 tags, full whole-project `to_xml()` export with no errors) and
+`Trimmer` still correctly resolves to `[Saw_Pos, DINT, dim=32]` (unaffected by this fix). Covered
+by `test_dedupe_comps_records_keeps_unrelated_objects_sharing_an_object_id` and
+`test_dedupe_comps_records_still_collapses_truncated_duplicate_under_same_parent`
+(`test/test_database.py`).
+
+**Residual, theoretical risk not chased further**: `object_id` genuinely isn't unique in this
+project's own `Comps.Dat`. Many other lookups throughout `elements.py` do `SELECT ... WHERE
+object_id=?` expecting exactly one row (via `fetchone()`/`results[0]`) — if some *other* reference
+elsewhere in the same project happens to point at a colliding `object_id` for a different purpose,
+that lookup could resolve to the wrong one of the colliding rows. This risk already existed before
+this fix (the "keep the largest" heuristic just silently resolved it one particular, wrong way);
+this fix only guarantees the *dedup* step no longer discards a real object outright. No evidence of
+this manifesting as an actual bug has been found (the whole-project export for this real project
+completes and looks correct) — revisit only if a concrete case turns up, per this project's own
+"don't guess a fix without real data" rule.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*

@@ -336,6 +336,39 @@ def test_decode_single_udt_element_still_truncates_beyond_max_depth():
     assert result == {"b": {"c": {"d": {"e": {}}}}}
 
 
+def test_get_type_size_rounds_up_to_multiple_of_4_not_merely_even():
+    # Regression test for a real, previously-undetected bug: _get_type_size()
+    # rounded a UDT's computed size up to the next EVEN byte count
+    # (`max_end + max_end % 2`), not a true multiple of 4, despite both the
+    # docstring and the commit that "fixed" this explicitly saying "multiple
+    # of 4" (confirmed by the user: "UDT can only have a multiple of 4 byte
+    # total size"). The bug went undetected because the one real-world case
+    # used to verify that fix (Encoder, 263 -> 264) is ambiguous: 264 is
+    # both the next even number AND the next multiple of 4 above 263, so it
+    # can't distinguish the two rounding rules. A real UDT ("FenceSkid",
+    # members summing to 13 bytes) exposed it: the old code returned 14
+    # (even, wrong) instead of 16 (multiple of 4, correct) -- and because
+    # this size was also used as an ARRAY element's stride
+    # (FenceGate.Skid[2], and by extension every element of a FenceGate[]
+    # array tag beyond index 0), the 2-byte shortfall corrupted every
+    # subsequent array element's decoded field values, confirmed via a real
+    # Studio 5000 "Tag Name Collision" dialog.
+    #
+    # 13 bytes is the distinguishing case this test locks in: even-rounding
+    # gives 14, multiple-of-4 gives 16 -- only the latter is correct.
+    dt = DataType(
+        "Odd13", "Odd13", "NoFamily", "User",
+        [
+            _member("a", "DINT", byte_offset=0),   # 0-3
+            _member("b", "DINT", byte_offset=4),   # 4-7
+            _member("c", "DINT", byte_offset=8),   # 8-11
+            _member("d", "SINT", byte_offset=12),  # 12 (1 byte) -> max_end=13
+        ],
+    )
+    data_types_map = {"ODD13": dt}
+    assert _get_type_size("ODD13", data_types_map) == 16
+
+
 def test_get_type_size_does_not_add_dead_member_bytes():
     # _get_type_size() must NOT add dt._dead_member_bytes -- an earlier
     # version of this function did, on the untested assumption that it

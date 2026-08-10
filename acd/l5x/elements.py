@@ -1057,12 +1057,34 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
     """Return the byte size of a DataType (primitive, STRING, or UDT).
 
     For UDTs, computes max(byte_offset + elem_size * max(dimension,1))
-    across non-hidden non-BIT members, then rounds up to the next EVEN byte
-    count -- Rockwell pads a UDT's own declared total size to a 2-byte
-    boundary (confirmed directly against Studio 5000's own "Data Type
-    Size" field, shown in a UDT's Properties dialog: a real UDT whose
-    members sum to 263 bytes is declared by Studio itself as 264). Returns
-    0 for unknown types.
+    across non-hidden non-BIT members, then rounds up to the next multiple
+    of 4 -- Rockwell always declares a UDT's total size this way (confirmed
+    directly against Studio 5000's own "Data Type Size" field, shown in a
+    UDT's Properties dialog, and directly stated by the user: "UDT can only
+    have a multiple of 4 byte total size"). Returns 0 for unknown types.
+
+    A real bug lived here for a while despite this being documented
+    correctly: the actual rounding was `max_end + (max_end % 2)` (round up
+    to even), not a true multiple-of-4 round-up -- a genuine typo-class
+    slip between the intent (and this very docstring/commit message) and
+    the code, undetected because the *test case cited when "fixing" this*
+    (Encoder, 263 -> 264) happens to round to the same result either way
+    (264 is both the next even number and the next multiple of 4 above
+    263), so it couldn't distinguish the two rules. Found via a real project
+    (`FenceSkid`, whose members sum to 13 bytes): the old code returned 14
+    (even, wrong) instead of 16 (multiple of 4, correct), silently making
+    every *array* of `FenceSkid`-sized structs (here, `FenceGate.Skid[2]`,
+    and therefore every element of the `FenceGate[]` tag array beyond
+    index 0) use a 2-byte-too-small stride -- confirmed via a real Studio
+    5000 "Tag Name Collision" dialog showing `FenceGate[1]`/`FenceGate[2]`
+    decoded with every field shifted by one position relative to the real
+    project's existing values. Lesson worth repeating from elsewhere in
+    this file: a fix verified against only one real-world example that
+    happens to be ambiguous between two candidate rules is not verified at
+    all -- the previous investigation's own 99-DataType whole-project sweep
+    (see CLAUDE.md) apparently never happened to include an ODD-remainder
+    struct whose size was also used as an ARRAY element's stride, which is
+    exactly the combination needed to expose this.
 
     Deliberately does NOT add dt._dead_member_bytes here -- an earlier
     version of this function did, on the (untested) assumption that a
@@ -1114,7 +1136,7 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
         max_end = max(max_end, member_end)
     if max_end == 0:
         return 0
-    return max_end + (max_end % 2)  # round up to the next even byte count
+    return -(-max_end // 4) * 4  # round up to the next multiple of 4
 
 
 def _tag_value_blob_offset(raw_rec: bytes) -> int:

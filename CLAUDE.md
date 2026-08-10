@@ -1472,6 +1472,27 @@ immediately following one). `Trim_Decision`/`Fence_Decision`'s `L5K` literal re-
 byte-for-byte identical to real Studio ground truth after this change. New regression test:
 `test_apply_dead_member_byte_corrections_bool_array_absorbs_shift_via_alignment`.
 
+**CORRECTION, found much later**: point 1 above was never actually fixed in code, despite this
+section's own text (and the commit message that introduced it) explicitly saying "multiple of 4."
+The real code was `return max_end + (max_end % 2)` — **round to even**, the exact narrower guess
+this section says was corrected. Nobody caught it because the one real-world case used to verify it
+(`Encoder`, 263 → 264) is ambiguous: 264 is both the next even number *and* the next multiple of 4
+above 263, so it can't distinguish the two rules — `Lug`/`LugWrk` were already multiples of 4 going
+in, so they couldn't distinguish it either. Surfaced by a real project (`FenceSkid`, members summing
+to 13 bytes, used as an array-of-struct's own element type via `FenceGate.Skid[2]`): even-rounding
+gave 14 instead of the correct 16, a 2-byte-too-small size that — because this function's return
+value doubles as an **array element's stride** wherever the same struct type is used as an array —
+silently shifted every field of `FenceGate[1]` and `FenceGate[2]` (every element beyond index 0) by
+one member position, confirmed via a real Studio 5000 "Tag Name Collision" dialog. Fixed for real
+this time: `return -(-max_end // 4) * 4`. New regression test that actually distinguishes the two
+rules (13 bytes → 16, not 14):
+`test_get_type_size_rounds_up_to_multiple_of_4_not_merely_even` — confirmed to fail under the old
+`% 2` code. The methodological lesson repeated a third time in this file now: a fix "verified"
+against a single real-world data point that happens to be ambiguous between the old and new
+behavior is not verified at all; the previous 99-`DataType`/369-array whole-project sweeps
+apparently never happened to include a struct whose size had a non-multiple-of-4 remainder *and*
+was also used as an array element type, which is the exact combination needed to expose this.
+
 **RESOLVED (was "still open" above) — the whole "some tags need +2" mystery, definitively.** The
 `0x1A2`/`0x1A2 + 2` split described throughout this section and "Initial-value decoding offset
 bugs" below was **never actually about scalar-vs-array, or about which UDT type is involved** —

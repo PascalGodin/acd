@@ -213,19 +213,20 @@ def test_controller_builder_ignores_nameless_root_object():
     assert controller.name == "CuteLogix"
 
 
-def _pre38_entry(parent_id, unknown, seq_no, object_id) -> bytes:
+def _region_map_entry(parent_id, unknown, seq_no, object_id) -> bytes:
+    # Same 16-byte field order on BOTH sides of the V38 boundary -- only the
+    # header size (and therefore the entries' starting offset) differs. See
+    # _iter_region_map_entries_v38's own docstring for how a first attempt
+    # at this got the header offset wrong by exactly one field and wrongly
+    # concluded the field order itself had changed.
     return struct.pack("<IIII", parent_id, unknown, seq_no, object_id)
-
-
-def _v38_entry(object_id, parent_id, unknown, seq_no) -> bytes:
-    return struct.pack("<IIII", object_id, parent_id, unknown, seq_no)
 
 
 def test_iter_region_map_entries_v_pre38_reads_dense_16_byte_entries():
     header = b"\x00" * 78
     entries = [
-        _pre38_entry(parent_id=111, unknown=0, seq_no=0xFFFFFFFF, object_id=1001),
-        _pre38_entry(parent_id=111, unknown=1, seq_no=0xFFFFFFFF, object_id=1002),
+        _region_map_entry(parent_id=111, unknown=0, seq_no=0xFFFFFFFF, object_id=1001),
+        _region_map_entry(parent_id=111, unknown=1, seq_no=0xFFFFFFFF, object_id=1002),
     ]
     record = header + b"".join(entries)
 
@@ -237,20 +238,25 @@ def test_iter_region_map_entries_v_pre38_reads_dense_16_byte_entries():
     ]
 
 
-def test_iter_region_map_entries_v38_reads_dense_16_byte_entries_from_offset_3():
+def test_iter_region_map_entries_v38_reads_dense_16_byte_entries_from_offset_7():
     # Regression test for a real Studio 5000 V38.02 project (schema revision
     # 1.0): the "Region Map" comps record no longer has a trustworthy
     # region_length field at the old pre-V38 header offset, and its entries
-    # -- same 16-byte (object_id, parent_id, unknown, seq_no) tuple, fields
-    # reordered -- start right after a 3-byte header instead of the old
-    # 78-byte one. Reverse-engineered by byte-searching a known routine's
-    # own object_id through a real project's raw record; see CLAUDE.md
-    # "Region Map format change".
-    header = b"\x00\x01\x00"  # 3 bytes
+    # -- same 16-byte (parent_id, unknown, seq_no, object_id) tuple, SAME
+    # field order as the pre-V38 layout -- start right after a 7-byte header
+    # instead of the old 78-byte one. Reverse-engineered by resolving real
+    # ground-truth rung TEXT (from a Studio 5000 L5X export) to real
+    # object_ids via the independently-decoded SbRegion.Dat `rungs` table,
+    # then confirming those specific object_ids land in the LAST field of
+    # the entry at this offset -- not, as a first (wrong) attempt at this
+    # concluded, the FIRST field 4 bytes earlier (which is actually the
+    # PRECEDING entry's own object_id -- still a real rung id, just for the
+    # wrong routine). See CLAUDE.md "Region Map format change".
+    header = b"\x00" * 7
     entries = [
-        _v38_entry(object_id=2001, parent_id=222, unknown=0, seq_no=0xFFFFFFFF),
-        _v38_entry(object_id=2002, parent_id=222, unknown=1, seq_no=0xFFFFFFFF),
-        _v38_entry(object_id=2003, parent_id=222, unknown=2, seq_no=0xFFFFFFFF),
+        _region_map_entry(parent_id=222, unknown=0, seq_no=0xFFFFFFFF, object_id=2001),
+        _region_map_entry(parent_id=222, unknown=1, seq_no=0xFFFFFFFF, object_id=2002),
+        _region_map_entry(parent_id=222, unknown=2, seq_no=0xFFFFFFFF, object_id=2003),
     ]
     record = header + b"".join(entries)
 
@@ -274,10 +280,10 @@ def test_populate_region_map_falls_back_to_v38_layout_when_header_length_is_stal
     exp = ExportL5x("../resources/CuteLogix.ACD", "build")
     cur = exp._cur
 
-    header = b"\x00\x01\x00"
+    header = b"\x00" * 7
     entries = [
-        _v38_entry(object_id=3001, parent_id=444, unknown=0, seq_no=0xFFFFFFFF),
-        _v38_entry(object_id=3002, parent_id=444, unknown=1, seq_no=0xFFFFFFFF),
+        _region_map_entry(parent_id=444, unknown=0, seq_no=0xFFFFFFFF, object_id=3001),
+        _region_map_entry(parent_id=444, unknown=1, seq_no=0xFFFFFFFF, object_id=3002),
     ]
     # populate_region_map() bails out early on any record shorter than the
     # old 78-byte header, so pad well past that -- the padding lands after

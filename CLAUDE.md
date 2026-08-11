@@ -483,39 +483,91 @@ Confirmed by cross-referencing a specific routine's own `object_id` (`R07_Lift_S
 `comps`) against the raw `"Region Map"` record bytes directly (byte-search for the object_id as a
 raw `<I` LE value): it appears at 16 scattered offsets, none reachable by the old 78-byte-header
 scan, but all 16-byte-aligned to the *same* residue (`offset % 16` constant across every hit) —
-i.e. still a dense, gapless array of the same 4-field 16-byte entry shape, just relocated and
-reordered:
-- **Layout is unchanged in substance**: still one 16-byte tuple of
-  `(object_id, parent_id, unknown, seq_no)` per rung — just reordered within the entry (object_id
-  first, not last) and using a **3-byte header** instead of the old 78-byte one, with entries
-  running to the **exact end of the record** — there is no length field to trust in this layout
-  at all (the byte range where the old one lived means something else now, or nothing).
-- Cross-checked against real rung `object_id`s independently parsed from `SbRegion.Dat`: parsing
-  the whole record this way found **5338 of 5340** real rungs (the remainder plausibly stale/dead
-  entries, consistent with this codebase's other findings about undeleted dead records), and the
-  test routine's own 16 entries came back with a clean, contiguous `unknown` field of `0..15` —
-  exactly the per-routine rung-sequence role that field has always played.
-- Verified the *old* 78-byte-header layout's own invariant holds exactly (`78 + region_length ==
-  len(record)`, zero-byte slack) on every committed test fixture and every previously-verified
-  real project — giving a safe, non-guessy way to detect which layout applies to a given file
-  with no version sniffing needed: if the old header's declared length doesn't exactly account
-  for the whole record, the old layout's assumptions are wrong for this file, full stop.
+i.e. still a dense, gapless array of the same 4-field 16-byte entry shape, just relocated.
+
+**FIRST FIX WAS WRONG — shipped, then caught by the same downstream agent on the very next
+message.** The first attempt (committed, then reverted in the same investigation) started entries
+at absolute offset 3 and read fields in order `(object_id, parent_id, unknown, seq_no)` —
+concluding the field order itself had changed, not just the header size. This looked
+well-verified at the time: searching for `R07_Lift_Skids`'s own `object_id` in the parent-id slot
+found it every time, the `unknown`/seq field came back as a clean contiguous `0..15` run per
+routine, and 5338 of 5340 real rung `object_id`s cross-validated against `SbRegion.Dat` — a
+thorough-looking check that was nonetheless **entirely insufficient**, because it only asked "is
+this object_id a real rung anywhere in the project?", never "is it the *correct* rung for *this*
+routine?". The very next real-world use (opening the same project, reading `R07_Lift_Skids` and
+`Continuous/LS_Read`, both routines the user had personally authored and knew precisely) showed
+completely unrelated rung content attached to both — syntactically valid ladder logic (so it
+passed the "is this a real rung" check), just for the wrong routine entirely, on every single
+routine in the project.
+
+**Root cause of the first fix's error, found by resolving real ground-truth rung TEXT (not just
+object_id existence) to real `object_id`s**: the user supplied a whole-project Studio 5000 L5X
+export of this exact save. For a handful of routines with unambiguous rung text (unique substring
+match against the independently-decoded `rungs` table), the real `object_id` for e.g.
+`R07_Lift_Skids` rung 0 (`MOVE(Lift_Skids.pntrTpStrt,...)`) was found to sit in the search hit's
+**own** 4th field (`hit_offset + 12`), not in the *preceding* 16-byte slot's first field
+(`hit_offset - 4`, what the first fix read). In other words: **the field order never changed at
+all** — it's the exact same `(parent_id, unknown, seq_no, object_id)` order as every pre-V38
+project — the first fix's entry-start offset was simply 4 bytes (one field) too early. Reading 4
+bytes early means the "object_id" field silently comes from the END of the PRECEDING entry —
+still a real, valid rung `object_id` (hence passing the naive existence check), just belonging to
+whichever routine happens to own the entry immediately before this one in the table. This is why
+*every* routine came back non-empty and structurally plausible, and *every* routine's content was
+wrong: the true entry boundary is offset **7**, not 3 (`hit_offset - 4` vs the correct
+`hit_offset`, since the parent_id field the search matched IS the entry's own first field, not its
+second).
+
+- **Layout is byte-for-byte identical in substance to every pre-V38 project**: the same 16-byte
+  tuple `(parent_id, unknown, seq_no, object_id)`, same field order — the *only* thing that
+  changed for V38.02 is the header size (7 bytes instead of 78) and the fact that there is no
+  length field to bound the array at all; entries just run to the exact end of the record.
+- Re-verified against the user's whole-project L5X ground truth, this time checking actual rung
+  TEXT content (not just `object_id` existence) for every RLL routine in the project: **147 of 149
+  routines matched byte-for-byte** (full rung sequence, in order). The 2 remaining mismatches are
+  each missing exactly **one** rung — confirmed (by locating that rung's real `object_id` via its
+  ground-truth text in the independently-decoded `rungs` table, then querying `region_map` for
+  that `object_id` directly) to be a genuinely **absent** Region Map entry, not a parsing error:
+  the rung's text decodes fine and exists in `SbRegion.Dat`, it simply has no corresponding
+  `region_map` row anywhere in the table for either routine. Consistent with the ~1% orphaned-entry
+  rate seen project-wide (50 of 5388 total slots didn't validate against any real rung) and with
+  this codebase's many other findings about undeleted/stale index entries — not something more
+  parsing cleverness can recover, the data just isn't there. **If a rung count matters for a
+  routine you're about to edit, cross-check it against Studio 5000 directly rather than trusting
+  this library's count as exhaustive** — silent 1-rung gaps like this are rare but real.
 
 Fixed by splitting entry extraction into two pure generator functions,
 `_iter_region_map_entries_v_pre38()` (old behavior, byte-for-byte unchanged) and
-`_iter_region_map_entries_v38()` (new layout: offset-3 header, dense to EOF, reordered fields),
-with `populate_region_map()` picking one via the `78 + region_length == len(record)` check above
-and logging a `log.warning()` on the fallback path so a *third*, still-different future layout
-would be visible rather than silently misparsed the same way this one was. Verified end-to-end
-against the real V38.02 project: `R07_Lift_Skids` now returns 16 real rungs (matching real ladder
-logic text), 3884 total RLL rungs recovered project-wide (only one routine — plausibly genuinely
-empty — still shows zero), and rung comments still resolve via the unrelated `RegnLink.Idx`
-mechanism untouched by this fix. Full existing test suite (all pre-V38 fixtures, which exercise
-only the old layout) passes unchanged. Covered by
-`test_iter_region_map_entries_v_pre38_reads_dense_16_byte_entries`,
-`test_iter_region_map_entries_v38_reads_dense_16_byte_entries_from_offset_3`, and
+`_iter_region_map_entries_v38()` (new layout: 7-byte header, dense to EOF, **same field order** as
+pre-V38), with `populate_region_map()` picking one via the `78 + region_length == len(record)`
+check above and logging a `log.warning()` on the fallback path so a *third*, still-different
+future layout would be visible rather than silently misparsed the same way this one was. Full
+existing test suite (all pre-V38 fixtures, which exercise only the old layout) passes unchanged.
+Covered by `test_iter_region_map_entries_v_pre38_reads_dense_16_byte_entries`,
+`test_iter_region_map_entries_v38_reads_dense_16_byte_entries_from_offset_7`, and
 `test_populate_region_map_falls_back_to_v38_layout_when_header_length_is_stale`
 (`test/test_database.py`) — synthetic records, since no V38.02 fixture is checked into this repo.
+
+**The methodological lesson, stated plainly since it cost a full extra round-trip here**: a check
+that only confirms "this looks like a real object of the right general kind" (any valid rung
+`object_id`, a clean contiguous sequence field) is not evidence of *correct attribution* — it will
+pass just as easily on data that's shifted by exactly one record. The only check that actually
+catches an off-by-one-record bug is comparing real, specific, known TEXT CONTENT against ground
+truth for multiple routines, not structural/statistical plausibility. This is the same lesson
+already stated elsewhere in this file after other investigations; it applied again here just as
+forcefully.
+
+**Bonus finding from the same ground-truth sweep, unrelated to Region Map**: 15 of the 16
+mismatches found *before* the offset-7 fix (all with matching rung *counts*, only content
+differing) turned out to be a separate, pre-existing bug — `GSV(Module, ...)` instructions
+resolving to `__Map:VAB_SERVER_Bridge`/`__Map:FencePositioner1`/etc. instead of the real
+`VAB_SERVER_Bridge`/`FencePositioner1`. A `"__Map:"`-prefixed comps object is a distinct internal
+shadow entry for some devices/modules (confirmed: different `object_id`, different parent, from
+the real Module object of the same base name) that some raw `@HEX@` references in `SbRegion.Dat`
+point at instead of the real object — real Studio 5000 never emits the `"__Map:"` prefix itself.
+Fixed by stripping it once, at the single shared source (`name_lookup` construction in
+`ExportL5x.__post_init__`) used by both rung-text resolution (`SbRegionRecord.parse`) and
+tag-reference write-back (`_restore_tag_refs`), so both stay consistent. Verified: 0 of the 15
+previously-affected routines show any remaining difference.
 
 **Not chased further**: whether V36/V37 also use this new layout, or introduce a third one, is
 unknown — only V35-and-earlier (old layout, many real projects) and this one real V38.02 project

@@ -102,21 +102,39 @@ def _iter_region_map_entries_v_pre38(record: bytes, start: int, end: int):
 
 def _iter_region_map_entries_v38(record: bytes):
     """Region Map entry layout found on a real Studio 5000 V38.02 (schema
-    revision 1.0) project: the same 16-byte (object_id, parent_id, unknown,
-    seq_no) tuple as the pre-V38 layout, just reordered within the entry and
-    relocated to start right after a 3-byte header (rather than the old
-    78-byte one) -- with no length field anywhere to bound it, entries simply
-    run to the exact end of the record. See CLAUDE.md "Region Map format
-    change" for how this was reverse-engineered (byte-searched a known
-    routine's own object_id through the raw record, found it landing on 16
-    scattered-but-16-byte-aligned offsets that decoded cleanly into this
-    shape, cross-checked object_id fields against real rung object_ids from
-    SbRegion.Dat: 5338/5340 matched)."""
-    start = 3
+    revision 1.0) project: the EXACT SAME 16-byte (parent_id, unknown,
+    seq_no, object_id) tuple, same field order, as the pre-V38 layout --
+    just relocated to start right after a 7-byte header (rather than the
+    old 78-byte one), with no length field anywhere to bound it, so entries
+    simply run to the exact end of the record.
+
+    A first attempt at this (see git history / CLAUDE.md "Region Map format
+    change") got the header offset wrong by exactly one field (4 bytes: used
+    3, not 7) AND wrongly concluded the field order had changed. Both
+    mistakes were self-consistent with each other in a way that passed a
+    shallow validation check (searching for a known routine's own object_id
+    correctly located it in the parent_id slot every time; the seq/"unknown"
+    field even came back as a clean, contiguous 0..15 run), which is what let
+    a genuinely wrong fix look right: reading 4 bytes early means the
+    "object_id" field silently comes from the END of the PRECEDING 16-byte
+    entry, not the start of the current one -- still a real, valid rung
+    object_id (so it passes an "is this a real rung?" check), just the
+    wrong routine's rung. Every routine's rungs came back populated, in the
+    right relative order, and completely misattributed to the wrong
+    routines. Caught only by checking actual rung TEXT content against a
+    real Studio 5000 whole-project L5X export (ground truth) for specific,
+    known routines -- a structurally-valid-looking result is not the same
+    as a correct one; see the "don't trust a 'looks plausible' fix" lesson
+    repeated elsewhere in CLAUDE.md. Re-verified this time by resolving
+    ground-truth rung TEXT (not just object_id existence) to real object_ids
+    via the independently-decoded `rungs` table, then confirming those
+    specific object_ids land in the *current* entry's last field, not the
+    preceding entry's."""
+    start = 7
     offset = start
     end = len(record)
     while offset <= (end - 16):
-        object_id, parent_id, unknown, seq_no = struct.unpack_from("<IIII", record, offset)
+        parent_id, unknown, seq_no, object_id = struct.unpack_from("<IIII", record, offset)
         yield (object_id, parent_id, unknown, seq_no, record[offset : offset + 16])
         offset += 16
 
@@ -213,7 +231,23 @@ class ExportL5x:
         # A colliding object_id (see above) resolves to whichever of its entries was
         # inserted last here -- an accepted, pre-existing ambiguity for the rare real
         # case an object_id genuinely isn't unique, not something introduced by this fix.
-        name_lookup = {t[0]: t[2] for t in comps_by_id.values()}
+        #
+        # A "__Map:" prefix (e.g. "__Map:VAB_SERVER_Bridge") marks an internal shadow
+        # comps object distinct from the real Module/device object of the same base
+        # name (confirmed: two different object_ids, different parents) -- some raw
+        # @HEX@ tag references in SbRegion.Dat point at the shadow object rather than
+        # the real one (seen on every GSV(Module, ...) instruction sampled), but real
+        # Studio 5000 never emits the "__Map:" prefix itself in rendered ladder text.
+        # Stripping it here, at the single shared source for both rung-text resolution
+        # (SbRegionRecord.parse) and tag-ref write-back (_restore_tag_refs), keeps both
+        # consistent. Found via a real V38.02 project's whole-project L5X ground truth:
+        # GSV(Module,__Map:FencePositioner1,...) where real Studio shows
+        # GSV(Module,FencePositioner1,...) -- verified against every one of 15 affected
+        # routines project-wide, zero remaining differences after stripping.
+        name_lookup = {
+            t[0]: (t[2][len("__Map:") :] if t[2].startswith("__Map:") else t[2])
+            for t in comps_by_id.values()
+        }
         self._id_to_name: Dict[int, str] = name_lookup
 
         log.info(

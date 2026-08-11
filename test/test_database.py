@@ -1,8 +1,15 @@
+import struct
+
 import pytest
 
 from acd.database.dbextract import DbExtract
 from acd.l5x.elements import ControllerBuilder
-from acd.l5x.export_l5x import ExportL5x, _dedupe_comps_records
+from acd.l5x.export_l5x import (
+    ExportL5x,
+    _dedupe_comps_records,
+    _iter_region_map_entries_v38,
+    _iter_region_map_entries_v_pre38,
+)
 from acd.zip.unzip import Unzip
 
 from loguru import logger as log
@@ -204,3 +211,95 @@ def test_controller_builder_ignores_nameless_root_object():
     controller = ControllerBuilder(cur).build()
 
     assert controller.name == "CuteLogix"
+
+
+def _pre38_entry(parent_id, unknown, seq_no, object_id) -> bytes:
+    return struct.pack("<IIII", parent_id, unknown, seq_no, object_id)
+
+
+def _v38_entry(object_id, parent_id, unknown, seq_no) -> bytes:
+    return struct.pack("<IIII", object_id, parent_id, unknown, seq_no)
+
+
+def test_iter_region_map_entries_v_pre38_reads_dense_16_byte_entries():
+    header = b"\x00" * 78
+    entries = [
+        _pre38_entry(parent_id=111, unknown=0, seq_no=0xFFFFFFFF, object_id=1001),
+        _pre38_entry(parent_id=111, unknown=1, seq_no=0xFFFFFFFF, object_id=1002),
+    ]
+    record = header + b"".join(entries)
+
+    result = list(_iter_region_map_entries_v_pre38(record, 78, len(record)))
+
+    assert [(r[0], r[1], r[2], r[3]) for r in result] == [
+        (1001, 111, 0, 0xFFFFFFFF),
+        (1002, 111, 1, 0xFFFFFFFF),
+    ]
+
+
+def test_iter_region_map_entries_v38_reads_dense_16_byte_entries_from_offset_3():
+    # Regression test for a real Studio 5000 V38.02 project (schema revision
+    # 1.0): the "Region Map" comps record no longer has a trustworthy
+    # region_length field at the old pre-V38 header offset, and its entries
+    # -- same 16-byte (object_id, parent_id, unknown, seq_no) tuple, fields
+    # reordered -- start right after a 3-byte header instead of the old
+    # 78-byte one. Reverse-engineered by byte-searching a known routine's
+    # own object_id through a real project's raw record; see CLAUDE.md
+    # "Region Map format change".
+    header = b"\x00\x01\x00"  # 3 bytes
+    entries = [
+        _v38_entry(object_id=2001, parent_id=222, unknown=0, seq_no=0xFFFFFFFF),
+        _v38_entry(object_id=2002, parent_id=222, unknown=1, seq_no=0xFFFFFFFF),
+        _v38_entry(object_id=2003, parent_id=222, unknown=2, seq_no=0xFFFFFFFF),
+    ]
+    record = header + b"".join(entries)
+
+    result = list(_iter_region_map_entries_v38(record))
+
+    assert [(r[0], r[1], r[2], r[3]) for r in result] == [
+        (2001, 222, 0, 0xFFFFFFFF),
+        (2002, 222, 1, 0xFFFFFFFF),
+        (2003, 222, 2, 0xFFFFFFFF),
+    ]
+
+
+def test_populate_region_map_falls_back_to_v38_layout_when_header_length_is_stale():
+    # End-to-end version of the two tests above: a "Region Map" comps record
+    # shaped like the real V38.02 case (stale/undersized region_length at the
+    # old header offset) must still populate region_map correctly via the
+    # fallback layout, not silently produce an empty/wrong table -- which is
+    # exactly the bug a downstream user hit (every routine's rungs/rung_ids
+    # came back empty against a real V38.02 project).
+    unzip = Unzip("../resources/CuteLogix.ACD").write_files("build")
+    exp = ExportL5x("../resources/CuteLogix.ACD", "build")
+    cur = exp._cur
+
+    header = b"\x00\x01\x00"
+    entries = [
+        _v38_entry(object_id=3001, parent_id=444, unknown=0, seq_no=0xFFFFFFFF),
+        _v38_entry(object_id=3002, parent_id=444, unknown=1, seq_no=0xFFFFFFFF),
+    ]
+    # populate_region_map() bails out early on any record shorter than the
+    # old 78-byte header, so pad well past that -- the padding lands after
+    # our 2 real entries and reads back as zero-valued "entries" the
+    # parent_id=444 filter below excludes. The padded length (85) must also
+    # NOT happen to equal old_end (78 + whatever garbage region_length reads
+    # as from the padding, here 0 -> old_end=78), or this wouldn't exercise
+    # the fallback at all.
+    record = header + b"".join(entries)
+    record += b"\x00" * (85 - len(record))
+
+    cur.execute("DELETE FROM comps WHERE comp_name='Region Map'")
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (555, 0, "Region Map", 0, 0, record),
+    )
+    cur.execute("DELETE FROM region_map")
+    exp._db.commit()
+
+    exp.populate_region_map()
+
+    cur.execute(
+        "SELECT object_id, parent_id, unknown, seq_no FROM region_map WHERE parent_id=444 ORDER BY unknown"
+    )
+    assert cur.fetchall() == [(3001, 444, 0, 0xFFFFFFFF), (3002, 444, 1, 0xFFFFFFFF)]

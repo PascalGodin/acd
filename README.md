@@ -10,7 +10,10 @@ The Rockwell `.ACD` file is an archive that contains all the files used by RSLog
 
 This library parses those binary databases and exposes the project contents — controller tags, programs, ladder rungs, data types (UDTs), add-on instructions (AOIs), and hardware modules — as Python objects. It can also serialise the parsed project to an **L5X XML file** that Studio 5000 can import.
 
-> **Compatibility** — Tested against Studio 5000 firmware versions 20–35. Python 3.8+ is supported; Python 3.12+ is recommended.
+> **Compatibility** — Tested against Studio 5000 firmware versions 20–35, plus V38.02 (schema
+> revision 1.0) for rung/routine parsing specifically (see `CLAUDE.md` "Region Map format
+> change (V38.02)" for what's version-gated there). Python 3.8+ is supported; Python 3.12+ is
+> recommended.
 
 > **For AI agents using this library** — if a task requires writing more than a few lines of
 > boilerplate to get at something small (e.g. manually walking `controller.programs`/`.routines`

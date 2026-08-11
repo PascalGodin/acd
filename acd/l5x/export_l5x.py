@@ -88,6 +88,39 @@ def _parse_records(dat_path: str, parse_one, label: str) -> List[tuple]:
     return out
 
 
+def _iter_region_map_entries_v_pre38(record: bytes, start: int, end: int):
+    """Region Map entry layout for every project seen before Studio 5000 V38:
+    16-byte tuples of (parent_id, unknown, seq_no, object_id), densely packed
+    from `start` to `end` (both computed by the caller from the record's own
+    78-byte header)."""
+    offset = start
+    while offset <= (end - 16):
+        parent_id, unknown, seq_no, object_id = struct.unpack_from("<IIII", record, offset)
+        yield (object_id, parent_id, unknown, seq_no, record[offset : offset + 16])
+        offset += 16
+
+
+def _iter_region_map_entries_v38(record: bytes):
+    """Region Map entry layout found on a real Studio 5000 V38.02 (schema
+    revision 1.0) project: the same 16-byte (object_id, parent_id, unknown,
+    seq_no) tuple as the pre-V38 layout, just reordered within the entry and
+    relocated to start right after a 3-byte header (rather than the old
+    78-byte one) -- with no length field anywhere to bound it, entries simply
+    run to the exact end of the record. See CLAUDE.md "Region Map format
+    change" for how this was reverse-engineered (byte-searched a known
+    routine's own object_id through the raw record, found it landing on 16
+    scattered-but-16-byte-aligned offsets that decoded cleanly into this
+    shape, cross-checked object_id fields against real rung object_ids from
+    SbRegion.Dat: 5338/5340 matched)."""
+    start = 3
+    offset = start
+    end = len(record)
+    while offset <= (end - 16):
+        object_id, parent_id, unknown, seq_no = struct.unpack_from("<IIII", record, offset)
+        yield (object_id, parent_id, unknown, seq_no, record[offset : offset + 16])
+        offset += 16
+
+
 @dataclass
 class ExportL5x:
     input_filename: os.PathLike
@@ -328,35 +361,44 @@ class ExportL5x:
         # dropped 16-byte entry sat exactly at the true end of the buffer,
         # one entry beyond what "- 4" allowed the read loop to reach).
         record_length_absolute = identifier_offset + region_length
-        c = 0
-        while identifier_offset <= (record_length_absolute - 16):
-            parent_id_identifier = struct.unpack(
-                "I", record[identifier_offset : identifier_offset + 4]
-            )[0]
 
-            unknown_identifier = struct.unpack(
-                "I", record[identifier_offset + 4 : identifier_offset + 8]
-            )[0]
-
-            seq_identifier = struct.unpack(
-                "I", record[identifier_offset + 8 : identifier_offset + 12]
-            )[0]
-
-            c += 1
-            object_id_identifier = struct.unpack(
-                "I", record[identifier_offset + 12 : identifier_offset + 16]
-            )[0]
-
-            query: str = "INSERT INTO region_map VALUES (?, ?, ?, ?, ?)"
-            enty: tuple = (
-                object_id_identifier,
-                parent_id_identifier,
-                unknown_identifier,
-                seq_identifier,
-                record[identifier_offset : identifier_offset + 16],
+        # Schema-version check: on every local fixture and every real project
+        # checked before Studio 5000 V38, `78 + region_length` lands EXACTLY
+        # on len(record) -- the 78-byte header + region_length'd entry table
+        # consumes the whole record with nothing left over. A real V38.02
+        # project (schema revision 1.0) broke this: region_length read back
+        # as a small, non-multiple-of-16 value miles short of the record's
+        # real size (e.g. 8985 vs an 86151-byte true payload), causing this
+        # loop to silently stop after ~10% of the table -- and worse, every
+        # entry it DID emit was itself misaligned garbage (this file's real
+        # entries live on a different 16-byte grid than offset 78 sits on),
+        # so not one routine's rungs/rung_ids ever resolved (see CLAUDE.md
+        # "Region Map format change" for the full investigation). Detected
+        # by reverse-searching a real routine's own object_id through the
+        # raw record: entries in the new layout are still a dense, gapless
+        # array of the same 16-byte (object_id, parent_id, unknown, seq_no)
+        # tuples (just reordered within the entry, and the field at the old
+        # "region_length" offset no longer means anything) -- they simply
+        # start at a fixed, tiny 3-byte header instead of the old 78-byte
+        # one, and run to the exact end of the record with no length field
+        # to trust at all.
+        if record_length_absolute == len(record):
+            entries = _iter_region_map_entries_v_pre38(record, identifier_offset, record_length_absolute)
+        else:
+            log.warning(
+                "Region Map: header-declared length (78 + "
+                f"{region_length}={record_length_absolute}) doesn't match the "
+                f"record's real size ({len(record)}) -- falling back to the "
+                "V38+ dense-array layout (see CLAUDE.md 'Region Map format "
+                "change')"
             )
-            self._cur.execute(query, enty)
-            identifier_offset += 16
+            entries = _iter_region_map_entries_v38(record)
+
+        for object_id_identifier, parent_id_identifier, unknown_identifier, seq_identifier, blob in entries:
+            self._cur.execute(
+                "INSERT INTO region_map VALUES (?, ?, ?, ?, ?)",
+                (object_id_identifier, parent_id_identifier, unknown_identifier, seq_identifier, blob),
+            )
 
         self._db.commit()
 

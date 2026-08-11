@@ -458,6 +458,70 @@ buffer), and a single task that still can't decode is skipped with a warning rat
 existing test suite (which only exercises files that already parse cleanly) is unaffected by
 design — this only changes behavior on records/files that previously would have raised.
 
+## Region Map format change (V38.02) — every routine's rungs/rung_ids came back empty
+
+A downstream agent reported a total regression on a real project (`BPM_TrimmerSorter_VAB_...ACD`,
+re-saved from Studio 5000 multiple times in one session): **every single routine, in every
+program, returned `rungs == []` and `_rung_ids == []`** — not one routine anywhere had any rung
+data — while everything else (tags, UDTs, modules) parsed normally. The same file had parsed
+correctly earlier in that same session, against an earlier save; the only thing that changed was
+a re-save, and `project.software_revision` on the failing file reads `38.02` (schema revision
+1.0) — outside this library's previously-tested V20–35 range (see "Compatibility" in README.md).
+
+Root cause, confirmed directly against the raw bytes: `populate_region_map()` (`export_l5x.py`)
+locates the routine → rung mapping in a single per-project `"Region Map"` comps record, via a
+hardcoded 78-byte header followed by a `region_length`-bounded dense array of 16-byte
+`(parent_id, unknown, seq_no, object_id)` entries. On the V38.02 file, `region_length` (read from
+its old fixed offset) came back as `8985` — not even a multiple of 16 — against a real payload of
+`86151` bytes; `78 + region_length` (`9063`) landed nowhere near the record's real size
+(`86229`). The old loop dutifully parsed 561 entries from this now-meaningless byte range anyway
+(no exception, no warning — it's valid-looking binary, just misaligned garbage), and **none of
+them matched any real routine/rung `object_id`** — hence a `region_map` table that looked
+populated (`561` rows) but joined against precisely zero rungs for precisely every routine.
+
+Confirmed by cross-referencing a specific routine's own `object_id` (`R07_Lift_Skids`, found via
+`comps`) against the raw `"Region Map"` record bytes directly (byte-search for the object_id as a
+raw `<I` LE value): it appears at 16 scattered offsets, none reachable by the old 78-byte-header
+scan, but all 16-byte-aligned to the *same* residue (`offset % 16` constant across every hit) —
+i.e. still a dense, gapless array of the same 4-field 16-byte entry shape, just relocated and
+reordered:
+- **Layout is unchanged in substance**: still one 16-byte tuple of
+  `(object_id, parent_id, unknown, seq_no)` per rung — just reordered within the entry (object_id
+  first, not last) and using a **3-byte header** instead of the old 78-byte one, with entries
+  running to the **exact end of the record** — there is no length field to trust in this layout
+  at all (the byte range where the old one lived means something else now, or nothing).
+- Cross-checked against real rung `object_id`s independently parsed from `SbRegion.Dat`: parsing
+  the whole record this way found **5338 of 5340** real rungs (the remainder plausibly stale/dead
+  entries, consistent with this codebase's other findings about undeleted dead records), and the
+  test routine's own 16 entries came back with a clean, contiguous `unknown` field of `0..15` —
+  exactly the per-routine rung-sequence role that field has always played.
+- Verified the *old* 78-byte-header layout's own invariant holds exactly (`78 + region_length ==
+  len(record)`, zero-byte slack) on every committed test fixture and every previously-verified
+  real project — giving a safe, non-guessy way to detect which layout applies to a given file
+  with no version sniffing needed: if the old header's declared length doesn't exactly account
+  for the whole record, the old layout's assumptions are wrong for this file, full stop.
+
+Fixed by splitting entry extraction into two pure generator functions,
+`_iter_region_map_entries_v_pre38()` (old behavior, byte-for-byte unchanged) and
+`_iter_region_map_entries_v38()` (new layout: offset-3 header, dense to EOF, reordered fields),
+with `populate_region_map()` picking one via the `78 + region_length == len(record)` check above
+and logging a `log.warning()` on the fallback path so a *third*, still-different future layout
+would be visible rather than silently misparsed the same way this one was. Verified end-to-end
+against the real V38.02 project: `R07_Lift_Skids` now returns 16 real rungs (matching real ladder
+logic text), 3884 total RLL rungs recovered project-wide (only one routine — plausibly genuinely
+empty — still shows zero), and rung comments still resolve via the unrelated `RegnLink.Idx`
+mechanism untouched by this fix. Full existing test suite (all pre-V38 fixtures, which exercise
+only the old layout) passes unchanged. Covered by
+`test_iter_region_map_entries_v_pre38_reads_dense_16_byte_entries`,
+`test_iter_region_map_entries_v38_reads_dense_16_byte_entries_from_offset_3`, and
+`test_populate_region_map_falls_back_to_v38_layout_when_header_length_is_stale`
+(`test/test_database.py`) — synthetic records, since no V38.02 fixture is checked into this repo.
+
+**Not chased further**: whether V36/V37 also use this new layout, or introduce a third one, is
+unknown — only V35-and-earlier (old layout, many real projects) and this one real V38.02 project
+(new layout) have actually been observed. If a future file trips neither invariant cleanly, that's
+new territory, not a bug in this fallback.
+
 ## Native-import escape hatches for write-back (routine L5X is the one active mechanism)
 
 Because `FileInfo.Dat` is enforced on open (see "ACD write-back"), the sanctioned way to get an

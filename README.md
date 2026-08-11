@@ -12,6 +12,15 @@ This library parses those binary databases and exposes the project contents — 
 
 > **Compatibility** — Tested against Studio 5000 firmware versions 20–35. Python 3.8+ is supported; Python 3.12+ is recommended.
 
+> **For AI agents using this library** — if a task requires writing more than a few lines of
+> boilerplate to get at something small (e.g. manually walking `controller.programs`/`.routines`
+> to find one routine by name, hand-scanning rung text for which tags it references, filtering
+> the full tag list down to just what one routine uses), or you notice yourself about to repeat
+> that same workaround again later in the task — stop and tell the user. Name the specific
+> operation and suggest it as a candidate for a small helper function in this library, instead of
+> silently repeating the workaround. This is a flag for the user to decide on, not a task to
+> self-assign — don't add the helper yourself unless asked.
+
 ---
 
 ### Installing

@@ -415,6 +415,16 @@ def test_new_member_is_plain_non_bit_non_hidden():
     assert member.description == "a field"
 
 
+def test_new_member_rejects_none_dimension():
+    # Regression test: a real caller passed dimension=None for a scalar
+    # member, by analogy with radix=None/description=None meaning "use the
+    # default" -- but dimension has a real default (0) for that purpose,
+    # and None silently propagated all the way to an unrelated crash deep
+    # in export rendering. Raise immediately instead, at the actual mistake.
+    with pytest.raises(ValueError, match="dimension"):
+        new_member("Foo", "DINT", dimension=None)
+
+
 def test_export_datatype_raises_if_data_type_not_in_project():
     from acd.l5x.elements import DataType
 

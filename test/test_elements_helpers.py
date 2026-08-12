@@ -349,6 +349,16 @@ def test_zero_value_for_member_array():
     assert _zero_value_for_member(_member("Specie", "DINT", dimension=3), {}) == [0, 0, 0]
 
 
+def test_zero_value_for_member_handles_none_dimension():
+    # Regression test for a real crash report: `member.dimension > 0`
+    # assumed dimension is always an int, but a Member constructed with an
+    # explicit dimension=None (e.g. a caller mistaking new_member()'s
+    # dimension param for one of its OTHER params, where None means "use
+    # the default") raised `TypeError: '>' not supported between instances
+    # of 'NoneType' and 'int'`. None must be treated the same as 0 (scalar).
+    assert _zero_value_for_member(_member("Weird", "DINT", dimension=None), {}) == 0
+
+
 def test_zero_value_for_member_nested_struct():
     inner_dt = DataType("Inner", "Inner", "NoFamily", "User", [_member("Val", "DINT")])
     data_types_map = {"INNER": inner_dt}

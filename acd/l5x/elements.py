@@ -202,11 +202,25 @@ def new_member(name: str, data_type: str, dimension: int = 0,
     members actually read back from a real ACD record, not one authored
     fresh in Python.
 
+    `dimension` must be an `int` (0 for a scalar member, matching every
+    ACD-decoded Member) -- unlike `radix`/`description`, `None` is NOT a
+    valid "use the default" sentinel here, even though it's an easy mistake
+    to make by analogy with this function's other two params. A real caller
+    made exactly this mistake (`dimension=None` for a scalar member) and it
+    silently propagated all the way into an unrelated crash deep inside
+    export rendering, well after this function returned -- raising here
+    instead catches it immediately, at the actual point of the mistake.
+
     Byte offset is never included -- Member._byte_offset is a decode-only
     detail, never emitted in XML (Studio 5000 recomputes a UDT's real
     physical member layout itself on import), so a newly-authored member
     needs no offset of its own.
     """
+    if dimension is None:
+        raise ValueError(
+            "new_member(): dimension must be an int (0 for a scalar member), not None -- "
+            "unlike radix/description, None is not a valid 'use the default' value here."
+        )
     if radix is None:
         radix = _PRIMITIVE_RADIX.get(data_type.upper(), "NullType")
     return Member(
@@ -551,7 +565,17 @@ def _zero_value_for_member(member: "Member", data_types_map: Dict[str, "DataType
             if m.data_type != "BIT"  # BIT-overlay pseudo-members have no storage of their own
         }
 
-    if member.dimension > 0:
+    # `member.dimension` is documented/typed as `int` (0 = scalar), and every
+    # ACD-decoded Member (MemberBuilder.build()) always sets a real int here --
+    # but a Member constructed directly (or via new_member()) with an
+    # explicit `dimension=None`, mistakenly treating it like new_member()'s
+    # OTHER params (radix/description) where None means "use the default",
+    # crashes `> 0` with a real TypeError. Treat None the same as 0 (scalar)
+    # rather than assume it can't happen -- found via a real crash report one
+    # level removed from this function's own first real-world use (recursing
+    # into a newly-authored struct type's own members, one of which had this
+    # exact mistake).
+    if member.dimension and member.dimension > 0:
         return [_scalar_zero() for _ in range(member.dimension)]
     return _scalar_zero()
 

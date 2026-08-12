@@ -1147,12 +1147,30 @@ Covered by `test_l5k_udt_literal_zero_fills_scalar_member_missing_from_decoded_v
 `test_l5k_udt_literal_zero_fills_struct_member_missing_from_decoded_value` (the real reported shape:
 the new member was itself a struct type), `test_udt_scalar_to_xml_zero_fills_member_missing_from_decoded_value`,
 and three direct `_zero_value_for_member()` unit tests (scalar/array/nested-struct) —
-`test/test_elements_helpers.py`. Not yet re-verified against a real Studio import of the exact
-originally-failing case (the user's own `Bin`/`Criteria_Qty`/`To_VABView_Bins` project) — the fix is
-verified structurally (declared member count now always matches rendered value count) and by direct
-code-path tracing back to the downstream agent's own root-cause finding, not yet by a second live
-Studio import. If you have Studio access and this exact scenario handy, that's the next thing to
-confirm.
+`test/test_elements_helpers.py`.
+
+**Follow-up crash found on the very next retry, before the fix above could even be re-exercised**:
+`TypeError: '>' not supported between instances of 'NoneType' and 'int'` at `_zero_value_for_member`'s
+own `if member.dimension > 0:` — not `Criteria_Qty` itself (array-typed, fine), but some other member
+reached while zero-filling (most plausibly a scalar member of the newly-created `Bin_Criteria_Qty`
+type, constructed with a `Member.dimension` of `None` rather than `0`). Root cause: `Member.dimension`
+is documented/typed as `int` (0 = scalar) and every ACD-decoded `Member` (`MemberBuilder.build()`)
+always sets a real int here via `struct.unpack_from` — but `new_member()`'s own signature
+(`dimension: int = 0, radix=None, description=None`) makes `None` look like a valid "use the
+default" sentinel by analogy with its other two params, when it silently isn't; a value only this
+function itself was ever exercised against directly (`_zero_value_for_member` is new code, the first
+real-world path to actually *read* `member.dimension` on a member the user authored with a mistake
+that far upstream). Fixed in two places, not just the crash site: `member.dimension and
+member.dimension > 0` (treats `None` the same as `0`, i.e. scalar) in `_zero_value_for_member`
+itself, AND `new_member()` now raises `ValueError` immediately if called with an explicit
+`dimension=None`, catching the actual mistake at its source rather than letting a bad value silently
+propagate until some unrelated, far-later crash — the same "fail fast" preference already applied
+elsewhere in this file. Covered by `test_zero_value_for_member_handles_none_dimension`
+(`test/test_elements_helpers.py`) and `test_new_member_rejects_none_dimension` (`test/test_api.py`).
+
+Still not yet re-verified against a real Studio import of the exact originally-failing case (the
+user's own `Bin`/`Criteria_Qty`/`To_VABView_Bins` project) — structurally verified and unit-tested
+twice over now, not yet confirmed by an actual third live-Studio retry.
 
 ## Routine-level Description (leading XML comment newline pitfall)
 

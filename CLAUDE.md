@@ -649,6 +649,31 @@ the rung is still lost to this library the same as before — `RegnLink.Dat` is 
 a guarantee. If a rung count still looks short after this fix, that's the remaining possibility
 worth knowing about, not a sign this fix is incomplete.
 
+## Lookup/editing convenience API — `insert_rung()` verified end-to-end in real Studio 5000
+
+Added `get_routine()`, `tag_exists()`, `find_tag_references()`, `replace_rung_safe()`, and
+`Routine.insert_rung()`/`.delete_rung()` (`acd/api.py`, `acd/l5x/elements.py`) based on concrete
+feedback from a downstream agent's session building 8+ new routines/tags against a live project —
+four hand-rolled patterns (nested program→routine lookup, manual `_rung_comments` index shifting
+on insert/delete, an unguarded rung overwrite, a repeated substring scan for existing tag/member
+usage) kept recurring and had already caused two real index-arithmetic mistakes in one session.
+`insert_rung()`/`delete_rung()` never touch `_rung_ids` positions beyond inserting/removing a
+`None` placeholder to keep it the same length as `.rungs` — confirmed safe because `Routine.to_xml()`
+(what `export_routine()` actually renders) only ever reads `.rungs`/`._rung_comments`, never
+`_rung_ids` (that field exists solely for `patch_rungs()`, which can only edit an *existing* rung
+by its real object_id, never insert a new one).
+
+**Confirmed working end-to-end**: `insert_rung(5, new_text, comment=...)` on a real routine
+(`MainProgram/MainRoutine`, `Rung_Comments_Test_Project.ACD`) — with a comment pre-attached to the
+original rung 8, specifically to verify the comment-shifting arithmetic — exported via
+`export_routine()`, imported into real Studio 5000 via native Import Routine with zero errors, the
+result saved back to a new ACD by the user, then read back through this library's own `load_acd()`.
+The read-back matched the pre-import prediction exactly: 12 rungs, the new rung at index 5 with its
+own comment, the pre-existing comment now correctly on index 9 (shifted from 8), every other rung's
+text and position otherwise untouched. One routine, one insertion point — not exercised yet: a
+delete, multiple inserts in the same call, or inserting into a routine with `RegnLink.Dat`/rung-ID
+peculiarities of its own.
+
 ## Native-import escape hatches for write-back (routine L5X is the one active mechanism)
 
 Because `FileInfo.Dat` is enforced on open (see "ACD write-back"), the sanctioned way to get an

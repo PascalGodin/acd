@@ -2508,6 +2508,15 @@ class Controller(L5xElement):
     # skips it in the base to_xml()); it is used only to build the <RedundancyInfo> element.
     _redundancy_enabled: bool = field(default=False)
     _description: Union[str, None] = field(default=None)
+    # The SAME dict object every Tag's own _data_types_map references (case-insensitive
+    # name -> DataType, User + ProductDefined) -- exposed here so a caller that appends a
+    # newly-authored DataType to `.data_types` (the documented way to register a new UDT,
+    # see export_datatype()) has a reliable way to also register it here, keeping every
+    # already-built Tag's rendering in sync. See CLAUDE.md "Mutating a UDT with live tag
+    # instances" for why this needed to exist: appending to `.data_types` alone does NOT
+    # update this map (it's a different collection), so a tag whose value-rendering needs
+    # to resolve the new type silently got a wrong-shaped fallback instead of a real error.
+    _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()
@@ -5175,6 +5184,7 @@ class ControllerBuilder(L5xElementBuilder):
             aois,
             redundancy_enabled,
             controller_description,
+            data_types_map,
         )
 
 

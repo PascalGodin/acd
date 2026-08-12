@@ -22,8 +22,9 @@ from acd.api import (
     load_acd,
     replace_rung_safe,
     tag_exists,
+    _sync_data_types_map,
 )
-from acd.l5x.elements import new_member
+from acd.l5x.elements import DataType, Tag, new_member
 
 
 def test_import_from_file():
@@ -423,6 +424,44 @@ def test_new_member_rejects_none_dimension():
     # in export rendering. Raise immediately instead, at the actual mistake.
     with pytest.raises(ValueError, match="dimension"):
         new_member("Foo", "DINT", dimension=None)
+
+
+def test_sync_data_types_map_propagates_new_type_to_existing_tags():
+    # Regression test for a real report: appending a new DataType to
+    # project.controller.data_types (the documented way to register a new
+    # UDT) never updated the SEPARATE, already-captured _data_types_map
+    # every existing Tag's own rendering uses (Tag._data_types_map is a
+    # snapshot reference assigned once at load_acd() time) -- so a tag
+    # whose value needed to resolve that new type silently fell through to
+    # _zero_value_for_member's "unknown type" fallback (a wrong-shaped bare
+    # scalar 0) instead of the correct nested structure, with no error at
+    # all. Traced to a real case: adding a new struct-typed member to an
+    # existing UDT with live tag instances, then exporting a routine
+    # referencing one of those instances in the same session.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+
+    outer_dt = DataType("Outer", "Outer", "NoFamily", "User", [new_member("M", "DINT")])
+    project.controller.data_types.append(outer_dt)
+    project.controller._data_types_map["OUTER"] = outer_dt
+
+    tag = Tag("MyTag", "MyTag", "Base", "Outer", None, "Read/Write", None, None)
+    tag._data_types_map = project.controller._data_types_map  # same shared object TagBuilder assigns
+    tag._initial_value = {"M": 5}  # decoded before "Inner"/"NewStruct" existed
+
+    # Mutate Outer AFTER the tag's value was "decoded" -- register a new
+    # struct type and add a member of it, exactly matching export_datatype()'s
+    # own documented pattern: append to .data_types, then dt.members.insert(...).
+    inner_dt = DataType("Inner", "Inner", "NoFamily", "User", [new_member("X", "DINT", dimension=2)])
+    project.controller.data_types.append(inner_dt)
+    outer_dt.members.append(new_member("NewStruct", "Inner"))
+
+    _sync_data_types_map(project)
+
+    xml = tag.to_xml()
+    assert '<StructureMember Name="NewStruct" DataType="Inner">' in xml
+    assert '<ArrayMember Name="X" DataType="DINT" Dimensions="2"' in xml
+    # The pre-existing member must still render correctly, unaffected.
+    assert '<DataValueMember Name="M" DataType="DINT" Radix="Decimal" Value="5"/>' in xml
 
 
 def test_export_datatype_raises_if_data_type_not_in_project():

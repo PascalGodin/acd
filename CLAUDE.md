@@ -1172,6 +1172,59 @@ Still not yet re-verified against a real Studio import of the exact originally-f
 user's own `Bin`/`Criteria_Qty`/`To_VABView_Bins` project) — structurally verified and unit-tested
 twice over now, not yet confirmed by an actual third live-Studio retry.
 
+**Third bug found on the SAME retry, once the `None`-dimension crash above was fixed on the caller's
+own side (their script's mistake, not a library bug — see above) and the export finally completed
+without error**: the new struct-typed member rendered, but as a bare `Value="0"` scalar instead of a
+real nested structure — silently wrong, not a crash, which the reporting agent correctly flagged as
+worse (nothing signals anything is broken; Studio wouldn't reject this file, it would just import a
+broken value). Root cause, traced precisely by the reporting agent before handing it off:
+`Tag._data_types_map` (a case-insensitive name → `DataType` map used by `Tag.to_xml()`/
+`_udt_scalar_to_xml`/`_l5k_udt_literal`) is assigned once per tag, by reference, during the whole
+`load_acd()` build (`ControllerBuilder.build()`/`ProgramBuilder.build()`) — but every already-built
+`Tag` was found to share the literal SAME dict object (Python assigns dict references, not copies,
+and the same `data_types_map` local variable is threaded through the whole builder call chain
+unchanged). Appending a new `DataType` to `project.controller.data_types` (the documented, correct
+way to register a new UDT — see `export_datatype()` above) updates a completely different
+collection; nothing ever adds the new type to that shared map. `_zero_value_for_member()` (added in
+the first fix above) then looks up the new struct type, gets `None` back from the stale map, and
+silently takes its own "unknown type — a harmless scalar zero beats crashing" fallback — a fallback
+whose own premise doesn't hold for a type that's real but simply missing from a stale map, not
+genuinely unknown.
+
+Fixed by exposing that same shared dict as `Controller._data_types_map` (`ControllerBuilder.build()`
+now passes the same `data_types_map` object it already threads through every builder into the
+`Controller` constructor too — zero behavior change, just a new reference to the same object) and
+adding `_sync_data_types_map(project)` (`acd/api.py`), which registers any `project.controller.data_types`
+entry missing from that shared map (`setdefault`, so it only ever adds — never overwrites an existing
+entry, which already reflects any in-place member mutation correctly since it's the same object
+either way). Both `export_routine()` and `export_datatype()` call this once, right after their own
+initial validation, before any rendering — so a caller following the already-documented "just append
+to `.data_types`" pattern needs no workflow change at all; the sync happens transparently. Because
+every tag shares the ONE dict object, updating it through this ONE reference (`project.controller.
+_data_types_map`) is instantly visible to every tag everywhere — no need to walk the whole project's
+tags.
+
+Verified directly: constructing a tag whose `_initial_value` was decoded against a 1-member type,
+then appending a new struct-typed member (registering the struct type via `.data_types.append()`
+only, exactly the documented pattern) and calling `Tag.to_xml()` WITHOUT the fix reproduces the
+reported shape exactly (`<DataValueMember Name="NewStruct" DataType="Inner" Radix="Decimal"
+Value="0"/>` — a bare scalar); calling `_sync_data_types_map()` first produces the correct
+`<StructureMember Name="NewStruct" DataType="Inner">` with its real nested `<ArrayMember>` content.
+Covered by `test_sync_data_types_map_propagates_new_type_to_existing_tags` (`test/test_api.py`),
+which asserts both the new member's correct shape AND that the pre-existing member still renders
+unaffected. No local fixture has a UDT-typed tag instance to exercise this end-to-end through
+`export_routine()` itself, so this is verified at the `Tag.to_xml()`/`_sync_data_types_map()` level
+directly, constructing the exact before/after scenario by hand rather than through a real ACD file.
+
+**Three real bugs found in one investigation, each only surfacing once the previous one was fixed
+and the retry got one step further** — first the crash-free-but-wrong "Data type mismatch" Studio
+rejection, then a `None`-dimension crash in the first fix's own new code (a caller mistake, but one
+the library's own `new_member()` signature invited), then this silent wrong-value bug one step
+further still. Worth remembering next time a "fix" for a reported UDT/tag-value bug looks complete
+after one retry: a retry that gets further than the last one is progress, not proof the whole chain
+is now clean — this one needed three real rounds before actually converging, this project's
+"structurally verified ≠ actually correct" lesson applying yet again.
+
 ## Routine-level Description (leading XML comment newline pitfall)
 
 The leading `<!--description-->` XML comment `export_routine()` emits (see item 7 above) must

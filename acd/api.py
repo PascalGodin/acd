@@ -770,6 +770,35 @@ def _referenced_called_routines(rung_texts, program) -> list:
     return list(found.values())
 
 
+def _sync_data_types_map(project: RSLogix5000Content) -> None:
+    """Register any DataType appended to `project.controller.data_types`
+    (the documented way to create/register a new UDT -- see
+    `export_datatype()`) into the shared name -> DataType map every
+    already-built `Tag`'s own `_data_types_map` references.
+
+    Without this, a tag whose value-rendering needs to resolve a type
+    created *after* `load_acd()` returned silently gets a wrong-shaped
+    fallback (`_zero_value_for_member()`'s "unknown type" branch: a bare
+    scalar `0` instead of the real nested structure) instead of a real
+    error -- found via a real report: appending a new struct-typed UDT
+    member to an existing type with live tag instances, then exporting a
+    routine referencing one of those instances in the same session. See
+    CLAUDE.md "Mutating a UDT with live tag instances" for the full story.
+
+    Every `Tag._data_types_map` is the SAME dict object, assigned by
+    reference throughout the whole `load_acd()` build -- also exposed as
+    `project.controller._data_types_map` for exactly this purpose, so
+    mutating it through that one shared reference updates every tag's view
+    at once; no need to walk every tag in the project. `export_routine()`
+    and `export_datatype()` both call this before rendering, so callers
+    following the documented "just append to `.data_types`" pattern don't
+    need to do anything extra themselves.
+    """
+    shared_map = project.controller._data_types_map
+    for dt in project.controller.data_types:
+        shared_map.setdefault(dt.name.upper(), dt)
+
+
 def _resolve_type_closure(initial_type_names: set, project: RSLogix5000Content):
     """Recursively resolve a set of DataType/AOI names to every DataType and
     AOI they transitively depend on, so a partial export is self-consistent
@@ -940,6 +969,8 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
             "routine not found in any program of this project -- pass the "
             "same Routine object obtained from project.controller.programs[i].routines[j]"
         )
+
+    _sync_data_types_map(project)
 
     controller_name = project.controller.name
     export_date = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
@@ -1187,6 +1218,8 @@ def export_datatype(project: RSLogix5000Content, data_type: DataType, output_pat
             "it there first (for a brand-new UDT) or pass the same DataType "
             "object obtained from project.controller.data_types"
         )
+
+    _sync_data_types_map(project)
 
     controller_name = project.controller.name
     export_date = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")

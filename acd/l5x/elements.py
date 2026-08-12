@@ -3781,6 +3781,53 @@ class RoutineBuilder(L5xElementBuilder):
         rung_ids = [row[0] for row in rows]
         rungs = [row[1] for row in rows]
 
+        # Recover any rung whose Region Map entry has gone missing entirely (a
+        # real, observed data-loss case on a real V38.02 project -- NOT a
+        # parsing gap: the rung's own text decodes fine from SbRegion.Dat, and
+        # RegnLink.Dat still carries an intact, correctly-typed
+        # (routine, own_rung, next_rung) link record for it, even though
+        # Region Map's own entry for that exact rung is simply gone). Verified
+        # against two real cases: a rung unchanged since an earlier save (its
+        # RegnLink.Dat record predates the save that dropped its Region Map
+        # entry) and a rung created after that earlier save (whose Region Map
+        # entry seemingly never got written at all) -- both fully recovered,
+        # including correct position, from RegnLink.Dat alone. See CLAUDE.md
+        # "Region Map entries can go missing independently of the format".
+        self._cur.execute(
+            "SELECT own_rung, next_rung FROM regnlink_chain WHERE routine_id=" + str(self._object_id)
+        )
+        chain_by_own: Dict[int, int] = {}
+        next_to_own: Dict[int, int] = {}
+        for own_rung, next_rung in self._cur.fetchall():
+            chain_by_own[own_rung] = next_rung
+            next_to_own[next_rung] = own_rung
+        known_ids = set(rung_ids)
+        missing = [oid for oid in chain_by_own if oid not in known_ids]
+        recovered = []
+        for oid in missing:
+            self._cur.execute("SELECT rung FROM rungs WHERE object_id=?", (oid,))
+            row = self._cur.fetchone()
+            if row is None or row[0] is None:
+                continue  # text itself is gone too -- nothing recoverable
+            text = row[0]
+            next_rung = chain_by_own.get(oid)
+            pred_rung = next_to_own.get(oid)
+            if next_rung in known_ids:
+                idx = rung_ids.index(next_rung)
+            elif pred_rung in known_ids:
+                idx = rung_ids.index(pred_rung) + 1
+            else:
+                idx = len(rung_ids)  # no chain neighbor recovered either -- append
+            rung_ids.insert(idx, oid)
+            rungs.insert(idx, text)
+            known_ids.add(oid)
+            recovered.append(oid)
+        if recovered:
+            log.warning(
+                f"Routine {self._object_id}: recovered {len(recovered)} rung(s) missing from "
+                f"Region Map via RegnLink.Dat's own routine/rung link records: {recovered}"
+            )
+
         # Resolve &hexid: placeholders (object ID references) to comp names.
         # The ACD binary stores tag references as &XXXXXXXX: where XXXXXXXX is the
         # object_id in hex. Batch-resolve all unique IDs to avoid per-rung queries.

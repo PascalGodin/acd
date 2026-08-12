@@ -201,6 +201,10 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE regnlink_idx(routine_id int, fragment int, rung_object_id int)"
         )
+        log.debug("Create Regnlink_chain table in sqllite db")
+        self._cur.execute(
+            "CREATE TABLE regnlink_chain(routine_id int, own_rung int, next_rung int)"
+        )
 
         log.info("Extracting ACD database file")
         unzip = Unzip(self.input_filename)
@@ -508,21 +512,40 @@ class ExportL5x:
             data = f.read()
 
         rows: List[tuple] = []
+        chain_rows: List[tuple] = []
         limit = len(data) - 22
         i = 0
         while i <= limit:
             owner_id = struct.unpack_from("<I", data, i)[0]
             if owner_id in known_object_ids:
-                next_id, typ = struct.unpack_from("<II", data, i + 8)
+                own_id, next_id, typ = struct.unpack_from("<III", data, i + 4)
                 if typ != 0xFFFF0000:
                     fragment = struct.unpack_from("<H", data, i + 18)[0]
                     rows.append((owner_id, fragment, next_id))
+                    # own_id/next_id (a routine-scoped rung linked list, see the
+                    # docstring above) is a SEPARATE, independent source of
+                    # routine<->rung ownership from Region Map -- used as a
+                    # fallback in RoutineBuilder.build() for a rung whose Region
+                    # Map entry has gone missing (a real, observed data-loss case,
+                    # not a parsing gap -- see CLAUDE.md "Region Map entries can
+                    # go missing independently of the format").
+                    chain_rows.append((owner_id, own_id, next_id))
             i += 1
 
         if rows:
             self._cur.executemany("INSERT INTO regnlink VALUES (?,?,?)", rows)
             self._cur.execute(
                 "CREATE INDEX idx_regnlink_routine_fragment ON regnlink(routine_id, fragment)"
+            )
+            self._db.commit()
+
+        if chain_rows:
+            self._cur.executemany("INSERT INTO regnlink_chain VALUES (?,?,?)", chain_rows)
+            self._cur.execute(
+                "CREATE INDEX idx_regnlink_chain_routine ON regnlink_chain(routine_id)"
+            )
+            self._cur.execute(
+                "CREATE INDEX idx_regnlink_chain_own ON regnlink_chain(own_rung)"
             )
             self._db.commit()
 

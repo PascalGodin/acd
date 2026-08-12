@@ -3,7 +3,7 @@ import struct
 import pytest
 
 from acd.database.dbextract import DbExtract
-from acd.l5x.elements import ControllerBuilder
+from acd.l5x.elements import ControllerBuilder, RoutineBuilder
 from acd.l5x.export_l5x import (
     ExportL5x,
     _dedupe_comps_records,
@@ -309,3 +309,85 @@ def test_populate_region_map_falls_back_to_v38_layout_when_header_length_is_stal
         "SELECT object_id, parent_id, unknown, seq_no FROM region_map WHERE parent_id=444 ORDER BY unknown"
     )
     assert cur.fetchall() == [(3001, 444, 0, 0xFFFFFFFF), (3002, 444, 1, 0xFFFFFFFF)]
+
+
+def test_routine_builder_recovers_rung_missing_from_region_map_via_regnlink_chain():
+    # Regression test for a real, observed data-loss case (not a parsing gap):
+    # two real rungs on a real V38.02 project had their Region Map entry go
+    # missing entirely between two saves of the same project, even though the
+    # rung's own text still decodes fine from SbRegion.Dat -- while
+    # RegnLink.Dat still carried an intact, correctly-typed (routine, own_rung,
+    # next_rung) link record for each. See CLAUDE.md "Region Map entries can
+    # go missing independently of the format" for the full investigation
+    # (including confirming, via a genuinely earlier save, that one of the two
+    # rungs *was* correctly indexed before a later save dropped it).
+    #
+    # R020_Program_Control (routine object_id 765662755) in the real
+    # CuteLogix.ACD fixture has 14 rungs, region_map-ordered 0..13. Simulate
+    # losing the Region Map entry for rung index 3 (object_id 1957188902,
+    # "NOP();") while its RegnLink.Dat chain record survives, pointing at the
+    # real next rung (108740561, index 4) -- exactly the shape of the real
+    # bug.
+    routine_id = 765662755
+    missing_rung = 1957188902
+    real_next_rung = 108740561
+
+    unzip = Unzip("../resources/CuteLogix.ACD").write_files("build")
+    exp = ExportL5x("../resources/CuteLogix.ACD", "build")
+    cur = exp._cur
+
+    original_order = [row[0] for row in cur.execute(
+        "SELECT object_id FROM region_map WHERE parent_id=? ORDER BY unknown", (routine_id,)
+    ).fetchall()]
+    assert missing_rung in original_order  # sanity: fixture shape hasn't drifted
+
+    cur.execute("DELETE FROM region_map WHERE parent_id=? AND object_id=?", (routine_id, missing_rung))
+    cur.execute(
+        "INSERT INTO regnlink_chain VALUES (?,?,?)", (routine_id, missing_rung, real_next_rung)
+    )
+    exp._db.commit()
+
+    routine = RoutineBuilder(cur, routine_id).build()
+
+    assert routine is not None
+    assert routine._rung_ids == original_order
+
+
+def test_routine_builder_appends_recovered_rung_when_no_chain_neighbor_is_present():
+    # Same recovery mechanism, but the chain's own "next" pointer isn't (and
+    # no other chain record's "next" points at this rung either) -- there's
+    # no position to splice into, so the recovered rung must still surface
+    # (better than silently dropping real logic) via an append-at-end
+    # fallback, not be lost a second time.
+    routine_id = 765662755
+    missing_rung = 1957188902
+
+    unzip = Unzip("../resources/CuteLogix.ACD").write_files("build")
+    exp = ExportL5x("../resources/CuteLogix.ACD", "build")
+    cur = exp._cur
+
+    original_order = [row[0] for row in cur.execute(
+        "SELECT object_id FROM region_map WHERE parent_id=? ORDER BY unknown", (routine_id,)
+    ).fetchall()]
+
+    cur.execute("DELETE FROM region_map WHERE parent_id=? AND object_id=?", (routine_id, missing_rung))
+    # Replace whatever real chain record(s) the fixture's own RegnLink.Dat
+    # produced for this rung -- both its own forward pointer AND the
+    # preceding rung's real record pointing AT it -- with a single
+    # controlled row whose "next" points nowhere resolvable. Isolates the
+    # append-at-end fallback from the real, correctly-chained data already
+    # present in this fixture (which the previous test relies on instead,
+    # and which also independently resolves the same missing rung to the
+    # same original position via the reverse/predecessor direction unless
+    # removed here too).
+    cur.execute("DELETE FROM regnlink_chain WHERE own_rung=? OR next_rung=?", (missing_rung, missing_rung))
+    cur.execute(
+        "INSERT INTO regnlink_chain VALUES (?,?,?)", (routine_id, missing_rung, 0xFFFFFFFF)
+    )
+    exp._db.commit()
+
+    routine = RoutineBuilder(cur, routine_id).build()
+
+    assert routine is not None
+    expected = [oid for oid in original_order if oid != missing_rung] + [missing_rung]
+    assert routine._rung_ids == expected

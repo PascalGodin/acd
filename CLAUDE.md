@@ -523,17 +523,10 @@ second).
   length field to bound the array at all; entries just run to the exact end of the record.
 - Re-verified against the user's whole-project L5X ground truth, this time checking actual rung
   TEXT content (not just `object_id` existence) for every RLL routine in the project: **147 of 149
-  routines matched byte-for-byte** (full rung sequence, in order). The 2 remaining mismatches are
-  each missing exactly **one** rung — confirmed (by locating that rung's real `object_id` via its
-  ground-truth text in the independently-decoded `rungs` table, then querying `region_map` for
-  that `object_id` directly) to be a genuinely **absent** Region Map entry, not a parsing error:
-  the rung's text decodes fine and exists in `SbRegion.Dat`, it simply has no corresponding
-  `region_map` row anywhere in the table for either routine. Consistent with the ~1% orphaned-entry
-  rate seen project-wide (50 of 5388 total slots didn't validate against any real rung) and with
-  this codebase's many other findings about undeleted/stale index entries — not something more
-  parsing cleverness can recover, the data just isn't there. **If a rung count matters for a
-  routine you're about to edit, cross-check it against Studio 5000 directly rather than trusting
-  this library's count as exhaustive** — silent 1-rung gaps like this are rare but real.
+  routines matched byte-for-byte** (full rung sequence, in order) at this point in the
+  investigation. The 2 remaining mismatches were each missing exactly **one** rung — see "Region
+  Map entries can go missing independently of the format" below for the follow-up investigation
+  that found (and recovered) the actual cause; both are now also exact matches (**149/149**).
 
 Fixed by splitting entry extraction into two pure generator functions,
 `_iter_region_map_entries_v_pre38()` (old behavior, byte-for-byte unchanged) and
@@ -573,6 +566,88 @@ previously-affected routines show any remaining difference.
 unknown — only V35-and-earlier (old layout, many real projects) and this one real V38.02 project
 (new layout) have actually been observed. If a future file trips neither invariant cleanly, that's
 new territory, not a bug in this fallback.
+
+## Region Map entries can go missing independently of the format — recovered via RegnLink.Dat
+
+Follow-up to the offset-7 fix above: the 2 remaining routines with a missing rung turned out to be
+a *different*, unrelated problem, not another Region Map parsing bug — and it's genuinely
+recoverable, not a dead end.
+
+**First, ruled out "V38.02 always drops entries"**: the user provided a *third* real save of the
+same project, from earlier the same day (`_OLD/BPM_TrimmerSorter_VAB_20260810.ACD`, 11:56am,
+restored from a backup after two later same-day saves at 14:50 and 16:17 both exhibited the bug).
+This earlier file's own Region Map record independently satisfies the *pre-V38* invariant exactly
+(`78 + region_length == len(record)`, no fallback triggered) — **and its own
+`project.software_revision` also reads `38.02`**, identical to the two later, broken-layout saves.
+This rules out firmware version as the layout trigger entirely (a real, hardening finding worth
+keeping): whatever changed the on-disk Region Map layout happened during a specific save operation
+sometime between 11:56am and 2:50pm that same day, not as a function of Studio's own version
+number. Not chased further than that (would need the exact edit/save sequence from that window,
+which wasn't available) — but this matters for how to read `software_revision` going forward: it
+is NOT a reliable predictor of which Region Map layout a given file uses. `populate_region_map()`'s
+own byte-level invariant check is the only trustworthy signal, which is exactly why the fix doesn't
+key off firmware version at all.
+
+**Then, tracing the two specific missing rungs through this earlier 11:56am file** (same project,
+same routines, some content already different by the later saves) found two *different* root
+causes for what looked like the same symptom:
+
+- `Fence_Axis_2_Ctrl`'s missing rung (`GSV(Module,FencePositioner2,Mode,Module_Servo2_Mode);`) —
+  **same exact `object_id`, same exact text**, genuinely present with a correct, live
+  `region_map` row in the 11:56am file (`parent_id` = `Fence_Axis_2_Ctrl`'s own object_id,
+  `unknown`/seq = 2, matching its real position). By the next save, that row is simply gone,
+  even though nothing about the rung itself changed. This is real, reproducible **Region Map
+  entry loss on an otherwise-untouched rung**, caused by whatever Studio operation rewrote the
+  table's layout in that save window.
+- `R07_Lift_Skids`'s missing rung (`...ONS(Lift_Skids.Ons[1])...`) has **no match at all** in the
+  11:56am file's independently-decoded `rungs` table — it didn't exist yet. It was authored
+  sometime after 11:56am, and its Region Map entry apparently was never written in the first
+  place (or was dropped in the same event that dropped the other one — can't distinguish which
+  from the data available).
+
+**Recovery mechanism**: `RegnLink.Dat` (already used elsewhere for rung-*comment* attribution, see
+"Rung comments" above) turned out to still hold fully intact, correctly-typed (`type=0x00020000`,
+not the `0xFFFF0000` dead marker) link records for *both* rungs — independent of Region Map
+entirely. Each 22-byte record already documented in `populate_regnlink()`'s own docstring as
+`[0:4] owner_id, [4:8] own_id, [8:12] next_id, ...` directly gives `(routine_id, this_rung,
+next_rung_in_sequence)` — a completely separate, still-correct source for exactly the ownership
+question Region Map normally answers. Verified directly for both real cases (raw byte-scan of
+`RegnLink.Dat` for the rung's own `object_id` in the `own_id` slot): `Fence_Axis_2_Ctrl`'s record
+resolves `next_id` to `429377538`, confirmed via the independently-decoded `rungs` table to be the
+*exact* real next rung's text (`XIC(Test_Axis.0)...`, ground-truth rung 3); `R07_Lift_Skids`'s
+record resolves `next_id` to `1359329597`, confirmed to be its real next rung too
+(`XIC(Lift_Skids.ActvtnArea)...`, ground-truth rung 3). Both chain records line up exactly with
+ground truth, confirming this is genuinely recoverable data, not a coincidence.
+
+**Fix**: `populate_regnlink()`'s existing single linear scan of `RegnLink.Dat` (already walking
+every byte for the `regnlink`/`regnlink_idx` tables) now also captures `(routine_id, own_rung,
+next_rung)` into a new `regnlink_chain` table, filtered by the same `type != 0xFFFF0000` liveness
+check already used for `regnlink`. `RoutineBuilder.build()`, after building its rung list from
+`region_map` as before, cross-checks `regnlink_chain` for its own `routine_id`: any `own_rung` not
+already in the list (and whose text still exists in `rungs` — nothing recoverable otherwise) gets
+spliced in, positioned by chain lookup (before its own `next_rung` if that's already in the list;
+otherwise right after whichever other chain record's `next_rung` points at it; otherwise appended
+at the end as a last resort, logged via `log.warning()` either way so a recovery is always visible,
+never silent). This mirrors the resolution order already established for `RegnLink.Idx`-based
+comment attribution ("prefer the entry that resolves to something real over guessing").
+
+**Verified end-to-end**: re-ran the full 149-routine ground-truth sweep against the user's
+whole-project L5X export — **149/149 exact matches**, both previously-incomplete routines now
+recovering their missing rung in exactly the right position (confirmed by the `log.warning()`
+firing for both: `Routine 2809983382: recovered 1 rung(s) ... [4294631627]` and `Routine
+498307360: recovered 1 rung(s) ... [1520403580]`). Full existing test suite unaffected. Covered by
+`test_routine_builder_recovers_rung_missing_from_region_map_via_regnlink_chain` (splices into the
+correct middle position, via a real 14-rung routine in the `CuteLogix.ACD` fixture with one entry
+deleted and its RegnLink.Dat chain data faked to match) and
+`test_routine_builder_appends_recovered_rung_when_no_chain_neighbor_is_present` (the append-at-end
+fallback, with both directions of the real chain data around that rung deliberately removed to
+isolate it) — both in `test/test_database.py`.
+
+**Caveat**: this recovers a rung whose Region Map link is gone but whose `RegnLink.Dat` link
+survives. If *both* are gone (not observed in either real case here, but not provably impossible),
+the rung is still lost to this library the same as before — `RegnLink.Dat` is a second chance, not
+a guarantee. If a rung count still looks short after this fix, that's the remaining possibility
+worth knowing about, not a sign this fix is incomplete.
 
 ## Native-import escape hatches for write-back (routine L5X is the one active mechanism)
 

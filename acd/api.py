@@ -38,7 +38,7 @@ from acd.l5x.elements import (
 
 # Clean top-level API
 
-def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
+def load_acd(path, temp_dir: str = None, verbose: bool = True) -> RSLogix5000Content:
     """Load an ACD file into a Python object model.
 
     Args:
@@ -60,6 +60,14 @@ def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
             points intentionally behave differently (`load_acd()` favors a
             clean one-shot load; `ExportL5x` favors leaving artifacts
             around for a debugging/exploration session).
+        verbose: Set False to drop the ~15-20 lines of INFO/DEBUG progress
+            output ("Getting records from ACD Comps file...", etc.) every
+            load produces. WARNING and above (real data-quality signals --
+            stale/deleted records, unrecognized codes falling back to a
+            guess, recovered data -- see CLAUDE.md) are always kept. Note
+            this reconfigures loguru's process-wide default sink, not just
+            this one call -- see `ExportL5x.__post_init__` if you need
+            finer control.
 
     Returns:
         RSLogix5000Content with a fully populated controller object tree.
@@ -96,7 +104,7 @@ def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
         temp_dir = tempfile.mkdtemp(prefix="acd_load_")
     exporter = None
     try:
-        exporter = ExportL5x(str(path), temp_dir)
+        exporter = ExportL5x(str(path), temp_dir, verbose=verbose)
         return exporter.project
     finally:
         # The SQLite connection must be closed BEFORE rmtree, or the open
@@ -313,6 +321,126 @@ def _all_routines(project: RSLogix5000Content) -> Dict[Tuple[str, str], Routine]
         for routine in aoi.routines:
             result[(f"AOI:{aoi.name}", routine.name)] = routine
     return result
+
+
+def get_routine(project: RSLogix5000Content, routine_name: str, program_name: str = None) -> Routine:
+    """Look up a single Routine by name, instead of hand-writing the nested
+    program -> routine double-lookup
+    (`next(r for p in project.controller.programs for r in p.routines if r.name == ...)`)
+    every time -- this shows up in almost every script that reads/edits one
+    specific routine.
+
+    A routine name is only unique WITHIN a program -- many real projects
+    have a routine named "Main" (or similar) in several different programs.
+    This isn't a hypothetical: an early verification pass in this library's
+    own development compared two projects' "Main" routines without scoping
+    by program and silently diffed the wrong pair. If `program_name` is
+    omitted and more than one program has a routine with this name, raises
+    ValueError listing every matching program rather than silently returning
+    an arbitrary one.
+
+    AOI logic routines are looked up the same way `io_addresses_by_routine()`
+    keys them: pass `program_name=f"AOI:{aoi_name}"`.
+
+    Raises KeyError if no routine with this name exists (in the given
+    program, if one was specified).
+    """
+    routines = _all_routines(project)
+    if program_name is not None:
+        try:
+            return routines[(program_name, routine_name)]
+        except KeyError:
+            raise KeyError(f"No routine {routine_name!r} in program {program_name!r}")
+    matches = [(p, r) for (p, rn), r in routines.items() if rn == routine_name]
+    if not matches:
+        raise KeyError(f"No routine named {routine_name!r} in any program")
+    if len(matches) > 1:
+        programs = [p for p, _ in matches]
+        raise ValueError(
+            f"Routine name {routine_name!r} is ambiguous -- found in programs {programs}; "
+            "pass program_name= to disambiguate"
+        )
+    return matches[0][1]
+
+
+def tag_exists(project: RSLogix5000Content, name: str, program_name: str = None) -> bool:
+    """Check whether a tag named `name` already exists in a given scope --
+    a quick pre-creation collision check, instead of hand-writing
+    `any(t.name == name for t in ctrl.tags)` (or the program-scope
+    equivalent) every time before adding a new tag.
+
+    `program_name=None` (default) checks controller scope. Pass a program
+    name to check that program's own tags instead. Deliberately checks ONE
+    scope at a time, not both: program-scope and controller-scope tags
+    don't collide with each other in Logix (a program-scope tag shadows a
+    same-named controller tag only within that one program), so "does this
+    name already exist" only makes sense relative to the specific scope
+    you're about to create the new tag in.
+
+    Raises KeyError if `program_name` doesn't match any program.
+    """
+    if program_name is None:
+        return any(t.name == name for t in project.controller.tags)
+    for program in project.controller.programs:
+        if program.name == program_name:
+            return any(t.name == name for t in program.tags)
+    raise KeyError(f"No program named {program_name!r}")
+
+
+def find_tag_references(
+    project: RSLogix5000Content, name: str, regex: bool = False
+) -> List[Tuple[str, str, int, str]]:
+    """Find every place a tag/member name is referenced in rung (RLL) or
+    line (ST) text, project-wide -- instead of hand-writing the nested
+    programs -> routines -> rungs substring scan every time you need to
+    check whether a name is already used somewhere before reusing or
+    repurposing it.
+
+    Returns a list of (program_name, routine_name, line_index, text) tuples,
+    in project iteration order. `line_index` is 0-based, matching
+    `Routine.rungs`' own indexing for RLL routines (and `Routine._rung_comments`'
+    keys) or `Routine._st_lines`' indexing for ST routines. AOI logic
+    routines are keyed like `io_addresses_by_routine()`: `program_name` is
+    `f"AOI:{aoi_name}"`.
+
+    By default `name` is matched as a whole token with word boundaries on
+    both sides -- searching for "TrimPattern" will NOT match inside
+    "TrimPattern2" or ".TrimPattern_Old". Pass `regex=True` to supply your
+    own pattern instead (e.g. a family of names, or an address suffix like
+    `r"\\.Length_In\\b"`) -- `name` is then used as a raw `re` pattern, not
+    escaped.
+    """
+    pattern = name if regex else r"\b" + re.escape(name) + r"\b"
+    compiled = re.compile(pattern)
+    results: List[Tuple[str, str, int, str]] = []
+    for (program_name, routine_name), routine in _all_routines(project).items():
+        for i, text in enumerate(_routine_lines(routine) or []):
+            if text and compiled.search(text):
+                results.append((program_name, routine_name, i, text))
+    return results
+
+
+def replace_rung_safe(routine: Routine, index: int, expected_old: str, new_text: str) -> None:
+    """Replace `routine.rungs[index]`, but only if its current text still
+    exactly matches `expected_old` -- guards against silently clobbering a
+    rung that changed (e.g. was hand-edited in Studio 5000) since you last
+    read it. This is good practice before any edit to existing rung text,
+    but hand-writing `assert routine.rungs[index] == expected_old, "..."`
+    every time gives a useless failure message (you have to go add the
+    diff yourself to see what actually changed).
+
+    Raises ValueError, with both the expected and actual text shown, if
+    they don't match. Does not touch `routine.rungs` at all in that case.
+    """
+    actual = routine.rungs[index]
+    if actual != expected_old:
+        raise ValueError(
+            f"Rung {index} of routine {routine.name!r} doesn't match the expected text -- "
+            "it may have changed since you last read it.\n"
+            f"  expected: {expected_old!r}\n"
+            f"  actual:   {actual!r}"
+        )
+    routine.rungs[index] = new_text
 
 
 def diff_routine(routine_a: Routine, routine_b: Routine) -> dict:

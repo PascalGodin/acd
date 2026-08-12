@@ -2187,7 +2187,12 @@ class Routine(L5xElement):
     usually "RLL"; "ST" routines have their text in `._st_lines` instead,
     `.rungs` empty). `._rung_comments` maps a rung index to its comment
     text. `._rung_ids[i]` is the integer object_id patch_rungs() needs to
-    identify rung i for a write-back edit -- NOT the same as its index i."""
+    identify rung i for a write-back edit -- NOT the same as its index i --
+    or `None` for a rung inserted via `insert_rung()` that doesn't exist in
+    the source file yet (only `export_routine()` can write that back, not
+    `patch_rungs()`). Use `insert_rung()`/`delete_rung()` rather than
+    mutating `.rungs`/`._rung_ids`/`._rung_comments` directly -- keeping all
+    three in sync by hand is easy to get wrong."""
 
     name: str
     type: str
@@ -2229,6 +2234,45 @@ class Routine(L5xElement):
             ]
             content = f'<STContent>{"".join(line_xmls)}</STContent>'
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
+
+    def insert_rung(self, index: int, text: str, comment: Union[str, None] = None) -> None:
+        """Insert a new rung at `index`, shifting every existing rung at or
+        after that position -- including its own `_rung_comments` entry, if
+        any -- up by one.
+
+        Doing this by hand (`routine.rungs.insert(index, text)` plus
+        manually re-keying every `_rung_comments` entry at or after
+        `index`) is a real footgun: getting the shift boundary wrong
+        silently attaches an existing comment to the wrong rung. This
+        method does both atomically.
+
+        The new rung has no real ACD object_id (it doesn't exist in the
+        source file yet), so `_rung_ids` gets a `None` placeholder at this
+        position to keep it the same length as `.rungs`. This is harmless
+        for `export_routine()` (which only ever reads `.rungs`/
+        `._rung_comments`, never `_rung_ids`) -- but `patch_rungs()` can
+        only edit an EXISTING rung's text, identified by a real object_id
+        in `_rung_ids`, never create a new one. Use `export_routine()` for
+        a routine containing a newly-inserted rung.
+        """
+        self.rungs.insert(index, text)
+        self._rung_ids.insert(index, None)
+        self._rung_comments = {
+            (i + 1 if i >= index else i): c for i, c in self._rung_comments.items()
+        }
+        if comment is not None:
+            self._rung_comments[index] = comment
+
+    def delete_rung(self, index: int) -> None:
+        """Delete the rung at `index`, dropping its own comment (if any)
+        and shifting every later rung's `_rung_comments` entry down by one
+        to match -- the same footgun as `insert_rung()`, in reverse.
+        """
+        del self.rungs[index]
+        del self._rung_ids[index]
+        self._rung_comments = {
+            (i - 1 if i > index else i): c for i, c in self._rung_comments.items() if i != index
+        }
 
 
 @dataclass

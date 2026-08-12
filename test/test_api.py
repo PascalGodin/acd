@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from xml.dom import minidom
 
+import pytest
+
 from acd.api import (
     ImportProjectFromFile,
     RSLogix5000Content,
@@ -11,11 +13,15 @@ from acd.api import (
     export_datatype,
     export_routine,
     find_io_addresses,
+    find_tag_references,
+    get_routine,
     io_addresses_by_routine,
     diff_io_addresses,
     diff_project,
     diff_routine,
     load_acd,
+    replace_rung_safe,
+    tag_exists,
 )
 from acd.l5x.elements import new_member
 
@@ -453,3 +459,169 @@ def test_export_datatype_inserts_member_at_requested_position(tmp_path):
     expected_names = list(original_names)
     expected_names.insert(insert_at, "InsertedField")
     assert member_names == expected_names
+
+
+def _mock_project():
+    from types import SimpleNamespace
+
+    def routine(name, rungs):
+        return SimpleNamespace(name=name, type="RLL", rungs=rungs, _st_lines=[])
+
+    prog_a = SimpleNamespace(
+        name="ProgA",
+        routines=[routine("Main", ["XIC(Foo)OTE(Bar);"]), routine("Sub", ["MOV(Foo,Baz);"])],
+        tags=[SimpleNamespace(name="ProgTag")],
+    )
+    prog_b = SimpleNamespace(
+        name="ProgB",
+        routines=[routine("Main", ["XIC(Qux)OTE(Foo);"])],
+        tags=[],
+    )
+    aoi = SimpleNamespace(
+        name="MyAOI",
+        routines=[routine("Logic", ["MOV(Foo,1);"])],
+    )
+    controller = SimpleNamespace(
+        programs=[prog_a, prog_b],
+        aois=[aoi],
+        tags=[SimpleNamespace(name="CtrlTag")],
+    )
+    return SimpleNamespace(controller=controller)
+
+
+def test_get_routine_unique_name_no_program_given():
+    project = _mock_project()
+    routine = get_routine(project, "Sub")
+    assert routine.name == "Sub"
+
+
+def test_get_routine_ambiguous_name_without_program_raises():
+    project = _mock_project()
+    with pytest.raises(ValueError):
+        get_routine(project, "Main")  # exists in both ProgA and ProgB
+
+
+def test_get_routine_ambiguous_name_resolved_with_program():
+    project = _mock_project()
+    routine = get_routine(project, "Main", program_name="ProgB")
+    assert routine.rungs == ["XIC(Qux)OTE(Foo);"]
+
+
+def test_get_routine_aoi_logic_routine():
+    project = _mock_project()
+    routine = get_routine(project, "Logic", program_name="AOI:MyAOI")
+    assert routine.rungs == ["MOV(Foo,1);"]
+
+
+def test_get_routine_missing_raises_keyerror():
+    project = _mock_project()
+    with pytest.raises(KeyError):
+        get_routine(project, "DoesNotExist")
+
+
+def test_tag_exists_controller_scope():
+    project = _mock_project()
+    assert tag_exists(project, "CtrlTag") is True
+    assert tag_exists(project, "ProgTag") is False
+
+
+def test_tag_exists_program_scope():
+    project = _mock_project()
+    assert tag_exists(project, "ProgTag", program_name="ProgA") is True
+    assert tag_exists(project, "CtrlTag", program_name="ProgA") is False
+
+
+def test_tag_exists_unknown_program_raises():
+    project = _mock_project()
+    with pytest.raises(KeyError):
+        tag_exists(project, "CtrlTag", program_name="NoSuchProgram")
+
+
+def test_find_tag_references_word_boundary_by_default():
+    project = _mock_project()
+    # "Foo" appears in ProgA/Main, ProgA/Sub, ProgB/Main, and the AOI logic
+    # routine -- "Foobar" (a different, longer identifier) must NOT match.
+    results = find_tag_references(project, "Foo")
+    keys = {(p, r) for p, r, _, _ in results}
+    assert keys == {("ProgA", "Main"), ("ProgA", "Sub"), ("ProgB", "Main"), ("AOI:MyAOI", "Logic")}
+    for _, _, idx, text in results:
+        assert isinstance(idx, int)
+        assert "Foo" in text
+
+
+def test_find_tag_references_does_not_match_substring():
+    from types import SimpleNamespace
+
+    project = _mock_project()
+    project.controller.programs[0].routines.append(
+        SimpleNamespace(name="Extra", type="RLL", rungs=["XIC(Foobar)OTE(Foo2);"], _st_lines=[])
+    )
+    results = find_tag_references(project, "Foo")
+    assert ("ProgA", "Extra", 0, "XIC(Foobar)OTE(Foo2);") not in results
+
+
+def test_find_tag_references_regex_mode():
+    project = _mock_project()
+    results = find_tag_references(project, r"Ba[rz]", regex=True)
+    keys = {(p, r) for p, r, _, _ in results}
+    assert keys == {("ProgA", "Main"), ("ProgA", "Sub")}
+
+
+def test_routine_insert_and_delete_rung_shift_comments_atomically():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    original_rungs = list(routine.rungs)
+    original_ids = list(routine._rung_ids)
+    routine._rung_comments = {1: "comment on original rung 1"}
+
+    routine.insert_rung(1, "NOP();", comment="comment on new rung")
+
+    assert routine.rungs[1] == "NOP();"
+    assert routine._rung_ids[1] is None
+    assert routine._rung_comments == {1: "comment on new rung", 2: "comment on original rung 1"}
+    assert routine.rungs[2:] == original_rungs[1:]
+    assert len(routine.rungs) == len(routine._rung_ids) == len(original_rungs) + 1
+
+    routine.delete_rung(1)
+
+    assert routine.rungs == original_rungs
+    assert routine._rung_ids == original_ids
+    assert routine._rung_comments == {1: "comment on original rung 1"}
+
+
+def test_replace_rung_safe_matching_text():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    old_text = routine.rungs[0]
+
+    replace_rung_safe(routine, 0, old_text, "NEW_TEXT();")
+
+    assert routine.rungs[0] == "NEW_TEXT();"
+
+
+def test_replace_rung_safe_mismatch_raises_and_does_not_mutate():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    original = routine.rungs[0]
+
+    with pytest.raises(ValueError, match="doesn't match the expected text"):
+        replace_rung_safe(routine, 0, "definitely not the real text", "NEW_TEXT();")
+
+    assert routine.rungs[0] == original
+
+
+def test_load_acd_verbose_false_suppresses_info_and_debug(capsys):
+    from loguru import logger as loguru_logger
+
+    load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    captured = capsys.readouterr()
+
+    # A quiet load must not emit the routine progress INFO lines this
+    # library always logged unconditionally before verbose= existed.
+    assert "Getting records from ACD" not in captured.err
+
+    # WARNING and above must still come through -- verbose=False must not
+    # go fully silent, only drop INFO/DEBUG progress noise.
+    loguru_logger.warning("CHECK_WARNING_STILL_REACHES_THE_SINK")
+    captured = capsys.readouterr()
+    assert "CHECK_WARNING_STILL_REACHES_THE_SINK" in captured.err

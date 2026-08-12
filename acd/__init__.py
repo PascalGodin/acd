@@ -51,6 +51,31 @@ Studio's own "Import Data Type..." feature) for creating/modifying a UDT
 Studio enforces a `FileInfo.Dat` checksum on open that this library
 cannot re-sign without a key it does not have, so `save_acd()` only
 produces an openable file for a completely unmodified round-trip.
+
+EDITING RUNGS -- avoid hand-rolling these, they're easy to get subtly
+wrong (see README.md for full examples):
+  - `get_routine(project, routine_name, program_name=None)` -- instead of
+    the nested program -> routine double-lookup. A routine name is only
+    unique WITHIN a program (many projects have a "Main" in several
+    programs), so this raises if the name is ambiguous and no
+    `program_name` was given, rather than silently picking one.
+  - `routine.insert_rung(index, text, comment=None)` /
+    `routine.delete_rung(index)` -- inserting/deleting a rung means
+    shifting every `_rung_comments` key at/after that index too; doing
+    this by hand is a real, easy-to-mis-index footgun.
+  - `replace_rung_safe(routine, index, expected_old, new_text)` -- edit an
+    EXISTING rung's text, but only if it still matches what you last read
+    (raises with a readable diff otherwise) -- guards against clobbering a
+    rung someone hand-edited in Studio since your last read.
+  - `find_tag_references(project, name)` -- every (program, routine,
+    rung_index, text) where a tag/member name is referenced, project-wide
+    -- e.g. to check whether a name is already used before reusing it.
+  - `tag_exists(project, name, program_name=None)` -- pre-creation
+    collision check in a given scope (controller by default).
+
+`load_acd(path, verbose=False)` drops the ~15-20 lines of INFO/DEBUG
+progress output every load produces by default (WARNING and above --
+real data-quality signals -- are always kept regardless).
 """
 
 from acd.api import (  # noqa: F401
@@ -60,9 +85,13 @@ from acd.api import (  # noqa: F401
     export_routine,
     export_datatype,
     find_io_addresses,
+    find_tag_references,
+    get_routine,
     io_addresses_by_routine,
     diff_io_addresses,
     diff_project,
     diff_routine,
+    replace_rung_safe,
+    tag_exists,
 )
 from acd.l5x.elements import new_member  # noqa: F401

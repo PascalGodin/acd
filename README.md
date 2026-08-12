@@ -37,7 +37,11 @@ pip install acd-tools
 ### Quick start — read an ACD file
 
 `load_acd()` extracts the ACD into a temporary directory (system temp, auto-deleted when the call
-returns — see "Low-level access via ExportL5x" below if you want the extracted files left on disk):
+returns — see "Low-level access via ExportL5x" below if you want the extracted files left on disk).
+Every load logs ~15-20 lines of INFO/DEBUG progress output by default (via `loguru`) — pass
+`verbose=False` to drop those and keep only WARNING and above (real data-quality signals, e.g.
+stale/deleted records or a value that had to be guessed — see `CLAUDE.md` — which are never
+suppressed):
 
 ```python
 from acd.api import load_acd
@@ -243,6 +247,53 @@ print(diff_routine(routine_a, routine_b))
 `find_io_addresses(text)` extracts the raw list of I/O addresses from a single rung/ST-line;
 `io_addresses_by_routine(project)` gives the whole project's routine-by-routine breakdown without
 diffing.
+
+---
+
+### Lookup and rung-editing helpers
+
+A few small helpers exist specifically to avoid hand-rolled patterns that are easy to get subtly
+wrong — reach for these instead of writing your own version:
+
+```python
+from acd import get_routine, tag_exists, find_tag_references, replace_rung_safe
+
+# Instead of the nested program -> routine double-lookup. A routine name is only
+# unique WITHIN a program (many projects have a "Main" in several programs) --
+# raises ValueError (listing every matching program) if the name is ambiguous
+# and no program_name was given, rather than silently picking one.
+routine = get_routine(project, "R07_Lift_Skids", program_name="VAB_Trim_And_Sort")
+
+# Pre-creation collision check, in a given scope (controller by default).
+if not tag_exists(project, "NewTagName"):
+    ...
+
+# Every (program_name, routine_name, rung_index, text) referencing a name,
+# project-wide -- e.g. to check whether a name is already used before
+# reusing/repurposing it. Word-boundary matched by default (won't match
+# "TrimPattern" inside "TrimPattern2"); pass regex=True for your own pattern.
+for program_name, routine_name, idx, text in find_tag_references(project, "Lift_Skid"):
+    print(program_name, routine_name, idx, text)
+
+# Edit an EXISTING rung, but only if it still matches what you last read --
+# raises with a readable diff (not a bare AssertionError) if it changed
+# since then (e.g. hand-edited in Studio in the meantime).
+replace_rung_safe(routine, 0, expected_old="NOP();", new_text="XIC(MySensor)OTE(MyOutput);")
+```
+
+Inserting or deleting a rung means shifting every `_rung_comments` key at/after that index to
+match — `Routine.insert_rung()`/`Routine.delete_rung()` do this atomically instead of you
+re-deriving the index arithmetic by hand:
+
+```python
+routine.insert_rung(3, "XIC(NewCondition)OTE(NewOutput);", comment="Explains the new interlock")
+# ...
+routine.delete_rung(3)
+```
+
+A rung inserted this way has no real ACD object_id yet (`routine._rung_ids[3]` is `None`) --
+`export_routine()` (below) doesn't care, but `patch_rungs()` can only edit an *existing* rung's
+text, never create a new one.
 
 ---
 

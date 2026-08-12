@@ -1059,7 +1059,7 @@ naming convention): all three now correctly appear as full `<Tag>` context eleme
 Covered by `test_export_routine_st_routine_pulls_in_referenced_tags` (`test/test_api.py`) — confirmed
 this test fails without the fix, not just that it passes with it.
 
-## `export_datatype()` — create/modify a UDT (NOT YET VERIFIED against real Studio 5000)
+## `export_datatype()` — create/modify a UDT (now verified against real Studio 5000)
 
 Added per user request (concrete example: insert a new member in the middle of the real `Lug`
 UDT). Same "native-import escape hatch" architecture as `export_routine()`: exports a single
@@ -1087,14 +1087,72 @@ the Data Types folder) — sidestepping `save_acd()`/raw `Comps.Dat` writing ent
   `export_routine()`'s shape exactly right (see "Partial/context L5X exports" below — a crash, a
   missing `Use=` rule, several tag-rendering gaps, all only found via actual import attempts), expect
   this to need the same kind of iteration once tested against real Studio 5000.
-- Verified so far (without Studio 5000): generated XML is well-formed, the target `DataType`
+- Verified structurally (without Studio 5000): generated XML is well-formed, the target `DataType`
   carries `Use="Target"` and nothing else does, and a member inserted at a given list index appears
   at the correct position in the rendered `<Members>` — covered by
   `test_export_datatype_inserts_member_at_requested_position` (`test/test_api.py`), using the
-  `UDT_Test` fixture in `resources/ACDTestsWithAOI.ACD`. Also manually generated and inspected a
-  real `Lug_modified.L5X` (new `DINT` member inserted right after `Z1_Board_Length`) against the
-  real `BPM_TrimmerSorter_VAB_20260721.ACD` project — well-formed, correct member order — but this
-  has **not yet been imported into real Studio 5000**; do that on a **copy** of the project first.
+  `UDT_Test` fixture in `resources/ACDTestsWithAOI.ACD`.
+- **Confirmed working end-to-end in real Studio 5000** (a downstream agent's session, real project,
+  V38.02): a standalone `export_datatype()` call — new UDT member inserted into an existing type,
+  no routine/tag involved — imported via "Import Data Type..." with zero errors. See the next
+  section for a real, *adjacent* bug this same session found (and this library has since fixed):
+  mutating a UDT's members and *then*, in the same session, exporting a routine referencing an
+  existing tag of that type.
+
+## Mutating a UDT with live tag instances, then exporting a routine in the same session (fixed)
+
+Found via a real Studio 5000 import rejection in the same session that confirmed `export_datatype()`
+itself works (previous section): add a new member to an existing `DataType` that already has live
+tag instances (e.g. a `Bin` UDT with 50 instances via a `To_VABView_Bins[50]` controller tag), then
+— **in the same session, no reload** — `export_routine()` a routine whose logic references one of
+those existing instances (`To_VABView_Bins[i].NewMember...`). Studio rejected the import:
+
+```
+Error: Failed to set the 'Data' property (Data type mismatch - the object's value does not
+match its data type.).
+    RSLogix5000Content/Controller/Tags/Tag[@Name="To_VABView_Bins"]/Data
+```
+
+**Root cause**, confirmed by the downstream agent's own direct inspection of the exported XML
+before reporting it: a tag's decoded value (`Tag._initial_value`, produced once by
+`_decode_single_udt_element` from the ACD's raw stored bytes at `load_acd()` time, using
+`DataType.members` *as it existed then*) is a plain Python dict/list snapshot — appending a new
+`Member` to `DataType.members` afterward (the documented, correct way to mutate a UDT for
+`export_datatype()`, see above) has no way to reach back and retroactively add the new member's key
+to every already-decoded tag value of that type. The exported `<Tag>` element's `<DataType>`
+declaration (rendered fresh from the current, mutated `DataType.members` at export time) then
+disagrees with its own `<Data Format="L5K">`/`<Data Format="Decorated">` value blocks (rendered from
+the stale decoded dict, one member short) — an internally inconsistent file Studio correctly refuses.
+
+Confirmed narrowly scoped, not a general `export_routine()`/`export_datatype()` regression: a pure
+`export_datatype()` call (no tag values involved) is unaffected; a brand-new tag created in the same
+session is unaffected (no prior stored value to be stale); only "mutate an existing UDT with live
+instances, then export something that carries one of those instances' *values*" triggers it.
+
+**Fixed** by making the two value-rendering functions that walk `DataType.members` and look up each
+member's value in the decoded dict (`_l5k_udt_literal`, `_udt_scalar_to_xml`, `acd/l5x/elements.py`)
+zero-fill a member missing from that dict instead of silently skipping it — via a new
+`_zero_value_for_member()` that synthesizes a Studio-consistent zero/default (0, 0.0, `{"LEN":0,
+"DATA":""}` for a string-family type, or a recursively zero-filled dict for a nested struct,
+matching each member's own dimension/type), **mirroring what Studio 5000 itself does natively**
+when a UDT member is added to a type with existing instances via its own editor (per the downstream
+agent's own stated expectation, matching real Studio behavior). Both `_udt_scalar_to_xml` (used for
+both scalar UDT tags and, per-element, array-of-UDT tags like `To_VABView_Bins[50]`) and
+`_l5k_udt_literal` (same recursion structure) share the one fix point — an array-of-struct tag needed
+no separate handling. Also incidentally hardens the same two functions against a member that decodes
+to a real Python `None` for an unrelated reason (`_decode_scalar_member` returns `None` for an
+unrecognized member type) — previously silently dropped too, now zero-filled the same way.
+
+Covered by `test_l5k_udt_literal_zero_fills_scalar_member_missing_from_decoded_value`,
+`test_l5k_udt_literal_zero_fills_struct_member_missing_from_decoded_value` (the real reported shape:
+the new member was itself a struct type), `test_udt_scalar_to_xml_zero_fills_member_missing_from_decoded_value`,
+and three direct `_zero_value_for_member()` unit tests (scalar/array/nested-struct) —
+`test/test_elements_helpers.py`. Not yet re-verified against a real Studio import of the exact
+originally-failing case (the user's own `Bin`/`Criteria_Qty`/`To_VABView_Bins` project) — the fix is
+verified structurally (declared member count now always matches rendered value count) and by direct
+code-path tracing back to the downstream agent's own root-cause finding, not yet by a second live
+Studio import. If you have Studio access and this exact scenario handy, that's the next thing to
+confirm.
 
 ## Routine-level Description (leading XML comment newline pitfall)
 

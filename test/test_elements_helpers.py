@@ -17,8 +17,11 @@ from acd.l5x.elements import (
     _get_type_size,
     _l5k_real_literal,
     _l5k_string_padded,
+    _l5k_udt_literal,
     _read_tag_initial_value,
     _resolve_bit_target,
+    _udt_scalar_to_xml,
+    _zero_value_for_member,
 )
 
 
@@ -334,6 +337,83 @@ def test_decode_single_udt_element_still_truncates_beyond_max_depth():
     result = _decode_single_udt_element(blob, 0, a_dt, data_types_map, 0)
 
     assert result == {"b": {"c": {"d": {"e": {}}}}}
+
+
+def test_zero_value_for_member_scalar_primitive():
+    assert _zero_value_for_member(_member("Max_Qty", "DINT"), {}) == 0
+    assert _zero_value_for_member(_member("Ratio", "REAL"), {}) == 0.0
+    assert _zero_value_for_member(_member("Enabled", "BOOL"), {}) == 0
+
+
+def test_zero_value_for_member_array():
+    assert _zero_value_for_member(_member("Specie", "DINT", dimension=3), {}) == [0, 0, 0]
+
+
+def test_zero_value_for_member_nested_struct():
+    inner_dt = DataType("Inner", "Inner", "NoFamily", "User", [_member("Val", "DINT")])
+    data_types_map = {"INNER": inner_dt}
+    assert _zero_value_for_member(_member("Nested", "Inner"), data_types_map) == {"Val": 0}
+
+
+def test_l5k_udt_literal_zero_fills_scalar_member_missing_from_decoded_value():
+    # Regression test for a real Studio 5000 import rejection ("Data type
+    # mismatch"): appending a new Member to an existing DataType's
+    # .members list (e.g. via export_datatype()'s own documented pattern)
+    # does NOT retroactively re-derive an already-decoded tag value for
+    # that type -- the new member is simply absent as a key. Previously
+    # this function skipped any member missing from the decoded value
+    # dict entirely, so the L5K literal came out one element short of
+    # what the type's own (freshly-rendered) declaration says it has.
+    dt = DataType(
+        "Bin", "Bin", "NoFamily", "User",
+        [_member("Max_Qty", "DINT"), _member("Criteria_Qty", "DINT")],
+    )
+    data_types_map = {"BIN": dt}
+    # Decoded before Criteria_Qty existed on the type -- no such key.
+    values = {"Max_Qty": 5}
+
+    assert _l5k_udt_literal("Bin", values, data_types_map) == "[5,0]"
+
+
+def test_l5k_udt_literal_zero_fills_struct_member_missing_from_decoded_value():
+    # Same bug, real shape: the new member (Criteria_Qty) was itself a
+    # struct type (Bin_Criteria_Qty, one DINT[3] member) -- verified this
+    # recurses through _zero_value_for_member correctly rather than just
+    # handling a bare scalar.
+    criteria_dt = DataType(
+        "Bin_Criteria_Qty", "Bin_Criteria_Qty", "NoFamily", "User",
+        [_member("Specie", "DINT", dimension=3)],
+    )
+    bin_dt = DataType(
+        "Bin", "Bin", "NoFamily", "User",
+        [_member("Max_Qty", "DINT"), _member("Criteria_Qty", "Bin_Criteria_Qty")],
+    )
+    data_types_map = {"BIN": bin_dt, "BIN_CRITERIA_QTY": criteria_dt}
+    values = {"Max_Qty": 5}
+
+    assert _l5k_udt_literal("Bin", values, data_types_map) == "[5,[[0,0,0]]]"
+
+
+def test_udt_scalar_to_xml_zero_fills_member_missing_from_decoded_value():
+    # Decorated-format counterpart of the L5K tests above -- same root
+    # cause, same fix, different renderer.
+    criteria_dt = DataType(
+        "Bin_Criteria_Qty", "Bin_Criteria_Qty", "NoFamily", "User",
+        [_member("Specie", "DINT", dimension=3)],
+    )
+    bin_dt = DataType(
+        "Bin", "Bin", "NoFamily", "User",
+        [_member("Max_Qty", "DINT"), _member("Criteria_Qty", "Bin_Criteria_Qty")],
+    )
+    data_types_map = {"BIN": bin_dt, "BIN_CRITERIA_QTY": criteria_dt}
+    values = {"Max_Qty": 5}
+
+    xml = _udt_scalar_to_xml("Bin", values, data_types_map)
+
+    assert '<DataValueMember Name="Max_Qty" DataType="DINT" Radix="Decimal" Value="5"/>' in xml
+    assert '<StructureMember Name="Criteria_Qty" DataType="Bin_Criteria_Qty">' in xml
+    assert '<ArrayMember Name="Specie" DataType="DINT" Dimensions="3" Radix="Decimal">' in xml
+    assert xml.count('Value="0"') == 3  # the three zero-filled Specie elements
 
 
 def test_get_type_size_rounds_up_to_multiple_of_4_not_merely_even():

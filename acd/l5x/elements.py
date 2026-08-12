@@ -330,7 +330,15 @@ def _l5k_udt_literal(dt_name: str, values, data_types_map: Dict[str, 'DataType']
             continue
         val = values.get(member.name)
         if val is None:
-            continue
+            # Absent from the decoded value dict entirely (or genuinely
+            # decoded to None, e.g. an unrecognized member type) -- most
+            # commonly a member added to DataType.members AFTER this tag's
+            # value was already decoded from raw bytes. Zero-fill rather
+            # than skip: omitting it here would leave the L5K literal one
+            # element short of what the type's own (freshly-rendered)
+            # declaration says it has, which Studio rejects on import. See
+            # _zero_value_for_member()'s own docstring for the full story.
+            val = _zero_value_for_member(member, data_types_map)
         mdt = member.data_type
         if isinstance(val, dict) or (isinstance(val, list) and val and isinstance(val[0], dict)):
             parts.append(_l5k_udt_literal(mdt, val, data_types_map))
@@ -492,6 +500,60 @@ _SKIP_DECORATED: set = {
     "ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED",
     "AXIS_CIP_DRIVE", "MOTION_GROUP",
 }
+
+
+def _zero_value_for_member(member: "Member", data_types_map: Dict[str, "DataType"]):
+    """Synthesize a Studio-consistent zero/default value for a UDT member
+    that has no decoded value at all in a tag's already-decoded
+    `_initial_value` dict.
+
+    This happens whenever a member is present in `DataType.members` but
+    absent as a key in a value dict that was decoded (from the ACD's raw
+    stored bytes, see `_decode_single_udt_element`) BEFORE that member
+    existed -- e.g. a caller appends a new `Member` to an existing
+    `DataType.members` list, in the same session, for a type that already
+    has live tag instances whose values were decoded at `load_acd()` time.
+    Mutating `DataType.members` in place does not retroactively re-derive
+    or zero-fill those already-decoded values -- without this, the type's
+    *declaration* (rendered fresh from the current `DataType.members` at
+    export time) and the tag's *value* (rendered from the stale decoded
+    dict) disagree on member count, which Studio 5000 correctly rejects on
+    import ("Data type mismatch"). Found via a real case: adding a new
+    `Criteria_Qty` member to an existing `Bin` DataType with 50 live
+    `To_VABView_Bins` instances, then exporting a routine referencing one
+    of those instances in the same session.
+
+    Mirrors what Studio 5000 itself does natively when you add a UDT
+    member to a type with existing instances via its own editor: the new
+    member simply defaults to zero on every existing instance.
+
+    Returns a plain Python value in the same shape `_decode_single_udt_element`
+    would have produced (scalar / dict / list / list-of-dicts) -- callers
+    that already handle a real decoded value's shape (`_l5k_udt_literal`,
+    `_udt_scalar_to_xml`) can consume this exactly the same way.
+    """
+    mdt = member.data_type
+    mdt_upper = mdt.upper()
+
+    def _scalar_zero():
+        if mdt_upper in ("BOOL", "BIT"):
+            return 0
+        if mdt_upper in _PRIMITIVE_DECORATED_ZERO:
+            return 0.0 if mdt_upper in ("REAL", "LREAL") else 0
+        if _is_string_family_type(mdt, data_types_map):
+            return {"LEN": 0, "DATA": ""}
+        dt_obj = data_types_map.get(mdt_upper)
+        if dt_obj is None:
+            return 0  # unknown type -- a harmless scalar zero beats crashing
+        return {
+            m.name: _zero_value_for_member(m, data_types_map)
+            for m in dt_obj.members
+            if m.data_type != "BIT"  # BIT-overlay pseudo-members have no storage of their own
+        }
+
+    if member.dimension > 0:
+        return [_scalar_zero() for _ in range(member.dimension)]
+    return _scalar_zero()
 
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
@@ -783,7 +845,15 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
         val = values.get(mname)
 
         if val is None:
-            continue
+            # Absent from the decoded value dict entirely (or genuinely
+            # decoded to None, e.g. an unrecognized member type) -- most
+            # commonly a member added to DataType.members AFTER this tag's
+            # value was already decoded from raw bytes. Zero-fill rather
+            # than skip: omitting it here would leave this Decorated
+            # structure with fewer members than the type's own (freshly-
+            # rendered) declaration says it has, which Studio rejects on
+            # import. See _zero_value_for_member()'s own docstring.
+            val = _zero_value_for_member(member, data_types_map)
 
         if isinstance(val, dict):
             # Nested UDT

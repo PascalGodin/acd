@@ -260,10 +260,10 @@ each of these has a cheap "list names/counts only" step and a separate "fetch th
 full" step — never walk `project.controller...` yourself and return everything you find:
 
 ```python
-from acd import project_summary, list_routines, list_tags, get_tag_value
+from acd import get_project_summary, list_routines, list_tags, get_tag_value
 
 # Names/counts only -- the first thing to ask for, before drilling into anything specific.
-summary = project_summary(project)
+summary = get_project_summary(project)
 # {"controller_name": "...", "programs": [...], "tasks": [...], "data_types": [...],
 #  "aois": [...], "modules": [...], "controller_tag_count": N, "program_tag_counts": {...},
 #  "routine_count": N}

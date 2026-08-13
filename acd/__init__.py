@@ -63,7 +63,7 @@ budget (e.g. an MCP tool response), prefer these over walking
 `project.controller...` yourself and returning everything you find. Each
 has a "list names/counts only" step and a separate "fetch this ONE thing
 in full" step, so a caller never gets more than it actually asked for:
-  - `project_summary(project)` -- names/counts only (programs, tasks, data
+  - `get_project_summary(project)` -- names/counts only (programs, tasks, data
     types, AOIs, modules, tag counts, routine count) for an initial "what's
     in this project" response, before drilling into anything specific.
   - `list_routines(project, program_name=None)` -- name/type/line-count for
@@ -128,7 +128,7 @@ from acd.api import (  # noqa: F401
     io_addresses_by_routine,
     list_routines,
     list_tags,
-    project_summary,
+    get_project_summary,
     diff_io_addresses,
     diff_project,
     diff_routine,

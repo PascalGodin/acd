@@ -649,7 +649,7 @@ the rung is still lost to this library the same as before — `RegnLink.Dat` is 
 a guarantee. If a rung count still looks short after this fix, that's the remaining possibility
 worth knowing about, not a sign this fix is incomplete.
 
-## Lazy / summary-first lookups: `project_summary()`, `list_routines()`, `list_tags()`, `get_tag_value()`
+## Lazy / summary-first lookups: `get_project_summary()`, `list_routines()`, `list_tags()`, `get_tag_value()`
 
 Added in preparation for a possible future MCP server wrapping this library (not built yet, see
 the "MCP server competitive landscape" auto-memory from that discussion if you're picking this
@@ -661,7 +661,7 @@ underlying load was. These four functions (`acd/api.py`) give any caller (MCP wr
 otherwise) a summary-first / drill-down-on-demand shape to build on, instead of every future
 caller re-deriving "walk `project.controller...` and decide what to include" from scratch:
 
-- `project_summary(project)` -- names/counts only (program/task/data-type/AOI/module names,
+- `get_project_summary(project)` -- names/counts only (program/task/data-type/AOI/module names,
   controller + per-program tag counts, total routine count). Meant as the very first call.
 - `list_routines(project, program_name=None)` -- name/type/line-count per routine, no rung/ST
   content at all. Pairs with the already-existing `get_routine()` for one routine's actual logic.

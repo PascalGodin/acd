@@ -325,7 +325,7 @@ def _all_routines(project: RSLogix5000Content) -> Dict[Tuple[str, str], Routine]
     return result
 
 
-def project_summary(project: RSLogix5000Content) -> dict:
+def get_project_summary(project: RSLogix5000Content) -> dict:
     """A compact, names-and-counts-only summary of a whole project --
     intended as the FIRST thing a caller asks for (e.g. an MCP tool's
     "load this project" response), before drilling into any specific

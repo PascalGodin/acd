@@ -20,7 +20,7 @@ from acd.api import (
     io_addresses_by_routine,
     list_routines,
     list_tags,
-    project_summary,
+    get_project_summary,
     diff_io_addresses,
     diff_project,
     diff_routine,
@@ -702,9 +702,9 @@ def test_find_tag_references_regex_mode():
     assert keys == {("ProgA", "Main"), ("ProgA", "Sub")}
 
 
-def test_project_summary_is_names_and_counts_only():
+def test_get_project_summary_is_names_and_counts_only():
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
-    summary = project_summary(project)
+    summary = get_project_summary(project)
 
     assert summary["controller_name"] == "CuteLogix"
     assert set(summary["programs"]) == {p.name for p in project.controller.programs}

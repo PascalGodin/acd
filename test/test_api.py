@@ -10,6 +10,7 @@ from acd.api import (
     Extract,
     ExtractAcdDatabase,
     DumpCompsRecordsToFile,
+    diff_lines,
     export_datatype,
     export_routine,
     find_io_addresses,
@@ -24,7 +25,7 @@ from acd.api import (
     tag_exists,
     _sync_data_types_map,
 )
-from acd.l5x.elements import DataType, Tag, new_member
+from acd.l5x.elements import DataType, Tag, new_member, new_tag
 
 
 def test_import_from_file():
@@ -395,6 +396,27 @@ def test_diff_routine_reproduces_real_jsr_removal_scenario():
     ]
 
 
+def test_diff_lines_unchanged_returns_empty_list():
+    assert diff_lines(["A", "B"], ["A", "B"]) == []
+
+
+def test_diff_lines_insert_only():
+    old = ["A", "B", "C"]
+    new = ["A", "X", "B", "C"]
+    result = diff_lines(old, new)
+    assert result == [{"op": "insert", "old": [], "new": ["X"]}]
+    assert all(c["op"] == "insert" for c in result)
+
+
+def test_diff_lines_isolates_a_deletion_without_misreporting_the_shifted_tail():
+    # Same rationale as diff_routine()'s own JSR-removal test, but for the
+    # lower-level primitive directly: deleting lines near the start must not
+    # make an untouched tail look like a wall of replacements.
+    old = ["1", "2", "3", "4", "5"]
+    new = ["3", "4", "5"]
+    assert diff_lines(old, new) == [{"op": "delete", "old": ["1", "2"], "new": []}]
+
+
 def test_new_member_defaults_radix_by_data_type():
     dint_member = new_member("Foo", "DINT")
     assert dint_member.radix == "Decimal"
@@ -424,6 +446,39 @@ def test_new_member_rejects_none_dimension():
     # in export rendering. Raise immediately instead, at the actual mistake.
     with pytest.raises(ValueError, match="dimension"):
         new_member("Foo", "DINT", dimension=None)
+
+
+def test_new_tag_primitive_defaults_radix_by_data_type():
+    dint_tag = new_tag("Foo", "DINT")
+    assert dint_tag.name == "Foo"
+    assert dint_tag.tag_type == "Base"
+    assert dint_tag.data_type == "DINT"
+    assert dint_tag.radix == "Decimal"
+    assert dint_tag.dimensions is None
+    assert dint_tag._initial_value is None
+
+    real_tag = new_tag("Bar", "REAL", value=1.5)
+    assert real_tag.radix == "Float"
+    assert real_tag._initial_value == 1.5
+
+
+def test_new_tag_udt_type_omits_radix():
+    # A struct-typed tag carries no Radix attribute at all, matching every
+    # ACD-decoded UDT-typed Tag (see TagBuilder.build()) -- unlike
+    # new_member(), which defaults an unknown/struct type's radix to the
+    # string "NullType" instead of None.
+    tag = new_tag("Baz", "SomeUdt", dimensions="10", description="a tag")
+    assert tag.radix is None
+    assert tag.data_type == "SomeUdt"
+    assert tag.dimensions == "10"
+    assert tag._comments == [("", "a tag")]
+
+
+def test_new_tag_xml_shape():
+    tag = new_tag("MyTag", "DINT", value=5)
+    xml = tag.to_xml()
+    assert '<Tag Name="MyTag"' in xml
+    assert 'DataType="DINT"' in xml
 
 
 def test_sync_data_types_map_propagates_new_type_to_existing_tags():
@@ -462,6 +517,33 @@ def test_sync_data_types_map_propagates_new_type_to_existing_tags():
     assert '<ArrayMember Name="X" DataType="DINT" Dimensions="2"' in xml
     # The pre-existing member must still render correctly, unaffected.
     assert '<DataValueMember Name="M" DataType="DINT" Radix="Decimal" Value="5"/>' in xml
+
+
+def test_export_routine_validate_raises_on_unresolved_type(tmp_path):
+    # validate=True should catch, before writing any XML, the exact failure
+    # signature the stale-_data_types_map bug produced silently (see
+    # CLAUDE.md "Mutating a UDT with live tag instances..."): a referenced
+    # tag whose type doesn't resolve in data_types_map at all.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = project.controller.programs[0]
+    routine = next(r for r in program.routines if r.type == "RLL")
+
+    bad_tag = Tag("BadTag", "BadTag", "Base", "NotARealType", None, "Read/Write", None, None)
+    bad_tag._data_types_map = project.controller._data_types_map
+    bad_tag._initial_value = {"X": 0}
+    project.controller.tags.append(bad_tag)
+    routine.rungs.append("XIC(BadTag)OTE(BadTag);")
+
+    out_path = tmp_path / "validate_test.L5X"
+    with pytest.raises(ValueError, match="NotARealType"):
+        export_routine(project, routine, str(out_path), validate=True)
+    assert not out_path.exists()  # must not write a file when validation fails
+
+    # validate defaults to False -- this option must not change any existing
+    # caller's behavior; the export still succeeds (just with a value that
+    # would render wrong, which is exactly what validate=True is for).
+    export_routine(project, routine, str(out_path))
+    assert out_path.exists()
 
 
 def test_export_datatype_raises_if_data_type_not_in_project():
@@ -674,3 +756,13 @@ def test_load_acd_verbose_false_suppresses_info_and_debug(capsys):
     loguru_logger.warning("CHECK_WARNING_STILL_REACHES_THE_SINK")
     captured = capsys.readouterr()
     assert "CHECK_WARNING_STILL_REACHES_THE_SINK" in captured.err
+
+
+def test_load_acd_defaults_to_quiet(capsys):
+    # Regression test for the verbose default flip (True -> False): a bare
+    # load_acd(path), with no verbose= argument at all, must already be
+    # quiet -- a caller shouldn't have to discover and pass verbose=False
+    # themselves to get the token-cheap behavior.
+    load_acd(os.path.join("..", "resources", "CuteLogix.ACD"))
+    captured = capsys.readouterr()
+    assert "Getting records from ACD" not in captured.err

@@ -229,6 +229,50 @@ def new_member(name: str, data_type: str, dimension: int = 0,
     )
 
 
+def new_tag(name: str, data_type: str, dimensions: Union[str, None] = None,
+            description: Union[str, None] = None, value=None,
+            external_access: str = "Read/Write") -> "Tag":
+    """Construct a new, plain (Base, non-alias) `Tag` for insertion into
+    `project.controller.tags` (controller scope) or a `Program.tags` list
+    (program scope) before calling `export_routine()` -- e.g. to introduce
+    a brand-new tag that new rung/ST logic references. Confirmed working
+    end-to-end against real Studio 5000 (see CLAUDE.md "Native-import
+    escape hatches" -- "creating a brand-new tag from scratch").
+
+    `radix` is always derived from `data_type` (`_PRIMITIVE_RADIX`, e.g.
+    "Decimal" for DINT, "Float" for REAL) -- or omitted (`None`) for a
+    UDT-typed tag, matching every ACD-decoded struct-typed tag, which
+    carries no Radix attribute of its own; there is no override parameter
+    since a tag's Radix is never a free choice independent of its type the
+    way a UDT member's occasionally is.
+
+    `value`, if given, becomes `_initial_value` directly -- an int/float
+    for a scalar primitive tag, or a dict/list matching the shape
+    `_decode_udt_initial_value`/`_zero_value_for_member` would produce for
+    a UDT-typed tag. Not validated against `data_type`/`dimensions` here;
+    an omitted `value` (the default) simply renders as Studio's own zero
+    default via the same `_zero_value_for_member`-style fallback every
+    other tag's own rendering already goes through.
+
+    `dimensions`, if given, is the comma-separated internal form (e.g.
+    "10" or "4,3,2" -- NOT `Tag.to_xml()`'s own space-separated XML
+    attribute rendering, which is handled automatically). Unlike
+    `new_member()`'s `dimension`, `None` here really does mean "scalar" --
+    `Tag.dimensions` (unlike `Member.dimension`) already uses `None` as its
+    own scalar convention on every ACD-decoded tag, so there is no
+    None-vs-0 ambiguity to guard against for this field.
+    """
+    # .get() with no default -- unlike new_member()'s "NullType" fallback --
+    # returns None for a non-primitive (UDT/AOI) data_type, which is what a
+    # real UDT-typed Tag.radix already is (see TagBuilder.build()).
+    radix = _PRIMITIVE_RADIX.get(data_type.upper())
+    return Tag(
+        name, name, "Base", data_type, radix, external_access, None, dimensions,
+        _comments=[("", description)] if description else [],
+        _initial_value=value,
+    )
+
+
 @dataclass
 class DataType(L5xElement):
     name: str
@@ -578,6 +622,62 @@ def _zero_value_for_member(member: "Member", data_types_map: Dict[str, "DataType
     if member.dimension and member.dimension > 0:
         return [_scalar_zero() for _ in range(member.dimension)]
     return _scalar_zero()
+
+
+def _validate_tag_types_resolve(tags: List["Tag"], data_types_map: Dict[str, "DataType"]) -> None:
+    """Verify every struct-typed name reachable from `tags`' own DataType
+    trees resolves to a real entry in `data_types_map` -- a primitive, a
+    string-family type, a built-in Logix struct (TIMER/COUNTER/CONTROL/...,
+    see `_BUILTIN_STRUCT_MEMBERS`/`_SKIP_DECORATED`), or a project UDT/AOI
+    actually present in the map. Opt-in self-consistency check
+    (`export_routine(..., validate=True)`), meant to run BEFORE any XML is
+    written.
+
+    Exists because an unresolved type never raises on its own: it silently
+    falls into `_zero_value_for_member()`'s (and the equivalent live-value
+    rendering paths') "unknown type -- a harmless scalar zero beats
+    crashing" branch, producing a `<Tag>` whose declared member count and
+    rendered value shape quietly disagree -- the exact bug class that was
+    previously only ever caught by an actual Studio 5000 import rejecting
+    the file (see CLAUDE.md "Mutating a UDT with live tag instances...",
+    the `Tag._data_types_map` staleness bug). This walks the same
+    member-type graph that rendering does, but eagerly, with a clear error
+    naming the tag/member/type responsible, instead of waiting for that
+    silent fallback to produce a wrong file.
+
+    Raises ValueError on the first unresolved type found.
+    """
+    seen: set = set()
+
+    def _check(dt_name: str, context: str) -> None:
+        key = dt_name.upper()
+        if (
+            key in _PRIMITIVE_DECORATED_ZERO
+            or key in _BUILTIN_STRUCT_MEMBERS
+            or key in _SKIP_DECORATED
+            or key in seen
+            or _is_string_family_type(dt_name, data_types_map)
+        ):
+            return
+        dt_obj = data_types_map.get(key)
+        if dt_obj is None:
+            raise ValueError(
+                f"{context}: type {dt_name!r} does not resolve to a known "
+                "primitive, string-family type, built-in Logix struct, or an "
+                "entry in data_types_map -- most likely a stale/incomplete "
+                "data_types_map (see _sync_data_types_map()) rather than a "
+                "genuinely unknown type. Exporting anyway would silently "
+                "render this member as a bare zero instead of its real "
+                "nested structure."
+            )
+        seen.add(key)
+        for member in dt_obj.members:
+            if member.data_type:
+                _check(member.data_type, f"{context}.{member.name}")
+
+    for tag in tags:
+        if tag.data_type:
+            _check(tag.data_type, f"Tag {tag.name!r}")
 
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
@@ -2952,14 +3052,24 @@ class DataTypeBuilder(L5xElementBuilder):
             # `_dead_member_bytes` is kept purely as a diagnostic (logged
             # below) that this type has an orphaned/deleted member; it is no
             # longer used in any byte-offset or size computation.
+            # Both of these are self-healing confirmations, not problems --
+            # the deleted/orphaned member data was already correctly excluded
+            # by the filtering above. Deliberately INFO, not WARNING: they
+            # fire deterministically, once per affected UDT, on every single
+            # load of a project with any historically-deleted UDT member,
+            # which is common enough in real long-lived projects that a
+            # downstream caller piping WARNING-and-above through a filter to
+            # find *actionable* signal (e.g. "Unrecognized connection type
+            # code..." below) had to grep these out by hand every time --
+            # flagged as pure noise by a real downstream agent session.
             if name_to_child:
-                log.warning(
+                log.info(
                     f"DataType {name!r}: {len(name_to_child)} deleted member(s) "
                     f"with no type descriptor found ({sorted(name_to_child)}) -- "
                     "diagnostic only, no byte-offset correction is applied for this."
                 )
             if deleted_child_names:
-                log.warning(
+                log.info(
                     f"DataType {name!r}: {len(deleted_child_names)} member-collection "
                     f"child row(s) marked deleted (record_type=512) filtered out "
                     f"({sorted(deleted_child_names)}) -- a stale extended-record "

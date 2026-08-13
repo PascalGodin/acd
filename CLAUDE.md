@@ -649,6 +649,72 @@ the rung is still lost to this library the same as before — `RegnLink.Dat` is 
 a guarantee. If a rung count still looks short after this fix, that's the remaining possibility
 worth knowing about, not a sign this fix is incomplete.
 
+## Second convenience-API batch: `new_tag()`, `diff_lines()`, `validate=True`, log-level split
+
+A second round of downstream-agent friction feedback (same style as the batch below, reflecting
+on real friction points from a session rather than hypotheticals), addressed in one pass:
+
+- **Log noise.** `DataType 'X': N deleted member(s) with no type descriptor found...` and
+  `DataType 'X': N member-collection child row(s) marked deleted... correctly ignored` (see
+  "Phantom UDT members" above) are self-healing confirmations, not problems — they fired at
+  WARNING on every load of any project with a historically-deleted UDT member (common in real
+  long-lived projects), forcing a downstream caller to `grep -v` them out by hand to find
+  genuinely actionable signal (e.g. the connection-type-code fallback warning, which explicitly
+  asks the user to report it). Downgraded both to `log.info()` — the WARNING-and-above quiet-mode
+  filter now suppresses them for free, no new parameter needed. The `member_count` mismatch
+  diagnostic ("possible remaining stale/phantom member data; investigate") stays at WARNING since
+  it's explicitly framed as something to check, not a confirmed non-issue.
+- **`load_acd()`/`ExportL5x`'s `verbose` default flipped from `True` to `False`**, per direct
+  follow-up feedback in the same conversation ("I feel like verbose=false should be the default"):
+  previously a caller had to know to pass `verbose=False` to get quiet output; now `load_acd(path)`
+  alone is quiet (WARNING and above only) and `verbose=True` opts INTO the ~15-20 lines of
+  INFO/DEBUG progress output. Matches this library's primary audience (AI agents operating under a
+  token budget) defaulting to the token-cheap behavior rather than requiring every caller to
+  discover and pass the flag themselves. `ExportL5x.verbose` (the field `load_acd()` itself
+  forwards to) flipped the same way, so the lower-level entry point (`ImportProjectFromFile`, the
+  `export_l5x.py` CLI) is quiet by default too, not just `load_acd()`. This is a real, if narrow,
+  behavior change for any existing caller relying on the old loud-by-default behavior without
+  passing `verbose=` explicitly — flagged here rather than treated as a pure no-risk addition like
+  the rest of this batch.
+- **`new_tag(name, data_type, dimensions=None, description=None, value=None,
+  external_access="Read/Write")`** (`acd/l5x/elements.py`), mirroring `new_member()`: a downstream
+  agent had hand-rolled `Tag(_name=..., name=..., tag_type="Base", ...)` positional construction
+  "probably a dozen times" in one session — the same class of easy-to-misuse-by-hand risk
+  `new_member()` was already hardened against. `radix` has no override parameter (unlike
+  `new_member()`) since a tag's Radix is never an independent choice from its type; derived from
+  `_PRIMITIVE_RADIX`, `None` for a UDT-typed tag (matching every ACD-decoded struct-typed `Tag`,
+  which carries no Radix attribute — confirmed via `TagBuilder.build()`). Note (flagged by the
+  same feedback, documented rather than "fixed" since both conventions are already correct and
+  relied upon elsewhere): `Tag.dimensions` already uses `None` as its own scalar convention
+  (unlike `Member.dimension`, which needs `0`, not `None` — see `new_member()`'s own
+  `dimension=None` guard above) — `new_tag()` needs no equivalent guard because `Tag.dimensions`'s
+  `None`-means-scalar convention was already correct on every ACD-decoded `Tag`.
+- **`diff_lines(old, new)`** (`acd/api.py`): the `difflib.SequenceMatcher` alignment primitive
+  `diff_routine()` already used internally, extracted and exposed directly for when a caller
+  already has two plain line lists (verifying their OWN in-memory edit to `.rungs`/`._st_lines`
+  before calling `export_routine()`) rather than two full `Routine` objects — a downstream agent
+  had hand-rolled the same ~20-30 line `SequenceMatcher` boilerplate three separate times in one
+  session for exactly this. `diff_routine()` refactored to call it rather than duplicate the logic.
+- **`export_routine(..., validate=True)`** (opt-in, default `False`): recursively verifies every
+  struct-typed name reachable from a referenced tag's own `DataType` tree resolves in
+  `data_types_map` (a primitive, string-family type, built-in Logix struct, or a real project
+  UDT/AOI) before any XML is written, raising `ValueError` naming the specific tag/member/type
+  responsible. This is the eager version of the exact check that was missing when the
+  `Tag._data_types_map` staleness bug (see "Mutating a UDT with live tag instances..." below) was
+  silently producing a wrong-shaped `<Tag>` — an unresolved type never raised on its own before,
+  it just fell into `_zero_value_for_member()`'s "harmless scalar zero" fallback, and the *only*
+  way that was ever caught was a real Studio 5000 import rejecting the file. `validate=True` moves
+  that same check to before-export time, at the cost of one extra pass over the referenced-type
+  graph — off by default so no existing caller's behavior changes.
+
+None of these four are re-verified against a live Studio 5000 import in this round (unlike
+`insert_rung()`/`export_datatype()`/the region-map fixes above) — `new_tag()`/`diff_lines()` are
+pure Python-side conveniences with no new XML shape, and `validate=True` only ever runs *before*
+XML is written (it either raises or is a no-op on the exact same file `validate=False` already
+produces), so there was nothing new to import-test. Covered by unit tests in
+`test/test_api.py`/`test/test_elements_helpers.py` (`test_new_tag_*`, `test_diff_lines_*`,
+`test_validate_tag_types_resolve_*`, `test_export_routine_validate_raises_on_unresolved_type`).
+
 ## Lookup/editing convenience API — `insert_rung()` verified end-to-end in real Studio 5000
 
 Added `get_routine()`, `tag_exists()`, `find_tag_references()`, `replace_rung_safe()`, and

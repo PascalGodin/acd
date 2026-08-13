@@ -38,10 +38,12 @@ pip install acd-tools
 
 `load_acd()` extracts the ACD into a temporary directory (system temp, auto-deleted when the call
 returns — see "Low-level access via ExportL5x" below if you want the extracted files left on disk).
-Every load logs ~15-20 lines of INFO/DEBUG progress output by default (via `loguru`) — pass
-`verbose=False` to drop those and keep only WARNING and above (real data-quality signals, e.g.
-stale/deleted records or a value that had to be guessed — see `CLAUDE.md` — which are never
-suppressed):
+`load_acd()` is quiet by default (via `loguru`) — only WARNING and above comes through: actionable
+data-quality signals (e.g. an unrecognized connection-type code, a Region Map format fallback)
+that are worth seeing even in quiet mode. Purely diagnostic, self-healing confirmations (e.g. a
+deleted UDT member that was already correctly filtered out) log at INFO, so they stay suppressed
+too — see `CLAUDE.md` for the full list of what logs where. Pass `verbose=True` if you want the
+~15-20 lines of INFO/DEBUG progress output every load produces (e.g. while debugging a load).
 
 ```python
 from acd.api import load_acd
@@ -256,7 +258,7 @@ A few small helpers exist specifically to avoid hand-rolled patterns that are ea
 wrong — reach for these instead of writing your own version:
 
 ```python
-from acd import get_routine, tag_exists, find_tag_references, replace_rung_safe
+from acd import get_routine, tag_exists, find_tag_references, replace_rung_safe, new_tag, diff_lines
 
 # Instead of the nested program -> routine double-lookup. A routine name is only
 # unique WITHIN a program (many projects have a "Main" in several programs) --
@@ -279,6 +281,18 @@ for program_name, routine_name, idx, text in find_tag_references(project, "Lift_
 # raises with a readable diff (not a bare AssertionError) if it changed
 # since then (e.g. hand-edited in Studio in the meantime).
 replace_rung_safe(routine, 0, expected_old="NOP();", new_text="XIC(MySensor)OTE(MyOutput);")
+
+# Construct a new controller-/program-scope Tag to append to .tags, instead of
+# hand-rolling Tag(_name=..., name=..., tag_type="Base", ...) positional
+# construction (an easy field-order mistake) every time.
+new = new_tag("Current_Origin", "DINT", value=0, description="Added via acd-tools")
+project.controller.tags.append(new)
+
+# Verify your OWN in-memory edit to routine.rungs/._st_lines did what you
+# expected before exporting -- e.g. assert an edit was insert-only. Aligns
+# with difflib the same way diff_routine() does, just for two plain line
+# lists instead of two Routine objects.
+assert all(c["op"] == "insert" for c in diff_lines(old_rungs, routine.rungs))
 ```
 
 Inserting or deleting a rung means shifting every `_rung_comments` key at/after that index to
@@ -350,6 +364,17 @@ on whether the tag name already exists in the project, so no special-casing is n
 See `export_routine()`'s own docstring and `CLAUDE.md`'s "Native-import escape hatches" section for
 the full mechanism, verified dependency-closure behavior (UDTs, AOIs, Modules, JSR-called
 routines), and known limitations.
+
+**`export_routine(..., validate=True)`** checks, before writing any XML, that every struct-typed
+name reachable from a referenced tag's own DataType tree actually resolves — catches (with a clear
+error naming the tag/member/type) the class of bug where mutating a UDT's members and exporting a
+routine referencing an existing instance of it, in the same session, silently renders a member as
+a bare zero instead of its real nested structure (previously only ever caught by a Studio 5000
+import rejection). Off by default; it's an extra pass over the whole referenced-type graph.
+
+```python
+export_routine(project, routine, "MyRoutine.L5X", validate=True)
+```
 
 ---
 

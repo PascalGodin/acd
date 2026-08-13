@@ -26,6 +26,12 @@ by aligning content with `difflib`, not by index:
   - `diff_routine(routine_a, routine_b)` -- already have two specific
     Routine objects (e.g. "the same" routine fetched from two projects) and
     just want that one routine's diff, without a whole-project scan.
+  - `diff_lines(old, new)` -- already have two plain line lists (e.g.
+    verifying your OWN in-memory edit to `.rungs`/`._st_lines` before
+    calling `export_routine()`, not comparing two loaded Routine objects) --
+    the same alignment primitive `diff_routine()` uses internally, exposed
+    directly so you don't need two full Routine objects just to check what
+    an edit actually did.
   - `diff_io_addresses(project_a, project_b)` -- ONLY when the request is
     specifically about I/O address wiring (e.g. "what I/O addresses
     changed?"); it reports nothing about tag values or rung logic changes,
@@ -72,10 +78,20 @@ wrong (see README.md for full examples):
     -- e.g. to check whether a name is already used before reusing it.
   - `tag_exists(project, name, program_name=None)` -- pre-creation
     collision check in a given scope (controller by default).
+  - `new_tag(name, data_type, dimensions=None, description=None, value=None)`
+    -- construct a new controller-/program-scope `Tag` to append to
+    `.tags`, instead of hand-rolling `Tag(_name=..., name=..., tag_type=
+    "Base", ...)` positional construction from scratch every time.
+  - `export_routine(..., validate=True)` -- before writing the file, verify
+    every struct-typed name reachable from a referenced tag's own DataType
+    tree actually resolves, raising with the specific tag/member/type
+    instead of silently rendering a bare zero where a nested structure
+    belongs (the class of bug that otherwise only surfaces as a Studio 5000
+    import rejection, or worse, a silent wrong value). Off by default.
 
-`load_acd(path, verbose=False)` drops the ~15-20 lines of INFO/DEBUG
-progress output every load produces by default (WARNING and above --
-real data-quality signals -- are always kept regardless).
+`load_acd()` is quiet by default (WARNING and above -- real data-quality
+signals -- are always kept regardless); pass `verbose=True` to also see the
+~15-20 lines of INFO/DEBUG progress output every load produces.
 """
 
 from acd.api import (  # noqa: F401
@@ -84,6 +100,7 @@ from acd.api import (  # noqa: F401
     patch_rungs,
     export_routine,
     export_datatype,
+    diff_lines,
     find_io_addresses,
     find_tag_references,
     get_routine,
@@ -94,4 +111,4 @@ from acd.api import (  # noqa: F401
     replace_rung_safe,
     tag_exists,
 )
-from acd.l5x.elements import new_member  # noqa: F401
+from acd.l5x.elements import new_member, new_tag  # noqa: F401

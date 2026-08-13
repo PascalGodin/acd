@@ -4,10 +4,13 @@ import struct
 from datetime import datetime
 from xml.dom import minidom
 
+import pytest
+
 from acd.l5x.elements import (
     DataType,
     DataTypeBuilder,
     Member,
+    Tag,
     _apply_dead_member_byte_corrections,
     _decode_single_udt_element,
     _decode_string_family_value,
@@ -21,6 +24,7 @@ from acd.l5x.elements import (
     _read_tag_initial_value,
     _resolve_bit_target,
     _udt_scalar_to_xml,
+    _validate_tag_types_resolve,
     _zero_value_for_member,
 )
 
@@ -363,6 +367,51 @@ def test_zero_value_for_member_nested_struct():
     inner_dt = DataType("Inner", "Inner", "NoFamily", "User", [_member("Val", "DINT")])
     data_types_map = {"INNER": inner_dt}
     assert _zero_value_for_member(_member("Nested", "Inner"), data_types_map) == {"Val": 0}
+
+
+def test_validate_tag_types_resolve_raises_on_unresolved_type():
+    # This is the exact failure signature the stale-Tag._data_types_map bug
+    # (see CLAUDE.md "Mutating a UDT with live tag instances...") produced
+    # silently: a struct-typed tag whose type name isn't in data_types_map
+    # at all used to fall through to _zero_value_for_member's "harmless
+    # scalar zero" fallback with no error anywhere. validate=True should
+    # catch this eagerly instead.
+    tag = Tag("MyTag", "MyTag", "Base", "NotARealType", None, "Read/Write", None, None)
+    with pytest.raises(ValueError, match="NotARealType"):
+        _validate_tag_types_resolve([tag], {})
+
+
+def test_validate_tag_types_resolve_passes_when_type_resolves():
+    inner_dt = DataType("Inner", "Inner", "NoFamily", "User", [_member("Val", "DINT")])
+    tag = Tag("MyTag", "MyTag", "Base", "Inner", None, "Read/Write", None, None)
+    _validate_tag_types_resolve([tag], {"INNER": inner_dt})  # must not raise
+
+
+def test_validate_tag_types_resolve_raises_on_nested_unresolved_member():
+    # The unresolved type doesn't have to be the tag's own top-level type --
+    # a member several levels deep referencing an unresolved type must be
+    # caught too, with the nested member path named in the error.
+    inner_dt = DataType(
+        "Outer", "Outer", "NoFamily", "User",
+        [_member("Bad", "AlsoNotReal")],
+    )
+    tag = Tag("MyTag", "MyTag", "Base", "Outer", None, "Read/Write", None, None)
+    with pytest.raises(ValueError, match="AlsoNotReal"):
+        _validate_tag_types_resolve([tag], {"OUTER": inner_dt})
+
+
+def test_validate_tag_types_resolve_allows_builtin_struct_types():
+    # TIMER/COUNTER/CONTROL are real, legitimate struct types that are
+    # deliberately NOT in data_types_map (they're built into Logix, not
+    # user DataTypes) -- these must never be flagged as unresolved.
+    for builtin in ("TIMER", "COUNTER", "CONTROL"):
+        tag = Tag("MyTag", "MyTag", "Base", builtin, None, "Read/Write", None, None)
+        _validate_tag_types_resolve([tag], {})  # must not raise
+
+
+def test_validate_tag_types_resolve_allows_string_family_types():
+    tag = Tag("MyTag", "MyTag", "Base", "STRING", None, "Read/Write", None, None)
+    _validate_tag_types_resolve([tag], {})  # must not raise
 
 
 def test_l5k_udt_literal_zero_fills_scalar_member_missing_from_decoded_value():

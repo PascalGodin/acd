@@ -32,13 +32,14 @@ from acd.l5x.elements import (
     Routine,
     _escape_xml_attr,
     _multiline_xml_text,
+    _validate_tag_types_resolve,
     new_member,
 )
 
 
 # Clean top-level API
 
-def load_acd(path, temp_dir: str = None, verbose: bool = True) -> RSLogix5000Content:
+def load_acd(path, temp_dir: str = None, verbose: bool = False) -> RSLogix5000Content:
     """Load an ACD file into a Python object model.
 
     Args:
@@ -60,14 +61,15 @@ def load_acd(path, temp_dir: str = None, verbose: bool = True) -> RSLogix5000Con
             points intentionally behave differently (`load_acd()` favors a
             clean one-shot load; `ExportL5x` favors leaving artifacts
             around for a debugging/exploration session).
-        verbose: Set False to drop the ~15-20 lines of INFO/DEBUG progress
+        verbose: Set True to include the ~15-20 lines of INFO/DEBUG progress
             output ("Getting records from ACD Comps file...", etc.) every
-            load produces. WARNING and above (real data-quality signals --
-            stale/deleted records, unrecognized codes falling back to a
-            guess, recovered data -- see CLAUDE.md) are always kept. Note
-            this reconfigures loguru's process-wide default sink, not just
-            this one call -- see `ExportL5x.__post_init__` if you need
-            finer control.
+            load produces -- False (the default) drops them. WARNING and
+            above (real data-quality signals -- stale/deleted records,
+            unrecognized codes falling back to a guess, recovered data --
+            see CLAUDE.md) are always kept either way. Note this
+            reconfigures loguru's process-wide default sink, not just this
+            one call -- see `ExportL5x.__post_init__` if you need finer
+            control.
 
     Returns:
         RSLogix5000Content with a fully populated controller object tree.
@@ -443,6 +445,36 @@ def replace_rung_safe(routine: Routine, index: int, expected_old: str, new_text:
     routine.rungs[index] = new_text
 
 
+def diff_lines(old: List[str], new: List[str]) -> List[dict]:
+    """Align two plain line lists with difflib.SequenceMatcher and return
+    structured opcodes -- the same alignment primitive diff_routine() uses
+    internally, exposed directly for when you already have two line lists
+    in hand (e.g. verifying your own in-memory edit to `routine.rungs` or
+    `routine._st_lines` before calling export_routine(), rather than
+    comparing two separately-loaded Routine objects).
+
+    Do NOT hand-roll `for i, (a, b) in enumerate(zip(old, new)): ...` (or
+    equivalent) to check "did my edit do what I expected" -- a single
+    inserted/deleted line anywhere before the end shifts every later
+    line's index, making an otherwise-untouched tail look like a wall of
+    unrelated changes. This is exactly diff_routine()'s own rationale,
+    just for two plain lists instead of two Routine objects.
+
+    Returns a list of {"op": "replace"/"delete"/"insert", "old": [...],
+    "new": [...]} blocks, in order, empty if `old == new` -- e.g. to assert
+    an edit was insert-only: `assert all(c["op"] == "insert" for c in
+    diff_lines(old, new))`.
+    """
+    if old == new:
+        return []
+    matcher = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
+    return [
+        {"op": tag, "old": old[i1:i2], "new": new[j1:j2]}
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != "equal"
+    ]
+
+
 def diff_routine(routine_a: Routine, routine_b: Routine) -> dict:
     """Compare two Routine objects directly -- e.g. "the same" routine
     fetched from two different projects/saves, when you already have both
@@ -467,15 +499,8 @@ def diff_routine(routine_a: Routine, routine_b: Routine) -> dict:
     lines are identical.
     """
     lines_a, lines_b = _routine_lines(routine_a) or [], _routine_lines(routine_b) or []
-    if lines_a == lines_b:
-        return {"status": "unchanged", "changes": []}
-    changes = []
-    matcher = difflib.SequenceMatcher(a=lines_a, b=lines_b, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        changes.append({"op": tag, "old": lines_a[i1:i2], "new": lines_b[j1:j2]})
-    return {"status": "changed", "changes": changes}
+    changes = diff_lines(lines_a, lines_b)
+    return {"status": "changed" if changes else "unchanged", "changes": changes}
 
 
 def _diff_routines(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -> dict:
@@ -857,7 +882,8 @@ def _resolve_type_closure(initial_type_names: set, project: RSLogix5000Content):
     return data_types, aois
 
 
-def export_routine(project: RSLogix5000Content, routine: Routine, output_path, owner: str = None) -> None:
+def export_routine(project: RSLogix5000Content, routine: Routine, output_path, owner: str = None,
+                    validate: bool = False) -> None:
     """Export a single routine as a standalone, partial L5X file.
 
     Unlike ConvertAcdToL5x (which serialises the whole project), this is
@@ -940,9 +966,22 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
             license owner, e.g. "MyCompany, MyCompany" -- a real export
             included this attribute, but it's not clear whether Studio 5000
             requires it to import; omitted entirely if not supplied).
+        validate: If True, verify every struct-typed name reachable from a
+            referenced tag's own DataType tree actually resolves (see
+            `_validate_tag_types_resolve()`) before writing any XML, raising
+            ValueError with the specific tag/member/type responsible instead
+            of silently rendering a bare zero in its place. Catches the
+            "mutate an existing UDT with live tag instances, then export a
+            routine referencing one in the same session" class of bug (see
+            CLAUDE.md) at the point of the mistake rather than at the next
+            Studio 5000 import attempt. Off by default (matches every
+            existing caller's behavior unchanged) since it's an extra pass
+            over the whole referenced-type graph on every call.
 
     Raises:
-        ValueError: if `routine` isn't found in any program of `project`.
+        ValueError: if `routine` isn't found in any program of `project`, or
+            (with `validate=True`) if a referenced tag's DataType tree
+            contains an unresolved type name.
 
     Example (RLL):
         project = load_acd("MyController.ACD")
@@ -1145,6 +1184,9 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         f'</Controller>\n'
         f'</RSLogix5000Content>\n'
     )
+
+    if validate:
+        _validate_tag_types_resolve(controller_tags + program_tags, project.controller._data_types_map)
 
     Path(output_path).write_text(xml, encoding="utf-8")
 

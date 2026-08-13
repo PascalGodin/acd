@@ -146,7 +146,7 @@ class ExportL5x:
     _temp_dir: str = ""
     _controller: Union[Controller, None] = None
     _project: Union[RSLogix5000Content, None] = None
-    verbose: bool = True
+    verbose: bool = False
 
     def __post_init__(self):
         if not self.verbose:
@@ -158,12 +158,16 @@ class ExportL5x:
             # this library already had to do themselves (the only previously
             # *possible*, but undocumented, way to quiet the ~15-20 lines of
             # INFO/DEBUG progress output every load_acd() call produces) --
-            # exposed here as a documented parameter instead. WARNING and
-            # above are always kept: this library relies on log.warning() to
-            # surface real data-quality concerns (stale/deleted records,
-            # unrecognized codes falling back to a guess, recovered data,
-            # etc. -- see CLAUDE.md), which should never be silent even in
-            # quiet mode.
+            # exposed here as a documented parameter instead, and now the
+            # DEFAULT (flipped from an opt-in `verbose=False` to an opt-in
+            # `verbose=True`, per direct feedback: a library whose primary
+            # audience is AI agents operating under a token budget should be
+            # quiet unless asked otherwise, not loud unless asked otherwise).
+            # WARNING and above are always kept: this library relies on
+            # log.warning() to surface real data-quality concerns (stale/
+            # deleted records, unrecognized codes falling back to a guess,
+            # recovered data, etc. -- see CLAUDE.md), which should never be
+            # silent even in quiet mode.
             log.remove()
             log.add(sys.stderr, level="WARNING")
         if not self._temp_dir:

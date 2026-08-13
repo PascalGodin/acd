@@ -4,135 +4,174 @@ export, and no manual/raw parsing of the file needed or possible (it is a
 zip-like container of several undocumented binary databases, not plain
 text or a documented format).
 
-    from acd import load_acd
-    project = load_acd("MyController.ACD")
-    project.controller.name                    # controller name
-    project.controller.tags                    # controller-scope tags
-    for program in project.controller.programs:
-        for routine in program.routines:        # NOT project.routines
-            routine.rungs                        # list[str], plain ladder text
+THE API IS THE `db_*` FUNCTIONS BELOW. Every one takes `acd_path` directly,
+does exactly one thing against a real, persistent SQLite file next to the
+ACD, and returns -- there is no `load_acd()`/`project` object to hold onto
+here, and no separate "save" step. An edit is durable the moment the call
+returns, visible to every later `db_*` call against that same `acd_path`
+(from this or a different process), until the DB is rebuilt from the real
+`.ACD` (a new Studio 5000 save, detected automatically via the source
+file's mtime, or an explicit `rebuild=True`).
+
+    import acd
+    acd.db_get_project_summary("MyController.ACD")   # names/counts overview
+    acd.db_list_routines("MyController.ACD")           # routine names/types, no content
+    acd.db_get_routine("MyController.ACD", "MyRoutine") # one routine's actual rungs
+    acd.db_new_tag("MyController.ACD", "MyTag", "DINT", value=42)
+    acd.db_insert_rung("MyController.ACD", "MyRoutine", 0, "XIC(Always_Off)OTE(MyTag);")
+    acd.db_export_routine("MyController.ACD", "MyRoutine", "out.L5X")
+
+WHY THIS SHAPE, NOT AN IN-MEMORY `project` OBJECT -- raw write-back to a
+real `.ACD` is blocked (Studio 5000 enforces a `FileInfo.Dat` checksum on
+open that this library cannot re-sign without a key it doesn't have), so
+the only durable edit path is a partial L5X import via Studio's own native
+"Import Routine"/"Import Data Type..." feature (`db_export_routine()`/
+`db_export_datatype()` below). That means a typical workflow is several
+separate script invocations against the same ACD (make an edit, export,
+have the edit imported into Studio, maybe make another edit later) --
+an in-memory `project` object from a hypothetical `load_acd()` call would
+only live as long as one script's process, so a tag created in one script
+would silently vanish by the next script's fresh load, with no error, just
+a quietly incomplete export. Every `db_*` function instead reads and
+writes a real file, so state survives across process boundaries the same
+way editing an offline Studio 5000 project does. See CLAUDE.md's
+"Persistent project DB" section for the full mechanism (locking, rebuild
+triggers, what's and isn't covered) if you're modifying this library
+itself rather than just calling it.
+
+READS -- prefer these over asking for more than you need; each has a
+"names/counts only" step and a separate "fetch this ONE thing in full"
+step, so a call never returns more than actually asked for:
+  - `db_get_project_summary(acd_path)` -- names/counts only (programs,
+    tasks, data types, AOIs, modules, tag counts, routine count). Call
+    this FIRST, before drilling into anything specific.
+  - `db_list_routines(acd_path, program_name=None)` -- name/type/line-count
+    for every routine, no rung/line content -- then `db_get_routine()` for
+    one routine's actual logic.
+  - `db_get_routine(acd_path, routine_name, program_name=None)` -- one
+    routine's current rungs/comments (or ST lines) plus its description.
+    A routine name is only unique WITHIN a program (many projects have a
+    "Main" in several programs) -- raises `ValueError` if ambiguous and no
+    `program_name` was given, rather than silently picking one.
+  - `db_list_tags(acd_path, program_name=None)` -- name/data_type/
+    dimensions/description for tags in one scope, WITHOUT the decoded
+    value (can be large on its own for a UDT array tag) -- then
+    `db_get_tag_value()` for one tag's value, only when actually needed.
+  - `db_get_tag_value(acd_path, tag_name, program_name=None, offset=0,
+    limit=50)` -- one tag's value, paginated if it's a large array.
+  - `db_tag_exists(acd_path, name, program_name=None)` -- pre-creation
+    collision check in a given scope (controller by default).
+  - `db_find_tag_references(acd_path, name, regex=False)` -- every
+    (program, routine, line_index, text) where a tag/member name is
+    referenced, project-wide -- e.g. to check whether a name is already
+    used before reusing it.
+  - `db_io_addresses_by_routine(acd_path)` -- every routine's I/O
+    addresses, without hand-rolling a regex over rung text (easy to
+    mis-tokenize -- `"Remote_Rack1:3:I.Pt13.Data"`, `"IO024:I.Data[0].13"`).
+
+EDITS -- durable the moment the call returns (see above), each raising
+`KeyError` for an unknown name/scope:
+  - `db_new_tag(acd_path, name, data_type, program_name=None,
+    dimensions=None, description=None, value=None,
+    external_access="Read/Write")`
+  - `db_edit_tag(acd_path, name, program_name=None, description=None,
+    value=None)` -- only the fields actually passed are changed.
+  - `db_set_tag_comment(acd_path, name, path, text, program_name=None)`
+    -- `path=""` is the tag's own whole-tag description.
+  - `db_new_member(acd_path, data_type_name, name, member_data_type,
+    dimension=0, radix=None, description=None, index=None)` -- add a
+    member to an EXISTING UDT, at `index` (default: appended).
+  - `db_insert_rung(acd_path, routine_name, index, text, comment=None,
+    program_name=None)` / `db_delete_rung(acd_path, routine_name, index,
+    program_name=None)`
+  - `db_replace_rung_safe(acd_path, routine_name, index, expected_old,
+    new_text, program_name=None)` -- edit an EXISTING rung's text, but
+    only if it still matches `expected_old` (raises with a readable diff
+    otherwise) -- guards against clobbering a rung someone hand-edited in
+    Studio since your last read.
+
+EXPORTING TO REAL STUDIO 5000 -- the only durable write path (see above):
+  - `db_export_routine(acd_path, routine_name, output_path,
+    program_name=None, owner=None, validate=False)` -- a standalone
+    partial L5X for Studio's "Import Routine" feature, covering both rung
+    edits and any tag this routine's logic references. `validate=True`
+    verifies every struct-typed name reachable from a referenced tag's own
+    DataType tree actually resolves before writing, instead of silently
+    rendering a bare zero where a nested structure belongs.
+  - `db_export_datatype(acd_path, data_type_name, output_path,
+    owner=None)` -- a standalone partial L5X for Studio's "Import Data
+    Type..." feature, for creating/modifying a UDT (e.g. inserting a
+    member via `db_new_member()` first).
 
 COMPARING TWO PROJECTS/SAVES/ROUTINES -- READ THIS BEFORE WRITING YOUR OWN
-COMPARISON CODE. Do NOT manually zip/print two routines' `.rungs` (or
-`._st_lines`) side by side by index and eyeball the difference: a single
-rung inserted, deleted, or reordered anywhere in one routine shifts every
-later rung's index, so an otherwise byte-identical tail will look completely
-different in a naive index-paired printout even though nothing there
+COMPARISON CODE. Do NOT fetch two routines via `db_get_routine()` and
+zip/print their `"rungs"` lists side by side by index: a single rung
+inserted, deleted, or reordered anywhere in one routine shifts every later
+rung's index, so an otherwise identical tail will look completely
+different in a naive index-paired comparison even though nothing there
 actually changed. Use one of these instead -- all three already solve this
 by aligning content with `difflib`, not by index:
-  - `diff_project(project_a, project_b)` -- GENERIC "what changed between
-    these two ACDs?" (routines, tags, data types, modules, AOIs). Use this
-    by default for a broad comparison.
-  - `diff_routine(routine_a, routine_b)` -- already have two specific
-    Routine objects (e.g. "the same" routine fetched from two projects) and
-    just want that one routine's diff, without a whole-project scan.
-  - `diff_lines(old, new)` -- already have two plain line lists (e.g.
-    verifying your OWN in-memory edit to `.rungs`/`._st_lines` before
-    calling `export_routine()`, not comparing two loaded Routine objects) --
-    the same alignment primitive `diff_routine()` uses internally, exposed
-    directly so you don't need two full Routine objects just to check what
-    an edit actually did.
-  - `diff_io_addresses(project_a, project_b)` -- ONLY when the request is
-    specifically about I/O address wiring (e.g. "what I/O addresses
-    changed?"); it reports nothing about tag values or rung logic changes,
-    so it is the wrong default for a broad comparison.
-All three also avoid a hand-rolled regex over rung text for I/O addresses
-(`"Remote_Rack1:3:I.Pt13.Data"`, `"IO024:I.Data[0].13"` are easy to
-mis-tokenize) -- see `find_io_addresses()`/`io_addresses_by_routine()` if you
-need the raw address list rather than a diff.
+  - `db_diff_project(acd_path_a, acd_path_b)` -- GENERIC "what changed
+    between these two ACDs?" (routines, tags, data types, modules, AOIs).
+    Use this by default for a broad comparison.
+  - `db_diff_routine(acd_path_a, routine_name_a, acd_path_b,
+    routine_name_b, program_name_a=None, program_name_b=None)` -- already
+    know which two routines you want compared (by name, possibly the same
+    project before/after an edit) and just want that one routine's diff,
+    without a whole-project scan.
+  - `db_diff_io_addresses(acd_path_a, acd_path_b)` -- ONLY when the
+    request is specifically about I/O address wiring; it reports nothing
+    about tag values or rung logic changes, so it is the wrong default for
+    a broad comparison.
 
-See `acd.api` for the full public API (`load_acd`, `save_acd`,
-`patch_rungs`, `export_routine`, `ConvertAcdToL5x`, ...) -- each function
-and the returned object's own classes (`RSLogix5000Content`, `Controller`,
-`Program`, `Routine`, `Tag`, ... in `acd.l5x.elements`) have docstrings
-with concrete attribute paths; check those with `help()` before guessing
-at the object shape. See this package's README.md for full usage examples,
-and CLAUDE.md for internals/gotchas if modifying this library itself.
+Two pure, no-DB-involved utilities, usable directly on text/lists you
+already have in hand (e.g. from `db_get_routine()`'s own `"rungs"`):
+  - `find_io_addresses(text)` -- every I/O-style address in one line of
+    rung/ST text.
+  - `diff_lines(old, new)` -- the same `difflib`-based alignment the diff
+    functions above use internally, for when you already have two plain
+    line lists rather than two routines.
 
-Writing changes back to a real `.ACD` that Studio 5000 will open: prefer
-`export_routine()` (a partial L5X imported via Studio's own "Import
-Routine" feature) for rungs/tags, or `export_datatype()` (imported via
-Studio's own "Import Data Type..." feature) for creating/modifying a UDT
--- e.g. inserting a new member -- over `save_acd()`/`patch_rungs()`.
-Studio enforces a `FileInfo.Dat` checksum on open that this library
-cannot re-sign without a key it does not have, so `save_acd()` only
-produces an openable file for a completely unmodified round-trip.
-
-LAZY / SUMMARY-FIRST LOOKUPS -- for a caller operating under a context
-budget (e.g. an MCP tool response), prefer these over walking
-`project.controller...` yourself and returning everything you find. Each
-has a "list names/counts only" step and a separate "fetch this ONE thing
-in full" step, so a caller never gets more than it actually asked for:
-  - `get_project_summary(project)` -- names/counts only (programs, tasks, data
-    types, AOIs, modules, tag counts, routine count) for an initial "what's
-    in this project" response, before drilling into anything specific.
-  - `list_routines(project, program_name=None)` -- name/type/line-count for
-    every routine, no rung/line content -- then `get_routine()` for one
-    routine's actual logic.
-  - `list_tags(project, program_name=None)` -- name/data_type/dimensions/
-    description for tags in one scope, WITHOUT the decoded value (which can
-    be large on its own for a UDT array tag) -- then `get_tag_value()` for
-    one tag's value, only when actually needed.
-  - `get_tag_value(project, tag_name, program_name=None, offset=0, limit=50)`
-    -- one tag's value, paginated if it's a large array (returns
-    total_elements/offset/returned alongside value) rather than dumping a
-    multi-hundred-element array in one call.
-
-EDITING RUNGS -- avoid hand-rolling these, they're easy to get subtly
-wrong (see README.md for full examples):
-  - `get_routine(project, routine_name, program_name=None)` -- instead of
-    the nested program -> routine double-lookup. A routine name is only
-    unique WITHIN a program (many projects have a "Main" in several
-    programs), so this raises if the name is ambiguous and no
-    `program_name` was given, rather than silently picking one.
-  - `routine.insert_rung(index, text, comment=None)` /
-    `routine.delete_rung(index)` -- inserting/deleting a rung means
-    shifting every `_rung_comments` key at/after that index too; doing
-    this by hand is a real, easy-to-mis-index footgun.
-  - `replace_rung_safe(routine, index, expected_old, new_text)` -- edit an
-    EXISTING rung's text, but only if it still matches what you last read
-    (raises with a readable diff otherwise) -- guards against clobbering a
-    rung someone hand-edited in Studio since your last read.
-  - `find_tag_references(project, name)` -- every (program, routine,
-    rung_index, text) where a tag/member name is referenced, project-wide
-    -- e.g. to check whether a name is already used before reusing it.
-  - `tag_exists(project, name, program_name=None)` -- pre-creation
-    collision check in a given scope (controller by default).
-  - `new_tag(name, data_type, dimensions=None, description=None, value=None)`
-    -- construct a new controller-/program-scope `Tag` to append to
-    `.tags`, instead of hand-rolling `Tag(_name=..., name=..., tag_type=
-    "Base", ...)` positional construction from scratch every time.
-  - `export_routine(..., validate=True)` -- before writing the file, verify
-    every struct-typed name reachable from a referenced tag's own DataType
-    tree actually resolves, raising with the specific tag/member/type
-    instead of silently rendering a bare zero where a nested structure
-    belongs (the class of bug that otherwise only surfaces as a Studio 5000
-    import rejection, or worse, a silent wrong value). Off by default.
-
-`load_acd()` is quiet by default (WARNING and above -- real data-quality
-signals -- are always kept regardless); pass `verbose=True` to also see the
-~15-20 lines of INFO/DEBUG progress output every load produces.
+ADVANCED / BATCH USE -- `open_project_db(acd_path)` returns a `ProjectDB`
+with the same methods as the `db_*` functions above (minus the `db_`
+prefix and the repeated `acd_path` argument) for a script doing MANY edits
+in one session that wants to hold the DB open (and its lock held) across
+all of them, rather than pay one open/close cycle per edit. Prefer the
+`db_*` functions above for a single edit. `ProjectDB.to_controller()` (or
+the `db_to_controller()` function) returns a normal `RSLogix5000Content`
+object graph reflecting the DB's current state, for anything not covered
+by a `db_*`/`ProjectDB` method -- see `RSLogix5000Content`/`Controller`/
+`Program`/`Routine`/`Tag` in `acd.l5x.elements` for that object shape.
+The lower-level, single-process, no-persistence functions this whole
+module is built on (`load_acd`, `export_routine`, `get_routine`, ...) are
+still there in `acd.api`/`acd.l5x.elements` if you have a specific reason
+to need them, but are deliberately not re-exported here -- every `db_*`
+call above already does the load/rehydrate/close cycle for you.
 """
 
-from acd.api import (  # noqa: F401
-    load_acd,
-    save_acd,
-    patch_rungs,
-    export_routine,
-    export_datatype,
-    diff_lines,
-    find_io_addresses,
-    find_tag_references,
-    get_routine,
-    get_tag_value,
-    io_addresses_by_routine,
-    list_routines,
-    list_tags,
-    get_project_summary,
-    diff_io_addresses,
-    diff_project,
-    diff_routine,
-    replace_rung_safe,
-    tag_exists,
+from acd.api import diff_lines, find_io_addresses  # noqa: F401
+from acd.l5x.project_db import (  # noqa: F401
+    open_project_db,
+    ProjectDB,
+    db_new_tag,
+    db_edit_tag,
+    db_set_tag_comment,
+    db_new_member,
+    db_insert_rung,
+    db_delete_rung,
+    db_replace_rung_safe,
+    db_export_routine,
+    db_export_datatype,
+    db_list_tags,
+    db_list_routines,
+    db_tag_exists,
+    db_get_project_summary,
+    db_to_controller,
+    db_get_routine,
+    db_get_tag_value,
+    db_find_tag_references,
+    db_io_addresses_by_routine,
+    db_diff_project,
+    db_diff_routine,
+    db_diff_io_addresses,
 )
-from acd.l5x.elements import new_member, new_tag  # noqa: F401

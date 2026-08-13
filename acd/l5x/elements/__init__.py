@@ -6,6 +6,7 @@
 from .base import (
     _escape_xml_attr,
     _multiline_xml_text,
+    _sanitize_xml_text,
     L5xElementBuilder,
     L5xElement,
     _XML_ILLEGAL_RE,
@@ -13,6 +14,7 @@ from .base import (
 )  # noqa: F401
 
 from .types import (
+    _is_bit_overlay,
     _is_string_family_type,
     _string_family_capacity,
     _get_type_size,

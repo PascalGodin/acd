@@ -18,6 +18,29 @@ _PRIM = {
     'LREAL': ('<d',  8),
 }
 
+def _is_bit_overlay(member: "Member") -> bool:
+    """True for a BIT-overlay pseudo-member (e.g. TIMER.EN/TT/DN,
+    COUNTER.CU/CD/DN/OV/UN) -- aliases one bit of a sibling member (via
+    `member.target`/`member.bit_number`) rather than having storage of its
+    own in the data table.
+
+    This exact check (`member.data_type == "BIT"`) is the "skip this member
+    when walking a struct's own raw bytes/backing storage" rule shared by
+    every one of this codebase's three independent member-tree walks
+    (decode.py's `_decode_single_udt_element`, rendering.py's
+    `_l5k_udt_literal`/`_zero_value_for_member`, and this module's own
+    `_get_type_size`) -- named here as a single shared predicate so a future
+    change to the rule only needs to happen once, rather than relying on
+    five separate call sites independently staying in sync (the historical
+    class of bug this whole file's docstrings are full of). Deliberately
+    does NOT also fold in `member.hidden` -- that's a *different*, Decorated-
+    XML-specific visibility rule (a BIT-overlay member IS shown in Decorated
+    output, as a real BOOL; its hidden backing field is what's NOT shown),
+    not a variant of this one.
+    """
+    return member.data_type == "BIT"
+
+
 def _is_string_family_type(type_name: str, data_types_map: Dict[str, 'DataType']) -> bool:
     """Return True if type_name is the built-in STRING type or a custom
     string-family DataType (e.g. STRING20, STRING64, ...).
@@ -114,7 +137,7 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
         # still occupies real bytes in the struct and must count toward the
         # total size, or a struct whose hidden member happens to be its
         # largest-offset field would be undersized.
-        if m.data_type == "BIT":
+        if _is_bit_overlay(m):
             continue
         if m.data_type.upper() == "BOOL" and m.dimension > 0:
             # BOOL arrays are bit-packed into DINT-sized (4-byte) words, 32

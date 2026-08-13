@@ -6,7 +6,7 @@ from typing import Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
 
-from .types import _PRIM, _get_type_size, _is_string_family_type, _string_family_capacity
+from .types import _PRIM, _get_type_size, _is_bit_overlay, _is_string_family_type, _string_family_capacity
 
 
 def _tag_value_blob_offset(raw_rec: bytes) -> int:
@@ -293,7 +293,7 @@ def _decode_single_udt_element(
         # was missing CU/CD/DN/OV/UN entirely): both the raw backing value
         # (needed for L5K) and the individual bits (needed for Decorated)
         # ultimately come from this same decode.
-        if member.data_type == "BIT":
+        if _is_bit_overlay(member):
             continue
 
         mname = member.name
@@ -356,7 +356,7 @@ def _decode_single_udt_element(
     # negative int is an arithmetic (sign-extending) shift, which correctly
     # reproduces the 32-bit two's-complement bit pattern for any bit 0-31.
     for member in data_type.members:
-        if member.data_type != "BIT":
+        if not _is_bit_overlay(member):
             continue
         target_val = result.get(member.target)
         if isinstance(target_val, int) and member.bit_number is not None:

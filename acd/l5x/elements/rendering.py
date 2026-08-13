@@ -4,7 +4,7 @@ import struct
 from typing import Dict, List, Tuple, Union
 
 from .base import _sanitize_xml_text
-from .types import _PRIM, _get_type_size, _is_string_family_type, _string_family_capacity
+from .types import _PRIM, _get_type_size, _is_bit_overlay, _is_string_family_type, _string_family_capacity
 
 
 def _l5k_prim_literal(dt_upper: str, val) -> str:
@@ -66,7 +66,7 @@ def _l5k_udt_literal(dt_name: str, values, data_types_map: Dict[str, 'DataType']
         # "[-1607863227,3000,3000]" (Control, PRE, ACC in declaration
         # order), which a prior version of this function silently dropped
         # down to "[3000,3000]" by skipping hidden members entirely.
-        if member.data_type == "BIT":
+        if _is_bit_overlay(member):
             continue
         val = values.get(member.name)
         if val is None:
@@ -284,7 +284,7 @@ def _zero_value_for_member(member: "Member", data_types_map: Dict[str, "DataType
         return {
             m.name: _zero_value_for_member(m, data_types_map)
             for m in dt_obj.members
-            if m.data_type != "BIT"  # BIT-overlay pseudo-members have no storage of their own
+            if not _is_bit_overlay(m)
         }
 
     # `member.dimension` is documented/typed as `int` (0 = scalar), and every

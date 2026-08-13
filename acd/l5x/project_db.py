@@ -77,7 +77,7 @@ from acd.l5x.elements import (
     new_member as _new_member,
     new_tag as _new_tag,
 )
-from acd.l5x.export_l5x import ExportL5x
+from acd.l5x.export_l5x import configure_logging, ExportL5x
 
 _DB_FILENAME = "acd.db"
 
@@ -206,7 +206,12 @@ DROP TABLE IF EXISTS proj_programs;
 
 CREATE TABLE proj_meta (
     source_acd_path TEXT NOT NULL,
-    source_acd_mtime REAL NOT NULL
+    source_acd_mtime REAL NOT NULL,
+    -- Flipped to 1 by every edit method (new_tag, insert_rung, ...) in the
+    -- same commit as the edit itself; checked (and warned on) by
+    -- open_project_db() before a rebuild would discard it. A fresh
+    -- materialize() always inserts 0 here (nothing to lose yet).
+    dirty INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE proj_data_types (
@@ -428,7 +433,24 @@ def open_project_db(acd_path, project_dir=None, rebuild: bool = False,
     just a documentation convention; prefer the `db_*` functions below for
     a single edit so there's no long-lived handle for a caller to forget to
     release.
+
+    If a rebuild is about to happen (mtime changed, or `rebuild=True`) AND
+    the existing DB has at least one edit since its own last rebuild that
+    was never exported (`proj_meta.dirty`, see the edit methods below),
+    logs a WARNING before discarding it rather than doing so silently at
+    INFO level -- found via a real report: the source `.ACD` here got
+    re-synced from Studio mid-session more than once, and a `db_*` edit
+    made just before that happened vanished with no visible signal at all.
+
+    Also applies `configure_logging(verbose)` (see `export_l5x.py`)
+    unconditionally, even when no rebuild happens -- `to_controller()`
+    calls `ControllerBuilder` directly against an already-open connection,
+    which never goes through `ExportL5x.__post_init__` (the only other
+    place this was previously applied), so a process that never triggers a
+    rebuild would otherwise see this library's INFO/DEBUG progress output
+    unfiltered regardless of `verbose=False`.
     """
+    configure_logging(verbose)
     acd_path = Path(acd_path)
     project_dir = Path(project_dir) if project_dir is not None else acd_path.parent / acd_path.stem
     db_file = project_dir / _DB_FILENAME
@@ -437,10 +459,11 @@ def open_project_db(acd_path, project_dir=None, rebuild: bool = False,
     lock.acquire()
     try:
         needs_rebuild = rebuild or not db_file.exists()
-        if not needs_rebuild:
+        was_dirty = False
+        if db_file.exists():
             probe = sqlite3.connect(str(db_file))
             try:
-                row = probe.execute("SELECT source_acd_mtime FROM proj_meta").fetchone()
+                row = probe.execute("SELECT source_acd_mtime, dirty FROM proj_meta").fetchone()
             except sqlite3.OperationalError:
                 # acd.db exists but has no proj_meta table -- either a plain
                 # load_acd()/ExportL5x call left raw-only tables here, or a
@@ -448,10 +471,23 @@ def open_project_db(acd_path, project_dir=None, rebuild: bool = False,
                 row = None
             finally:
                 probe.close()
-            needs_rebuild = row is None or row[0] != os.path.getmtime(acd_path)
+            if row is None:
+                needs_rebuild = True
+            else:
+                was_dirty = bool(row[1])
+                if not needs_rebuild:
+                    needs_rebuild = row[0] != os.path.getmtime(acd_path)
 
         if needs_rebuild:
-            log.info(f"open_project_db(): rebuilding {db_file} from {acd_path}")
+            if was_dirty:
+                log.warning(
+                    f"open_project_db(): rebuilding {db_file} from {acd_path} -- this DISCARDS "
+                    "one or more edits made since the last rebuild that were never exported via "
+                    "db_export_routine()/db_export_datatype() (the source .ACD changed, or "
+                    "rebuild=True was passed). Export first if you don't want those edits lost."
+                )
+            else:
+                log.info(f"open_project_db(): rebuilding {db_file} from {acd_path}")
             os.makedirs(project_dir, exist_ok=True)
             _rebuild_project_db(acd_path, project_dir, verbose=verbose)
         else:
@@ -573,6 +609,7 @@ class ProjectDB:
                 "INSERT INTO proj_tag_comments (tag_id, path, text) VALUES (?, ?, ?)",
                 (tag_id, path, text),
             )
+        cur.execute("UPDATE proj_meta SET dirty=1")
         self._conn.commit()
         return tag_id
 
@@ -602,6 +639,7 @@ class ProjectDB:
             cur.execute("DELETE FROM proj_tag_comments WHERE tag_id=? AND path=''", (tag_id,))
             cur.execute("INSERT INTO proj_tag_comments (tag_id, path, text) VALUES (?, '', ?)",
                         (tag_id, description))
+        cur.execute("UPDATE proj_meta SET dirty=1")
         self._conn.commit()
 
     def set_tag_comment(self, name: str, path: str, text: str,
@@ -623,6 +661,7 @@ class ProjectDB:
         cur.execute("DELETE FROM proj_tag_comments WHERE tag_id=? AND path=?", (tag_id, path))
         cur.execute("INSERT INTO proj_tag_comments (tag_id, path, text) VALUES (?, ?, ?)",
                     (tag_id, path, text))
+        cur.execute("UPDATE proj_meta SET dirty=1")
         self._conn.commit()
 
     def new_member(self, data_type_name: str, name: str, member_data_type: str,
@@ -666,6 +705,7 @@ class ProjectDB:
              member.radix, member.external_access, member._description),
         )
         member_id = cur.lastrowid
+        cur.execute("UPDATE proj_meta SET dirty=1")
         self._conn.commit()
         return member_id
 
@@ -700,6 +740,7 @@ class ProjectDB:
             "VALUES (?, ?, ?, ?, NULL)",
             (routine_id, index, text, comment),
         )
+        cur.execute("UPDATE proj_meta SET dirty=1")
         self._conn.commit()
 
     def delete_rung(self, routine_name: str, index: int,
@@ -720,6 +761,7 @@ class ProjectDB:
             "WHERE routine_id=? AND rung_index < 0",
             (routine_id,),
         )
+        cur.execute("UPDATE proj_meta SET dirty=1")
         self._conn.commit()
 
     def replace_rung_safe(self, routine_name: str, index: int, expected_old: str,
@@ -742,6 +784,7 @@ class ProjectDB:
             )
         cur.execute("UPDATE proj_rungs SET text=? WHERE routine_id=? AND rung_index=?",
                     (new_text, routine_id, index))
+        cur.execute("UPDATE proj_meta SET dirty=1")
         self._conn.commit()
 
     # ---- rehydration ----

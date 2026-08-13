@@ -140,6 +140,39 @@ def _iter_region_map_entries_v38(record: bytes):
         offset += 16
 
 
+def configure_logging(verbose: bool) -> None:
+    """Quiet-by-default log configuration shared by every entry point that
+    can produce this library's INFO/DEBUG progress output -- not just
+    `ExportL5x`/`load_acd()`. Originally inline in `ExportL5x.__post_init__`
+    only; extracted after a real gap was found: `acd.l5x.project_db`'s
+    `to_controller()` calls `ControllerBuilder` directly against an
+    already-open connection whenever `open_project_db()` takes its "reuse
+    existing DB, no rebuild needed" path -- meaning `ExportL5x` (and this
+    reconfiguration) never runs at all in that process, so `ControllerBuilder`'s
+    own `log.info()` calls (e.g. deleted-member diagnostics) printed
+    unfiltered even with the `db_*` functions' own `verbose=False` default,
+    silently reintroducing the noise the `verbose` flag was built to
+    suppress. `open_project_db()` now calls this directly too, regardless of
+    whether a rebuild actually happens.
+
+    loguru's logger is a process-wide singleton -- there is no per-instance/
+    per-call log level in this library, so this is a one-time, persistent
+    reconfiguration of the default sink, not scoped to just one call. This is
+    exactly what a caller doing `from loguru import logger; logger.remove()`
+    before calling this library already had to do themselves (the only
+    previously *possible*, but undocumented, way to quiet the ~15-20 lines of
+    INFO/DEBUG progress output every load produces) -- exposed here as a
+    documented parameter instead. WARNING and above are always kept: this
+    library relies on `log.warning()` to surface real data-quality concerns
+    (stale/deleted records, unrecognized codes falling back to a guess,
+    recovered data, etc. -- see CLAUDE.md), which should never be silent even
+    in quiet mode.
+    """
+    if not verbose:
+        log.remove()
+        log.add(sys.stderr, level="WARNING")
+
+
 @dataclass
 class ExportL5x:
     input_filename: os.PathLike
@@ -149,27 +182,7 @@ class ExportL5x:
     verbose: bool = False
 
     def __post_init__(self):
-        if not self.verbose:
-            # loguru's logger is a process-wide singleton -- there is no
-            # per-instance/per-call log level in this library, so this is a
-            # one-time, persistent reconfiguration of the default sink, not
-            # scoped to just this load. This is exactly what a caller doing
-            # `from loguru import logger; logger.remove()` before calling
-            # this library already had to do themselves (the only previously
-            # *possible*, but undocumented, way to quiet the ~15-20 lines of
-            # INFO/DEBUG progress output every load_acd() call produces) --
-            # exposed here as a documented parameter instead, and now the
-            # DEFAULT (flipped from an opt-in `verbose=False` to an opt-in
-            # `verbose=True`, per direct feedback: a library whose primary
-            # audience is AI agents operating under a token budget should be
-            # quiet unless asked otherwise, not loud unless asked otherwise).
-            # WARNING and above are always kept: this library relies on
-            # log.warning() to surface real data-quality concerns (stale/
-            # deleted records, unrecognized codes falling back to a guess,
-            # recovered data, etc. -- see CLAUDE.md), which should never be
-            # silent even in quiet mode.
-            log.remove()
-            log.add(sys.stderr, level="WARNING")
+        configure_logging(self.verbose)
         if not self._temp_dir:
             acd_path = Path(self.input_filename)
             self._temp_dir = str(acd_path.parent / acd_path.stem)

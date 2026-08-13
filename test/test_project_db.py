@@ -98,6 +98,74 @@ def test_open_project_db_rebuild_true_forces_rebuild(acd_copy):
         db2.close()
 
 
+def test_open_project_db_warns_when_rebuild_discards_dirty_edits(acd_copy, capsys):
+    """`configure_logging(verbose)` runs as the very first thing inside
+    open_project_db() and calls log.remove() -- any sink added by the test
+    BEFORE that call would be wiped before the warning below ever fires, so
+    this asserts against real captured stderr (what configure_logging()'s
+    own log.add(sys.stderr, level="WARNING") sink writes to), not a
+    separately-added loguru sink.
+    """
+    db1 = open_project_db(str(acd_copy), verbose=False)
+    db1.new_tag("PDB_DIRTY_TAG", "DINT")  # never exported
+    db1.close()
+
+    future = time.time() + 5
+    os.utime(acd_copy, (future, future))
+
+    capsys.readouterr()  # discard anything captured so far
+    db2 = open_project_db(str(acd_copy), verbose=False)
+    db2.close()
+    captured = capsys.readouterr()
+
+    assert "DISCARDS" in captured.err
+
+
+def test_open_project_db_does_not_warn_when_rebuild_has_nothing_to_discard(acd_copy, capsys):
+    db1 = open_project_db(str(acd_copy), verbose=False)
+    db1.close()  # no edits made -- nothing dirty
+
+    future = time.time() + 5
+    os.utime(acd_copy, (future, future))
+
+    capsys.readouterr()
+    db2 = open_project_db(str(acd_copy), verbose=False)
+    db2.close()
+    captured = capsys.readouterr()
+
+    assert "DISCARDS" not in captured.err
+
+
+def test_open_project_db_configures_quiet_logging_even_without_rebuild(acd_copy, monkeypatch):
+    """Regression test for a real gap: to_controller() calls
+    ControllerBuilder directly against an already-open connection, bypassing
+    ExportL5x.__post_init__ entirely on the "reuse existing DB, no rebuild"
+    path -- the only other place configure_logging() was previously applied.
+    Verified by spying on configure_logging() itself (deterministic) rather
+    than depending on some specific internal log.info() call the small
+    CuteLogix fixture may not happen to trigger (it has no deleted UDT
+    members, so the exact message a real downstream report saw never fires
+    against this fixture regardless of whether the fix is present).
+    """
+    db1 = open_project_db(str(acd_copy), verbose=False)
+    db1.close()
+
+    calls = []
+    original = project_db_module.configure_logging
+
+    def _spy(verbose):
+        calls.append(verbose)
+        return original(verbose)
+
+    monkeypatch.setattr(project_db_module, "configure_logging", _spy)
+
+    db2 = open_project_db(str(acd_copy), verbose=False)  # reuse path -- no rebuild
+    db2.to_controller()
+    db2.close()
+
+    assert calls == [False]
+
+
 def test_new_tag_persists_across_separate_open_calls(acd_copy):
     db1 = open_project_db(str(acd_copy), verbose=False)
     db1.new_tag("PDB_NEW_TAG", "DINT", description="a test tag", value=7)

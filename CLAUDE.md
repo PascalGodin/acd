@@ -2524,6 +2524,53 @@ code the moment a raw `open_project_db()` call got used carelessly, which is its
 concrete demonstration of why the user's original instinct (make forgetting-to-close structurally
 impossible, not just documented) was the right one.
 
+### First real-usage feedback round (two real bugs, one confirmed-as-designed)
+
+Asked the downstream agent that had actually been using `db_*` against a real project for direct
+feedback rather than waiting for it to surface as a bug report. Got three concrete items, two real:
+
+1. **A rebuild triggered by the source `.ACD`'s mtime changing silently discards any edit made
+   since the last rebuild that was never exported** — and for this real project specifically, the
+   source file gets re-synced from Studio mid-session more than once in a single day. An edit made
+   and not immediately exported can vanish with nothing but an `log.info()` line, indistinguishable
+   from the normal "old project, fresh start" case. Fixed by adding `proj_meta.dirty` (flipped to 1
+   by every edit method in the same commit as the edit itself, defaulting to 0 on a fresh
+   `_materialize()`) — `open_project_db()` now checks it before any rebuild (mtime-triggered OR
+   explicit `rebuild=True`) and logs a `log.warning()` naming the risk plainly if it would discard
+   real edits, instead of the same `log.info()` a routine "nothing to lose" rebuild gets. Deliberately
+   NOT a hard block/raise — the whole point of the wipe-and-rebuild model is that it's always
+   allowed, this only adds visibility into when it's throwing something away.
+2. **`db_*` functions didn't inherit `load_acd()`'s quiet-by-default logging** — confirmed directly:
+   `ExportL5x.__post_init__` is the only place the quiet/verbose reconfiguration ran, but
+   `ProjectDB.to_controller()` calls `ControllerBuilder` directly against an already-open connection,
+   which never goes through `ExportL5x` at all on `open_project_db()`'s "reuse existing DB, no
+   rebuild needed" path — meaning a process that never happens to trigger a rebuild never reconfigures
+   loguru's sink, so `ControllerBuilder`'s own `log.info()` calls (e.g. the deleted-member diagnostics
+   documented elsewhere in this file) print unfiltered regardless of `verbose=False`. Fixed by
+   extracting the reconfiguration into `configure_logging(verbose)` (`export_l5x.py`, used by both
+   `ExportL5x.__post_init__` and `open_project_db()`, called unconditionally at the very top of the
+   latter, before any rebuild-or-reuse decision is even made).
+3. **A new `acd.db` file — and its own subfolder, named after the ACD stem — appears directly in the
+   project's own working directory** (e.g. `source/BPM_TrimmerSorter_VAB_20260813/acd.db`), not a
+   temp dir. Confirmed as-designed, not a bug: this is the literal persistence mechanism the whole
+   feature exists to provide (see "Persistent project DB" above) — `ExportL5x` already had this exact
+   default-location behavior for any direct call without an explicit `temp_dir`, `db_*`/
+   `open_project_db()` are just the first thing to actually exercise it routinely. No code change;
+   documented here so the answer doesn't need re-deriving next time it comes up. If a downstream
+   project's own working directory is itself version-controlled, that project's `.gitignore` (not
+   this repo's) is the right place to exclude these — not something for acd-tools itself to manage.
+
+Covered by three new tests in `test/test_project_db.py`
+(`test_open_project_db_warns_when_rebuild_discards_dirty_edits`,
+`test_open_project_db_does_not_warn_when_rebuild_has_nothing_to_discard`,
+`test_open_project_db_configures_quiet_logging_even_without_rebuild`) — the warning tests assert
+against real captured `stderr` (via pytest's `capsys`) rather than a separately-added loguru sink,
+since `configure_logging()`'s own `log.remove()` call (run at the very top of `open_project_db()`)
+would silently wipe any sink a test added beforehand; the logging test spies on `configure_logging`
+itself rather than depending on the small `CuteLogix.ACD` fixture happening to trigger a specific
+internal `log.info()` call it may not have any real reason to emit (no deleted UDT members in that
+fixture) regardless of whether the fix is present.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

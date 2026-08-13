@@ -292,6 +292,28 @@ class ModuleBuilder(L5xElementBuilder):
             (self._object_id,),
         )
         for (conn_name, conn_rec) in self._cur.fetchall():
+            # A hex-encoded comp_name (e.g. "$0ce232bb$") is an internal/unnamed
+            # object, the same convention already used for a Module's own name a
+            # few lines above -- but for a *connection* specifically, this isn't
+            # just "unnamed": real evidence (not a guess -- see CLAUDE.md's
+            # "Connection Type / RPI" section for the full investigation) points
+            # to this being a cached CIP MESSAGE connection (e.g. a `MSG`
+            # instruction with "Cache Connections" enabled, routed over DH+/
+            # ControlNet through a bridge module), not a physical I/O connection
+            # at all. Confirmed on a real project: exactly one such connection
+            # existed, on the processor's own `Local` module (never on the
+            # bridge module the MSG actually routes through), with RPI=0 (message
+            # connections aren't cyclic/RPI-driven) and an otherwise-unrecognized
+            # type code -- and the project had multiple `MSG` instructions with
+            # caching enabled but ALL sharing the same destination path, matching
+            # "one cached connection per unique destination", not per instruction.
+            # Real Studio 5000 output confirms this category of connection is
+            # never rendered as an L5X <Connection> element at all (that schema
+            # models physical CIP I/O connections specifically) -- skipped here
+            # for the same reason, rather than guessing an Input/Output Type= for
+            # something that was never an I/O connection to begin with.
+            if conn_name.startswith("$") and conn_name.endswith("$"):
+                continue
             conn_raw = bytes(conn_rec)
             conn_type = None
             code = None

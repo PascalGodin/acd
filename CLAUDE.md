@@ -243,6 +243,82 @@ functionally-identical connections depending only on which one happened to be in
 neither guess was actually `StandardDataDriven`, so both were wrong, just not usually visible as
 a hard error since callers mostly only care whether IO is input-like or output-like.
 
+**RESOLVED (after being wrong once first) — a hex-named connection (e.g. `"$0ce232bb$"`) with an
+otherwise-unrecognized CIP connection-type code is a cached CIP MESSAGE connection, not physical
+I/O, and is now skipped entirely rather than guessed.** Found on a real project's processor module
+(`1756-L82E`, comp_name `Local`): one connection with RPI decoded as `0` and code `10`, not in
+`_CONNECTION_TYPE_BY_CODE`, hitting the name-heuristic fallback and logging the "please report
+this" warning. A whole-project sweep (246 modules, 201 real connections) found this was the *only*
+hex-named connection AND the *only* unrecognized-code connection in the whole project.
+
+**First attempt (wrong reasoning, reverted):** cross-referenced a real, exact-matching Studio 5000
+L5X export of the same project, found the `Local` module has no `<Connections>` element there at
+all, and concluded the connection should be excluded on that basis. That conclusion happened to be
+directionally right but the REASONING was wrong and got called out directly: L5X being silent
+about something is not evidence the ACD doesn't have real data for it (this project's own "Known
+limitations" section already documents multiple cases where the ACD holds real data L5X never
+surfaces — Module CIP identity records; 570 real Module/Connection-level comments with nowhere to
+go in L5X). Reverted rather than ship a fix justified by an invalid inference.
+
+**Second attempt (real investigation, with the user actively checking Studio 5000 directly) found
+the actual mechanism.** The same real project has a routine literally named `SLC_504` containing
+five `MSG` instructions (`SLC_Stacker_Write`/`Read`, `SLC_Planer_Write`/`Read`/`Read2`) reading and
+writing an external SLC 5/04 (SLC-500-family) controller over **DH+**, routed through a real
+`1756-DHRIO` bridge module (`RIO_Slot_3`) — confirmed directly via Studio's own Message
+Configuration dialog: Communication Method = DH+, Path = `RIO_Slot_3`, and **"Cache Connections"
+checked**. A cached `MSG` connection is a resource of the *requesting processor's own* message
+cache (hence owned by `Local`, not the DHRIO bridge module it routes through), is inherently
+message-triggered rather than cyclic (hence RPI=0), is auto-managed by Studio rather than
+user-named (hence the hex placeholder), and — the key fact that makes the fix correct rather than
+another guess — real Studio 5000 output confirms this whole *category* of connection is never
+rendered as an L5X `<Connection>` element at all, because that schema models physical CIP I/O
+connections specifically, not cached message connections. The 5-MSG-instructions-but-1-connection
+count also checks out: all five `MSG` instructions share the exact same DH+ destination path
+(same DHRIO module, same channel, same node), consistent with Rockwell caching one connection per
+unique destination rather than one per `MSG` instruction.
+
+Fixed in `ModuleBuilder.build()` by skipping any connection whose comp_name matches the `$hex$`
+placeholder pattern (the same convention already used for a Module's own hex-encoded name a few
+lines above) *before* the type-code lookup, rather than guessing an Input/Output `Type=` for
+something that was never an I/O connection to begin with. This matters beyond just the warning
+noise: `Module.to_xml()` DOES render `_connections` into real `<Connection>` XML output, so
+leaving this in would have produced a spurious `<Connection Name="$0ce232bb$" .../>` on export
+that real Studio 5000 would never emit. Covered by
+`test_module_builder_skips_hex_named_connection` (`test/test_database.py`) — confirmed to fail
+without the fix, and confirms a normally-named connection with a recognized code still comes
+through correctly (not a blanket "ignore odd codes" fix).
+
+**Caveat, stated plainly**: this is strong, multi-source converging evidence (Cache Connections
+confirmed checked, DH+ method confirmed, destination-path/count math checks out, and the L5X-schema
+absence now has a real, positive explanation instead of just being cited as silence) — but it was
+never verified at the byte level (no field in the connection's own raw record was decoded to
+directly read "this is a DH+ message cache entry"). The fix is scoped to the hex-name signal (not
+to code `10` specifically) precisely because that's the part with an existing, independently-
+established precedent in this codebase; don't assume code `10` universally/only means "DH+ message
+cache" if it turns up on a normally-named connection in some other project — re-investigate rather
+than assume.
+
+**The other pre-existing warning on this same real project (`Comps: skipped N unparseable
+record(s)`) was investigated, and an earlier claim here that the failing records were "dead" has
+been retracted -- it was an unverified guess.** Both failures are on records with Kaitai
+identifier `65021` (parsed via `FdfdComps`), which was assumed (by loose analogy with a
+*different* part of this codebase -- Comments.Dat's own `fa fa`/`fd fd` deletion-marker
+convention) to mean "deleted." Checked directly and found that's not true: of 680 real `65021`
+records in this same project that parse successfully, `record_type` (the field actually used
+elsewhere in this codebase to distinguish live from deleted) comes back `256` (live) 221 times,
+`512` (deleted) only 56 times, `0` 380 times, and a long tail of values (`34471`, `65535`,
+`32306`, ...) that don't look like a real small enum at all -- suggesting `CompsRecord.parse()`
+may be reading `record_type` from the wrong offset for this record shape, not that these are
+consistently anything in particular. There are also two OTHER valid record markers
+(`0xFBBF`=64447, `0xFEFE`=65278) that `CompsRecord.parse()` doesn't even attempt to handle
+(silently returns `None` for both) -- a broader gap than just these two exceptions. What's
+actually known: `65021`'s own header is a different size (155 bytes) than `64250`'s (144 bytes)
+and doesn't self-declare its own record length the way `64250` does, so it's a structurally
+different record layout, not just a flag on the same one. Genuinely unresolved what it represents.
+Left alone for now (the existing catch-and-warn behavior degrades gracefully either way), but
+don't repeat the "verified dead, safe to ignore" claim without actually checking `record_type`
+across a real sample first -- that's what caught this being wrong.
+
 ## Known limitations / things not implemented
 
 - `Comps.Dat` binary serialization is not implemented — `save_acd()`/`patch_rungs()` only

@@ -29,22 +29,21 @@ def _tag_value_blob_offset(raw_rec: bytes) -> int:
     after where `extended_records` leaves off.
 
     This replaces a former "0x1A2, +2 if is_array" fixed-offset guess. That
-    guess happened to match a large real project's array tags and its
-    Lug/LugWrk-typed scalar tags, but was proven wrong in general: a fresh
+    guess happened to match a large real project's array tags and some of
+    its UDT-typed scalar tags, but was proven wrong in general: a fresh
     Studio 5000 project's own primitive/UDT array tags decode correctly at
-    the *unshifted* base, and a real project's Encoder-typed *scalar* tag
+    the *unshifted* base, and a real project's other UDT-typed *scalar* tag
     needed the +2 shift despite being a scalar. The actual, self-describing
     length is `82 + sum(8 + len(value) for each extended_record)` -- this
     varies by a couple of bytes between records/projects (observed 2 bytes
     shorter in a fresh Studio 5000 V32 project than an older V38 one) but
     is always computable from the record itself, with no need to guess
     "is_array" or special-case any UDT type. Confirmed against a real
-    project's Trim_Decision tag (LugWrk-typed, scalar) via a Studio 5000
-    screenshot: its populated fields (pntrTpStrt=24, pntrTpStp=25,
-    pntrLug=183, Wrk[4]=32790) only decode correctly using this computed
-    offset together with each member's own *raw*, uncorrected stored
-    byte_offset -- see _apply_dead_member_byte_corrections's docstring for
-    the matching fix on the member-offset side.
+    project's UDT-typed scalar tag via a Studio 5000 screenshot: its
+    populated fields only decode correctly using this computed offset
+    together with each member's own *raw*, uncorrected stored byte_offset
+    -- see _apply_dead_member_byte_corrections's docstring for the matching
+    fix on the member-offset side.
     """
     try:
         r = RxGeneric.from_bytes(raw_rec)
@@ -266,9 +265,10 @@ def _decode_single_udt_element(
     in the calls to _decode_scalar_member below -- a real bug here (fixed)
     incremented depth both here AND inside _decode_scalar_member, silently
     halving the usable nesting depth from the documented 3 levels to
-    effectively 1: a real UDT only 2 real levels deep (LugWrk -> Lug ->
-    LugErrorCode) had its innermost member silently decode to `{}` well
-    within the intended limit. A `{}` for a struct-typed member renders as
+    effectively 1: a real UDT only 2 real levels deep (a struct containing
+    a struct containing a struct) had its innermost member silently decode
+    to `{}` well within the intended limit. A `{}` for a struct-typed
+    member renders as
     nothing in Decorated output (a member simply goes missing, easy to miss
     entirely) but as a bare "[]" in the L5K literal's fixed-position array
     -- a shape Studio 5000 rejects on import as "Data type mismatch", which
@@ -309,11 +309,12 @@ def _decode_single_udt_element(
                 # array *sizing* and _read_tag_initial_value() already uses
                 # for a top-level primitive BOOL-array *tag* -- but this
                 # UDT-member path never got the equivalent fix, so a BOOL
-                # array MEMBER (e.g. Encoder's "Ons") was read one raw byte
-                # per element (elem_size=1 from _get_type_size("BOOL",...))
-                # instead of extracting the correct bit from its shared
-                # packed DWORD. Found via a real Studio 5000 "Tag Name
-                # Collision / Data Compare" dialog: EncTrm.Ons[5] decoded
+                # array MEMBER (e.g. a UDT's own "Flags" member) was read
+                # one raw byte per element (elem_size=1 from
+                # _get_type_size("BOOL",...)) instead of extracting the
+                # correct bit from its shared packed DWORD. Found via a
+                # real Studio 5000 "Tag Name Collision / Data Compare"
+                # dialog: element 5 of a real tag's array member decoded
                 # as 1 instead of the real 0 -- only one of 32 elements
                 # differed because bit 0 of the wrong byte happens to
                 # coincidentally match the true packed bit for most

@@ -39,8 +39,8 @@ def _l5k_udt_literal(dt_name: str, values, data_types_map: Dict[str, 'DataType']
     declaration order (same order/skip rules as _udt_scalar_to_xml:
     hidden and BIT members omitted), comma-separated, recursively
     bracketed for nested structs/arrays. Verified against a real 25-element
-    UDT array tag (To_Skip[25]): every element's L5K literal matches
-    Studio 5000's own <Data Format="L5K"> content exactly.
+    UDT array tag: every element's L5K literal matches Studio 5000's own
+    <Data Format="L5K"> content exactly.
     """
     if isinstance(values, list):
         return "[" + ",".join(_l5k_udt_literal(dt_name, v, data_types_map) for v in values) + "]"
@@ -133,9 +133,8 @@ def _shortest_float32_repr(value: float) -> str:
     Neither matches Studio 5000, which shows the shortest decimal that
     uniquely identifies the same float32 value -- found via a real Studio
     "Tag Name Collision / Data Compare" dialog showing several float
-    members (SmltnPstn, LugMn, LugMnAvrg, Frequency, RPM, RPMSum) each
-    differing from ours only in significant-digit count (e.g. real
-    "81.006325" vs our "%.6g"-truncated "81.0063") even though the
+    members each differing from ours only in significant-digit count (e.g.
+    real "81.006325" vs our "%.6g"-truncated "81.0063") even though the
     underlying decoded bytes were already correct.
     """
     target_bits = struct.pack("<f", value)
@@ -153,9 +152,8 @@ def _decorated_real_literal(value: float, in_array: bool) -> str:
     float32 bit pattern (see _shortest_float32_repr) -- distinct from
     L5K's fixed 8-digit scientific notation (_l5k_real_literal) -- with a
     mandatory decimal point even for a whole-number value: confirmed
-    against a real AOI instance tag's own Decorated value (TestFPM,
-    DataType AOI_RPMtoFPM): MotorRPM=1800.0, MotorDriverSheaveDiameter=6.0,
-    MotorDrivenSheaveDiameter=12.0, DrivenRoll_SprocketDiameter=14.0 all
+    against a real AOI instance tag's own Decorated value (several REAL
+    members with whole-number values, e.g. 1800.0, 6.0, 12.0, 14.0) all
     render with an explicit ".0" in real Studio output, but
     _shortest_float32_repr's plain fixed-point formatting omits the
     decimal point for an exact whole number (e.g. "1800", not "1800.0").
@@ -255,9 +253,9 @@ def _zero_value_for_member(member: "Member", data_types_map: Dict[str, "DataType
     export time) and the tag's *value* (rendered from the stale decoded
     dict) disagree on member count, which Studio 5000 correctly rejects on
     import ("Data type mismatch"). Found via a real case: adding a new
-    `Criteria_Qty` member to an existing `Bin` DataType with 50 live
-    `To_VABView_Bins` instances, then exporting a routine referencing one
-    of those instances in the same session.
+    member to an existing DataType with 50 live tag instances, then
+    exporting a routine referencing one of those instances in the same
+    session.
 
     Mirrors what Studio 5000 itself does natively when you add a UDT
     member to a type with existing instances via its own editor: the new
@@ -493,7 +491,7 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
 
     # dt_base is always upper-cased (matching data_types_map's key convention),
     # but Studio 5000 shows the DataType attribute in its real original casing
-    # (e.g. "LugWrk", not "LUGWRK") -- recover it from the DataType object
+    # (e.g. "MyUdt", not "MYUDT") -- recover it from the DataType object
     # itself when there is one (built-in reserved keywords like TIMER/STRING
     # have no ACD DataType record and are canonically all-caps anyway).
     dt_obj_for_name = data_types_map.get(dt_base)
@@ -701,9 +699,9 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
             # A member's OWN declared radix (e.g. "Binary" for a UDT member
             # meant to be read as bit flags) must be honored over the
             # generic per-type default -- verified against a real project's
-            # "NETrimPB" member (DINT, Radix="Binary"), which a prior
-            # version rendered as plain Radix="Decimal" Value="0" instead
-            # of "2#0000_0000_0000_0000_0000_0000_0000_0000".
+            # DINT member declared Radix="Binary", which a prior version
+            # rendered as plain Radix="Decimal" Value="0" instead of
+            # "2#0000_0000_0000_0000_0000_0000_0000_0000".
             radix = (
                 member.radix
                 if member.radix and member.radix != "NullType"
@@ -775,8 +773,8 @@ def _udt_array_to_xml(dt_base: str, values: List[dict],
         # attribute (unlike a nested ArrayMember inside a Structure, which
         # does carry one) -- already correctly handled for primitive arrays
         # in Tag.to_xml(), but this UDT-array path still included one until
-        # a real project's own "ToTrim"/"ToTrim_Luci" (both TrimButtons[50])
-        # tags showed real Studio 5000 output has no Name= here either.
+        # two real project tags of the same UDT-array type showed real
+        # Studio 5000 output has no Name= here either.
         return (
             f'<Array DataType="{display_name}" Dimensions="{dim_str}">'
             f'{"".join(elems)}</Array>'

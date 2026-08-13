@@ -88,23 +88,22 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
     to even), not a true multiple-of-4 round-up -- a genuine typo-class
     slip between the intent (and this very docstring/commit message) and
     the code, undetected because the *test case cited when "fixing" this*
-    (Encoder, 263 -> 264) happens to round to the same result either way
-    (264 is both the next even number and the next multiple of 4 above
-    263), so it couldn't distinguish the two rules. Found via a real project
-    (`FenceSkid`, whose members sum to 13 bytes): the old code returned 14
-    (even, wrong) instead of 16 (multiple of 4, correct), silently making
-    every *array* of `FenceSkid`-sized structs (here, `FenceGate.Skid[2]`,
-    and therefore every element of the `FenceGate[]` tag array beyond
-    index 0) use a 2-byte-too-small stride -- confirmed via a real Studio
-    5000 "Tag Name Collision" dialog showing `FenceGate[1]`/`FenceGate[2]`
+    (a real UDT whose members summed to 263 bytes -> 264) happens to round
+    to the same result either way (264 is both the next even number and the
+    next multiple of 4 above 263), so it couldn't distinguish the two rules.
+    Found via a different real project (a UDT whose members summed to 13
+    bytes): the old code returned 14 (even, wrong) instead of 16 (multiple
+    of 4, correct), silently making every *array* of same-sized structs use
+    a 2-byte-too-small stride -- confirmed via a real Studio 5000 "Tag Name
+    Collision" dialog showing every element of that array beyond index 0
     decoded with every field shifted by one position relative to the real
     project's existing values. Lesson worth repeating from elsewhere in
     this file: a fix verified against only one real-world example that
     happens to be ambiguous between two candidate rules is not verified at
-    all -- the previous investigation's own 99-DataType whole-project sweep
-    (see CLAUDE.md) apparently never happened to include an ODD-remainder
-    struct whose size was also used as an ARRAY element's stride, which is
-    exactly the combination needed to expose this.
+    all -- the previous investigation's own whole-project sweep (see
+    CLAUDE.md) apparently never happened to include an ODD-remainder struct
+    whose size was also used as an ARRAY element's stride, which is exactly
+    the combination needed to expose this.
 
     Deliberately does NOT add dt._dead_member_bytes here -- an earlier
     version of this function did, on the (untested) assumption that a
@@ -112,14 +111,14 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
     element's stride the same way it affects a scalar struct member's
     trailing siblings (see _apply_dead_member_byte_corrections(), which
     handles that latter case directly). Verified against a real array of
-    the exact UDT this was found on ("Lug", 200 elements): the true
+    the exact UDT this was found on (a 200-element array): the true
     per-element stride is the plain max(offset+size) value with NO dead-byte
     addition -- confirmed by finding two known-consecutive elements' own
-    "No" field values at their real, empirically-located byte offsets 568
-    bytes apart. Adding dead-member bytes here would have silently
-    corrupted every array-of-that-struct tag project-wide; don't reinstate
-    it without re-verifying against a real array case specifically, not
-    just the scalar case this field was originally added for.
+    values at their real, empirically-located byte offsets 568 bytes apart.
+    Adding dead-member bytes here would have silently corrupted every
+    array-of-that-struct tag project-wide; don't reinstate it without
+    re-verifying against a real array case specifically, not just the
+    scalar case this field was originally added for.
     """
     t = type_name.upper()
     prim = _PRIM.get(t)
@@ -142,7 +141,7 @@ def _get_type_size(type_name: str, data_types_map: Dict[str, 'DataType']) -> int
         if m.data_type.upper() == "BOOL" and m.dimension > 0:
             # BOOL arrays are bit-packed into DINT-sized (4-byte) words, 32
             # bits per word -- NOT one byte per element. Verified against a
-            # real UDT (LugWrk) whose true total size only matches when a
+            # real UDT whose true total size only matches when a
             # trailing BOOL[32] member is sized as 4 bytes, not 32; without
             # this, every member/struct size computed *after* a BOOL array
             # member is wrong, corrupting offsets for any subsequent element

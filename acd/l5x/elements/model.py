@@ -349,9 +349,9 @@ class Tag(L5xElement):
 
             elif isinstance(iv, list) and iv and isinstance(iv[0], dict):
                 # UDT array. Same L5K-block fix as the scalar case above --
-                # verified against a real 25-element UDT array tag
-                # (To_Skip[25]): the real export has both L5K and
-                # Decorated blocks, previously only Decorated was emitted.
+                # verified against a real 25-element UDT array tag: the
+                # real export has both L5K and Decorated blocks, previously
+                # only Decorated was emitted.
                 dim_str = self.dimensions or "1"
                 body = _udt_array_to_xml(
                     dt_base, iv, dim_str, self._data_types_map

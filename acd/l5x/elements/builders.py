@@ -90,9 +90,9 @@ def _resolve_bit_target(
          declaration order. Verified correct in every real case checked so
          far, including one where mechanisms 2/3 below return a
          wrong-but-non-None name due to a coincidental byte-offset
-         collision (a real UDT, "Bin_Sequence": a BIT member's own 0x60
-         happened to equal an unrelated real field's 0x60 elsewhere in the
-         same UDT, not either of its two genuine hidden backing fields).
+         collision (a real UDT: a BIT member's own 0x60 happened to equal
+         an unrelated real field's 0x60 elsewhere in the same UDT, not
+         either of its two genuine hidden backing fields).
       2. target_key (the member's raw 0x6c value) as an offset60_to_name
          lookup key -- works for TIMER/COUNTER-style built-in overlays
          where 0x6c genuinely holds the backing field's own 0x60 value.
@@ -165,9 +165,9 @@ class MemberBuilder(L5xElementBuilder):
         # turned up several more 0x68 values (0x2, 0x9, 0x14, ...) that don't fit that
         # enum, AND -- more importantly -- turned up real cases where a BIT member's own
         # 0x60 coincidentally equals a totally unrelated real field's 0x60 elsewhere in
-        # the same UDT (e.g. "Bin_Sequence": Action_1..16's own 0x60 all read 4, which
-        # matches unrelated field "Sling_Pos_1" (also 0x60=4), not either of the UDT's
-        # two real hidden backing fields at 0x60=2 and 0x60=3). An offset60_to_name
+        # the same UDT (e.g. a real UDT where 16 BIT-overlay members' own 0x60 all read
+        # 4, which matches an unrelated plain field also at 0x60=4, not either of the
+        # UDT's two real hidden backing fields at 0x60=2 and 0x60=3). An offset60_to_name
         # lookup on a coincidental match returns a wrong-but-non-None name, which is
         # worse than the lookup failing outright. The one mechanism that has resolved
         # every real case checked so far correctly -- including this collision case --
@@ -301,9 +301,9 @@ class DataTypeBuilder(L5xElementBuilder):
             # filtering, but never applied here until now. Deleting a member
             # marks its own child row 512 but does NOT necessarily remove its
             # extended-record descriptor from the *type's* own comps row (see
-            # the member_keys loop below) -- found via a real project (UDT
-            # "Trimmer", 15 scalar DINT members consolidated into an array
-            # "Saw_Pos[32]" and re-saved): the type's own declared
+            # the member_keys loop below) -- found via a real project (a UDT
+            # whose 15 scalar DINT members were consolidated into a single
+            # array member and re-saved): the type's own declared
             # member_count (attribute 0x64) correctly read back as 1, but 15
             # stale extended-record descriptors for the deleted scalars were
             # still present and, before this fix, got matched against their
@@ -378,9 +378,9 @@ class DataTypeBuilder(L5xElementBuilder):
             # child with NO matching extended-record descriptor -- a deleted
             # UDT member whose child row was never marked 512 at all, just
             # left with no type-level descriptor (data_type/dimension) --
-            # verified against a real project (UDT "Lug", deleted member
-            # "Z1_Nominal_Width", confirmed via an older Studio 5000 export
-            # of the same UDT to have been DataType="INT"). This used to be
+            # verified against a real project (a UDT with a deleted member,
+            # confirmed via an older Studio 5000 export of the same UDT to
+            # have been DataType="INT"). This used to be
             # treated as needing a byte-offset correction for every
             # subsequent sibling member, but that theory was disproven by a
             # real, populated tag (see _apply_dead_member_byte_corrections's
@@ -422,9 +422,9 @@ class DataTypeBuilder(L5xElementBuilder):
             # anything, since its exact counting convention (does it include
             # hidden BIT-backing members?) isn't independently verified yet.
             # Still a useful free signal: it correctly read back as 1 for the
-            # real "Trimmer" case above while this function was about to
-            # return 16 members, which would have been an immediate, obvious
-            # red flag had this check existed already.
+            # real case above while this function was about to return 16
+            # members, which would have been an immediate, obvious red flag
+            # had this check existed already.
             if member_count and len(children) != member_count:
                 log.warning(
                     f"DataType {name!r}: declared member_count={member_count} but "
@@ -456,17 +456,16 @@ def _apply_dead_member_byte_corrections(all_data_types_map: Dict[str, "DataType"
     DataType has `_dead_member_bytes > 0`, on the theory that a deleted
     member's old byte range keeps occupying space in an already-allocated
     tag's data table. That theory was disproven by a real Studio 5000
-    screenshot of a populated `Trim_Decision` tag (`LugWrk`-typed, its
-    nested `Lug`-typed `BfrLug` member has one dead/deleted member,
-    `Z1_Nominal_Width`): the tag's real values (`pntrTpStrt=24,
-    pntrTpStp=25, pntrLug=183, Wrk[4]=32790`) only decode correctly using
-    each member's own *raw*, uncorrected stored byte_offset -- applying
-    this pass's shift on top double-counts a correction that turned out to
-    belong entirely to `_tag_value_blob_offset()` (the tag's own data-table
-    blob start position, which already accounts for the record's real
-    layout on a per-tag basis and needs no per-type adjustment on top).
-    The earlier "verified exact" claim for this same tag was made against
-    an all-zero/unpopulated instance, which cannot distinguish a correct
+    screenshot of a populated tag (a UDT-typed tag whose nested struct
+    member has one dead/deleted member): the tag's real values only decode
+    correctly using each member's own *raw*, uncorrected stored byte_offset
+    -- applying this pass's shift on top double-counts a correction that
+    turned out to belong entirely to `_tag_value_blob_offset()` (the tag's
+    own data-table blob start position, which already accounts for the
+    record's real layout on a per-tag basis and needs no per-type
+    adjustment on top). The earlier "verified exact" claim for this same
+    tag was made against an all-zero/unpopulated instance, which cannot
+    distinguish a correct
     offset from an off-by-2 one -- a real, populated instance was needed to
     catch this. `_dead_member_bytes` is still computed and logged (see
     DataTypeBuilder.build()) as a useful diagnostic that a type has an
@@ -1849,9 +1848,9 @@ class AoiBuilder(L5xElementBuilder):
             # metadata). Without this filter, an unordered "LIMIT 1" could pick
             # whichever of these happened to come back first instead of the real
             # description -- found via a real project where two AOIs' own
-            # Descriptions ("VAB PowerFlex 525/700 Drive Instruction for
-            # EtherNet/IP") were missing from the export entirely because this
-            # query silently grabbed one of the other member_ref=0 rows instead.
+            # Descriptions ("PowerFlex Drive Instruction for EtherNet/IP") were
+            # missing from the export entirely because this query silently
+            # grabbed one of the other member_ref=0 rows instead.
             self._cur.execute(
                 "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 "
                 "AND record_type=1 LIMIT 1",
@@ -2026,7 +2025,7 @@ class TaskBuilder(L5xElementBuilder):
         name, record = row[0], row[1]
 
         # All task config fields live within ext[0x01], accessed via absolute BLOB offsets.
-        # These offsets were reverse-engineered from CIPDemo_RevEng.ACD.
+        # These offsets were reverse-engineered from a real sample project.
         rate_us = struct.unpack_from("<I", record, 0x106C)[0]
         type_val = struct.unpack_from("<H", record, 0x10F6)[0]
         priority = struct.unpack_from("<H", record, 0x10F8)[0]
@@ -2100,7 +2099,7 @@ class ControllerBuilder(L5xElementBuilder):
 
         # A Controller can have its own whole-project Description, found the same way
         # as a Routine's/Program's (see RoutineBuilder.build()/_lookup_object_description)
-        # -- verified against a real project ("Dry Sorter program for Hancock Lumber\nBethel, Maine").
+        # -- verified against a real project's own multi-line project description.
         controller_description = _lookup_object_description(self._cur, r, results[0][4])
 
         extended_records: Dict[int, bytes] = {}
@@ -2445,7 +2444,7 @@ class ControllerBuilder(L5xElementBuilder):
         # parameter binding metadata, not user-authored descriptions.
         #
         # When a UDT member's DataType is itself an AOI (e.g. a "VFD" member of
-        # type "VAB_PowerFlex_753"), Rockwell needs to record which of that
+        # type "MyAOI_PowerFlex"), Rockwell needs to record which of that
         # AOI's InOut parameters is used, and stores it in Comments.Dat using
         # the exact same (parent, scope_id) keyed record shape as a real
         # per-element comment: ref resolves to the whole member (e.g. ".VFD"),
@@ -2507,10 +2506,10 @@ class ControllerBuilder(L5xElementBuilder):
             )
             # record_type=256 matches every real Module seen in every local fixture and
             # the Program/Task filter elsewhere in this method; a real project was found
-            # with three extra module-name comps records with record_type=512
-            # ("Grade_Deck", "Bridge", "MillTrak_VAB") that do not appear in that
-            # project's own Studio 5000 L5X export at all -- excluded here the same way,
-            # rather than emitting phantom <Module> elements.
+            # with three extra module-name comps records with record_type=512 that do
+            # not appear in that project's own Studio 5000 L5X export at all --
+            # excluded here the same way, rather than emitting phantom <Module>
+            # elements.
             mod_rows = self._cur.fetchall()
 
             # First pass: build modid→name map so child modules can resolve their parent name.

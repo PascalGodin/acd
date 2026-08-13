@@ -252,6 +252,40 @@ diffing.
 
 ---
 
+### Lazy / summary-first lookups
+
+For a caller operating under a context budget (e.g. an MCP tool wrapping this library, or any
+agent that shouldn't have to pay for a whole project's worth of content just to check one thing),
+each of these has a cheap "list names/counts only" step and a separate "fetch this ONE thing in
+full" step — never walk `project.controller...` yourself and return everything you find:
+
+```python
+from acd import project_summary, list_routines, list_tags, get_tag_value
+
+# Names/counts only -- the first thing to ask for, before drilling into anything specific.
+summary = project_summary(project)
+# {"controller_name": "...", "programs": [...], "tasks": [...], "data_types": [...],
+#  "aois": [...], "modules": [...], "controller_tag_count": N, "program_tag_counts": {...},
+#  "routine_count": N}
+
+# Name/type/line-count for every routine (or one program's) -- no rung/line content.
+for r in list_routines(project, program_name="VAB_Trim_And_Sort"):
+    print(r["routine"], r["type"], r["line_count"])
+# Then get_routine(project, r["routine"], ...) for one routine's actual logic.
+
+# Name/data_type/dimensions/description for tags in one scope -- WITHOUT the decoded value
+# (a UDT array tag's value can be large enough on its own to matter).
+for t in list_tags(project):
+    print(t["name"], t["data_type"], t["dimensions"])
+
+# One tag's value, paginated if it's a large array instead of dumped in full.
+page = get_tag_value(project, "To_VABView_Bins", offset=0, limit=50)
+# {"name": ..., "data_type": ..., "dimensions": "50", "total_elements": 50,
+#  "offset": 0, "returned": 50, "value": [...]}
+```
+
+---
+
 ### Lookup and rung-editing helpers
 
 A few small helpers exist specifically to avoid hand-rolled patterns that are easy to get subtly

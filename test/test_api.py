@@ -16,7 +16,11 @@ from acd.api import (
     find_io_addresses,
     find_tag_references,
     get_routine,
+    get_tag_value,
     io_addresses_by_routine,
+    list_routines,
+    list_tags,
+    project_summary,
     diff_io_addresses,
     diff_project,
     diff_routine,
@@ -696,6 +700,95 @@ def test_find_tag_references_regex_mode():
     results = find_tag_references(project, r"Ba[rz]", regex=True)
     keys = {(p, r) for p, r, _, _ in results}
     assert keys == {("ProgA", "Main"), ("ProgA", "Sub")}
+
+
+def test_project_summary_is_names_and_counts_only():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    summary = project_summary(project)
+
+    assert summary["controller_name"] == "CuteLogix"
+    assert set(summary["programs"]) == {p.name for p in project.controller.programs}
+    assert set(summary["tasks"]) == {t.name for t in project.controller.tasks}
+    assert summary["controller_tag_count"] == len(project.controller.tags)
+    assert summary["program_tag_counts"]["Instructions"] == len(
+        next(p for p in project.controller.programs if p.name == "Instructions").tags
+    )
+    assert summary["routine_count"] == sum(len(p.routines) for p in project.controller.programs)
+    # Never dumps actual content -- just names/counts.
+    assert "rungs" not in str(summary.keys())
+
+
+def test_list_routines_has_no_content_field():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routines = list_routines(project)
+    assert routines  # fixture has real routines
+    for r in routines:
+        assert set(r.keys()) == {"program", "routine", "type", "line_count"}
+    entry = next(r for r in routines if r["routine"] == "R033_ASCII_Conv")
+    assert entry["type"] == "RLL"
+    assert entry["line_count"] == 6
+
+
+def test_list_routines_filtered_by_program():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    all_routines = list_routines(project)
+    filtered = list_routines(project, program_name="Instructions")
+    assert filtered
+    assert all(r["program"] == "Instructions" for r in filtered)
+    assert len(filtered) < len(all_routines)
+
+
+def test_list_tags_excludes_io_and_omits_value():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    tags = list_tags(project)
+    names = {t["name"] for t in tags}
+    assert "Map:Local" not in names  # I/O tag (":" in name) -- excluded
+    assert "AdvancedMath" in names
+    for t in tags:
+        assert set(t.keys()) == {"name", "data_type", "dimensions", "description"}
+
+
+def test_list_tags_program_scope_unknown_program_raises():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    with pytest.raises(KeyError):
+        list_tags(project, program_name="NoSuchProgram")
+
+
+def test_get_tag_value_scalar_returned_in_full():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    result = get_tag_value(project, "EOT_Test")
+    assert result["value"] == 0
+    assert "total_elements" not in result  # pagination fields only apply to arrays
+
+
+def test_get_tag_value_small_array_returns_everything():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    result = get_tag_value(project, "AdvancedMath")  # DINT[10]
+    assert result["total_elements"] == 10
+    assert result["returned"] == 10
+    assert len(result["value"]) == 10
+
+
+def test_get_tag_value_large_array_paginates_by_default():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    full = next(t for t in project.controller.tags if t.name == "Branching")._initial_value
+    assert len(full) == 1000  # confirms the fixture actually exercises pagination
+
+    first_page = get_tag_value(project, "Branching")  # default limit=50
+    assert first_page["total_elements"] == 1000
+    assert first_page["offset"] == 0
+    assert first_page["returned"] == 50
+    assert first_page["value"] == full[0:50]
+
+    second_page = get_tag_value(project, "Branching", offset=50, limit=50)
+    assert second_page["offset"] == 50
+    assert second_page["value"] == full[50:100]
+
+
+def test_get_tag_value_missing_tag_raises_keyerror():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    with pytest.raises(KeyError):
+        get_tag_value(project, "NoSuchTag")
 
 
 def test_routine_insert_and_delete_rung_shift_comments_atomically():

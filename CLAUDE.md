@@ -649,6 +649,41 @@ the rung is still lost to this library the same as before — `RegnLink.Dat` is 
 a guarantee. If a rung count still looks short after this fix, that's the remaining possibility
 worth knowing about, not a sign this fix is incomplete.
 
+## Lazy / summary-first lookups: `project_summary()`, `list_routines()`, `list_tags()`, `get_tag_value()`
+
+Added in preparation for a possible future MCP server wrapping this library (not built yet, see
+the "MCP server competitive landscape" auto-memory from that discussion if you're picking this
+back up) -- the design goal discussed was that a persistent session (load once, keep the
+`Controller` object graph alive across many tool calls) solves the *load-time* cost problem, but
+tool call *responses* still need their own discipline: an MCP tool returning a whole project's
+tags/routines/UDTs in one call would blow a caller's context budget regardless of how cheap the
+underlying load was. These four functions (`acd/api.py`) give any caller (MCP wrapper or
+otherwise) a summary-first / drill-down-on-demand shape to build on, instead of every future
+caller re-deriving "walk `project.controller...` and decide what to include" from scratch:
+
+- `project_summary(project)` -- names/counts only (program/task/data-type/AOI/module names,
+  controller + per-program tag counts, total routine count). Meant as the very first call.
+- `list_routines(project, program_name=None)` -- name/type/line-count per routine, no rung/ST
+  content at all. Pairs with the already-existing `get_routine()` for one routine's actual logic.
+- `list_tags(project, program_name=None)` -- name/data_type/dimensions/description per tag,
+  deliberately WITHOUT `_initial_value` -- a UDT array tag's decoded value can be large enough on
+  its own (see below) to matter even in a "just list what's here" call. Filters through the same
+  `Tag._l5x_exclude` already used elsewhere (I/O tags, hex placeholders) since those were never
+  "real" listable tags to begin with.
+- `get_tag_value(project, tag_name, program_name=None, offset=0, limit=50)` -- the drill-down
+  counterpart to `list_tags()`: one tag's actual value, but paginated if it's a top-level array
+  (`total_elements`/`offset`/`returned` alongside a `value` slice) rather than ever returned in
+  full. Scalar values (including a scalar struct's whole dict, e.g. a TIMER) are always returned
+  in full -- pagination only applies to the outer list, mirroring the exact same "large container,
+  not large scalar" distinction `diff_project()`'s own `_summarize_value_diff()` already draws for
+  the same underlying reason (a real project's `To_VABView_Bins[50]`/`LugTrm[200]`-style tags are
+  where this actually bites, not scalar tags).
+
+All four are pure read-only additions over the existing object model -- no new binary parsing, no
+interaction with the write/export path, verified against the real `CuteLogix.ACD` fixture
+(including its real `Branching` `DINT[1000]` tag for the pagination case, `Map:Local` for the
+I/O-tag-exclusion case) in `test/test_api.py`.
+
 ## Second convenience-API batch: `new_tag()`, `diff_lines()`, `validate=True`, log-level split
 
 A second round of downstream-agent friction feedback (same style as the batch below, reflecting

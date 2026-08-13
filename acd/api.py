@@ -325,6 +325,100 @@ def _all_routines(project: RSLogix5000Content) -> Dict[Tuple[str, str], Routine]
     return result
 
 
+def project_summary(project: RSLogix5000Content) -> dict:
+    """A compact, names-and-counts-only summary of a whole project --
+    intended as the FIRST thing a caller asks for (e.g. an MCP tool's
+    "load this project" response), before drilling into any specific
+    routine/tag/UDT with a separate, narrower call. Deliberately never
+    includes routine content, tag values, or UDT member lists -- a project
+    with thousands of tags/hundreds of routines would blow a caller's
+    context budget if a "what's in this project" call returned everything
+    up front instead of just enough to know what's there and ask for more.
+
+    Returns: controller_name, program names, task names, data_type/aoi/
+    module names, controller_tag_count, per-program tag counts (dict keyed
+    by program name), and total routine_count (across all programs, not
+    including AOI logic routines -- see _all_routines() if those matter for
+    your use case).
+    """
+    ctrl = project.controller
+    return {
+        "controller_name": ctrl.name,
+        "programs": [p.name for p in ctrl.programs],
+        "tasks": [t.name for t in ctrl.tasks],
+        "data_types": [dt.name for dt in ctrl.data_types],
+        "aois": [a.name for a in ctrl.aois],
+        "modules": [m.name for m in ctrl.modules],
+        "controller_tag_count": len(ctrl.tags),
+        "program_tag_counts": {p.name: len(p.tags) for p in ctrl.programs},
+        "routine_count": sum(len(p.routines) for p in ctrl.programs),
+    }
+
+
+def list_routines(project: RSLogix5000Content, program_name: str = None) -> List[dict]:
+    """Name/type/line-count for every routine, WITHOUT rung/line content --
+    pass one of these names to get_routine() for that routine's actual
+    logic. The lazy-loading counterpart to get_routine(): use this to see
+    what routines exist before fetching any one of them in full.
+
+    program_name: filter to one program (or "AOI:<name>" for an AOI's own
+    logic routines, matching _all_routines()'s own keying) -- omit for
+    every routine project-wide.
+
+    "line_count" is len(.rungs) for RLL or len(._st_lines) for ST (see
+    _routine_lines()) -- FBD/SFC routines currently always report 0 (their
+    content isn't decoded by this library at all yet, see CLAUDE.md).
+    """
+    result = []
+    for (prog, name), routine in _all_routines(project).items():
+        if program_name is not None and prog != program_name:
+            continue
+        result.append({
+            "program": prog,
+            "routine": name,
+            "type": routine.type,
+            "line_count": len(_routine_lines(routine) or []),
+        })
+    return result
+
+
+def list_tags(project: RSLogix5000Content, program_name: str = None) -> List[dict]:
+    """Name/data_type/dimensions/description for tags in one scope, WITHOUT
+    the decoded value -- a UDT array tag's value can be large enough on its
+    own to blow a caller's context budget, so it's never included here; use
+    get_tag_value() for one specific tag's value, only when actually
+    needed. The lazy-loading counterpart to get_tag_value(), same relationship
+    list_routines() has to get_routine().
+
+    program_name=None (default) lists controller-scope tags; pass a program
+    name for that program's tags instead -- same single-scope-at-a-time
+    convention as tag_exists()/get_tag_value() use. I/O tags, alias-target
+    hex placeholders, and other tags Tag._l5x_exclude already treats as not
+    "real" (never emitted as a standalone <Tag> in a full project export
+    either) are excluded -- use find_io_addresses()/io_addresses_by_routine()
+    for I/O addressing instead.
+
+    Raises KeyError if program_name doesn't match any program.
+    """
+    if program_name is None:
+        tags = project.controller.tags
+    else:
+        program = next((p for p in project.controller.programs if p.name == program_name), None)
+        if program is None:
+            raise KeyError(f"No program named {program_name!r}")
+        tags = program.tags
+    return [
+        {
+            "name": t.name,
+            "data_type": t.data_type,
+            "dimensions": t.dimensions,
+            "description": t.description,
+        }
+        for t in tags
+        if not t._l5x_exclude
+    ]
+
+
 def get_routine(project: RSLogix5000Content, routine_name: str, program_name: str = None) -> Routine:
     """Look up a single Routine by name, instead of hand-writing the nested
     program -> routine double-lookup
@@ -565,6 +659,47 @@ def _all_tags(project: RSLogix5000Content) -> dict:
         for tag in program.tags:
             result[(program.name, tag.name)] = tag
     return result
+
+
+def get_tag_value(project: RSLogix5000Content, tag_name: str, program_name: str = None,
+                   offset: int = 0, limit: int = 50) -> dict:
+    """Fetch one tag's current decoded value, paginating it if it's a large
+    array instead of returning it in full -- a single UDT array tag (e.g. a
+    real project's 200-element struct array) can be large enough on its own
+    to blow a caller's context budget even though it's "just one tag". The
+    lazy-loading counterpart to list_tags(): list first (name/type/
+    dimensions only), then fetch a specific tag's value only when actually
+    needed, and only as much of it as needed.
+
+    program_name=None (default) looks up a controller-scope tag; pass a
+    program name for a program-scope tag instead -- same single-scope-at-a-
+    time convention as tag_exists()/list_tags().
+
+    A scalar value (int/float/a scalar struct's dict) is always returned in
+    full -- pagination only applies to a top-level array value (a list),
+    which is where real projects have shown multi-hundred-element blowups
+    (see diff_project()'s _summarize_value_diff, same rationale applied here
+    to one value instead of an old/new pair). Returns "total_elements"/
+    "offset"/"returned" alongside "value" for an array so a caller knows
+    whether there's more to fetch with a larger offset.
+
+    Raises KeyError if no tag by that name exists in the given scope.
+    """
+    tag = _all_tags(project).get((program_name or "", tag_name))
+    if tag is None:
+        raise KeyError(f"No tag {tag_name!r} in scope {program_name or 'controller'!r}")
+    base = {"name": tag.name, "data_type": tag.data_type, "dimensions": tag.dimensions}
+    value = tag._initial_value
+    if isinstance(value, list):
+        total = len(value)
+        base["total_elements"] = total
+        base["offset"] = offset
+        page = value[offset:offset + limit]
+        base["returned"] = len(page)
+        base["value"] = page
+    else:
+        base["value"] = value
+    return base
 
 
 def _diff_tags(project_a: RSLogix5000Content, project_b: RSLogix5000Content) -> dict:

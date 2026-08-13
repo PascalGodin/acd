@@ -58,6 +58,26 @@ Studio enforces a `FileInfo.Dat` checksum on open that this library
 cannot re-sign without a key it does not have, so `save_acd()` only
 produces an openable file for a completely unmodified round-trip.
 
+LAZY / SUMMARY-FIRST LOOKUPS -- for a caller operating under a context
+budget (e.g. an MCP tool response), prefer these over walking
+`project.controller...` yourself and returning everything you find. Each
+has a "list names/counts only" step and a separate "fetch this ONE thing
+in full" step, so a caller never gets more than it actually asked for:
+  - `project_summary(project)` -- names/counts only (programs, tasks, data
+    types, AOIs, modules, tag counts, routine count) for an initial "what's
+    in this project" response, before drilling into anything specific.
+  - `list_routines(project, program_name=None)` -- name/type/line-count for
+    every routine, no rung/line content -- then `get_routine()` for one
+    routine's actual logic.
+  - `list_tags(project, program_name=None)` -- name/data_type/dimensions/
+    description for tags in one scope, WITHOUT the decoded value (which can
+    be large on its own for a UDT array tag) -- then `get_tag_value()` for
+    one tag's value, only when actually needed.
+  - `get_tag_value(project, tag_name, program_name=None, offset=0, limit=50)`
+    -- one tag's value, paginated if it's a large array (returns
+    total_elements/offset/returned alongside value) rather than dumping a
+    multi-hundred-element array in one call.
+
 EDITING RUNGS -- avoid hand-rolling these, they're easy to get subtly
 wrong (see README.md for full examples):
   - `get_routine(project, routine_name, program_name=None)` -- instead of
@@ -104,7 +124,11 @@ from acd.api import (  # noqa: F401
     find_io_addresses,
     find_tag_references,
     get_routine,
+    get_tag_value,
     io_addresses_by_routine,
+    list_routines,
+    list_tags,
+    project_summary,
     diff_io_addresses,
     diff_project,
     diff_routine,

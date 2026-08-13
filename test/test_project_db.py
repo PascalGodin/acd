@@ -20,6 +20,7 @@ from acd import (
     db_new_member,
     db_new_tag,
     db_tag_exists,
+    db_transaction,
     open_project_db,
 )
 from acd.api import get_routine, load_acd
@@ -574,3 +575,80 @@ def test_project_lock_steals_a_stale_lock(tmp_path):
         assert elapsed < 2  # stolen quickly, not waited out for the full timeout
     finally:
         lock.release()
+
+
+# ---- transactions ----
+
+def test_transaction_commits_all_edits_together(acd_copy):
+    with db_transaction(str(acd_copy)) as db:
+        db.new_tag("TXN_TAG_A", "DINT")
+        db.new_tag("TXN_TAG_B", "DINT")
+
+    check = open_project_db(str(acd_copy))
+    try:
+        assert check.tag_exists("TXN_TAG_A") is True
+        assert check.tag_exists("TXN_TAG_B") is True
+    finally:
+        check.close()
+
+
+def test_transaction_rolls_back_all_edits_on_exception(acd_copy):
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        with db_transaction(str(acd_copy)) as db:
+            db.new_tag("TXN_ROLLBACK_TAG", "DINT")
+            raise _Boom("simulated failure partway through")
+
+    check = open_project_db(str(acd_copy))
+    try:
+        assert check.tag_exists("TXN_ROLLBACK_TAG") is False
+    finally:
+        check.close()
+
+
+def test_transaction_partial_multi_step_edit_rolls_back_completely(acd_copy):
+    """The exact scenario reported: add a UDT member, create tags, edit a
+    rung, then fail partway through -- nothing from the whole attempt
+    should be durably visible afterward.
+    """
+    program_name, routine_name = _first_routine_via_path(acd_copy)
+    summary_before = db_get_project_summary(str(acd_copy))
+    dt_name = summary_before["data_types"][0]
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        with db_transaction(str(acd_copy)) as db:
+            db.new_member(dt_name, "TXN_PARTIAL_MEMBER", "DINT")
+            db.new_tag("TXN_PARTIAL_TAG_1", "DINT")
+            db.new_tag("TXN_PARTIAL_TAG_2", "DINT")
+            db.insert_rung(routine_name, 0, "NOP();", program_name=program_name)
+            raise _Boom("simulated failure on step 5")
+
+    check = open_project_db(str(acd_copy))
+    try:
+        assert check.tag_exists("TXN_PARTIAL_TAG_1") is False
+        assert check.tag_exists("TXN_PARTIAL_TAG_2") is False
+        project = check.to_controller()
+        dt = next(d for d in project.controller.data_types if d.name == dt_name)
+        assert not any(m.name == "TXN_PARTIAL_MEMBER" for m in dt.members)
+        routine = get_routine(project, routine_name, program_name)
+        assert routine.rungs[0] != "NOP();"
+    finally:
+        check.close()
+
+
+def test_transaction_cannot_be_nested(acd_copy):
+    with db_transaction(str(acd_copy)) as db:
+        with pytest.raises(RuntimeError):
+            with db.transaction():
+                pass
+
+
+def test_transaction_sees_its_own_uncommitted_writes(acd_copy):
+    with db_transaction(str(acd_copy)) as db:
+        db.new_tag("TXN_VISIBLE_MID_BLOCK", "DINT")
+        assert db.tag_exists("TXN_VISIBLE_MID_BLOCK") is True

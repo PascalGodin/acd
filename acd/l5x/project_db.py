@@ -39,7 +39,23 @@ construction nothing else can be mid-operation while the lock is held.
 `open_project_db()`/`ProjectDB` are still there for a script doing many
 edits in one session that wants to hold the lock across all of them rather
 than pay one acquire/release cycle per edit.
+
+ATOMICITY ACROSS SEVERAL EDITS -- `db_transaction()`/`ProjectDB.transaction()`.
+Each `db_*` call commits the instant it returns -- unlike the old in-memory
+workflow (`load_acd()` + edit + `export_routine()`), where a script that
+raised partway through left zero durable side effects simply because
+nothing was ever written until a final export call succeeded. With `db_*`,
+a script that adds a UDT member, creates 3 tags, then raises on tag 4 has
+already durably committed the member and the first 3 tags -- nothing marks
+that as an incomplete attempt. Found via a real downstream report after a
+session's worth of scripts that used to fail "cleanly" (collision asserts,
+typos, ...) started leaving partial state behind instead. Use
+`db_transaction(acd_path)` (a context manager) to batch several edits into
+one atomic unit -- see its own docstring for the "don't call db_* functions
+inside the block" caveat (they'd deadlock against the transaction's own
+held lock).
 """
+import contextlib
 import json
 import os
 import sqlite3
@@ -507,12 +523,18 @@ class ProjectDB:
     Edits (`new_tag`/`edit_tag`/`new_member`/`insert_rung`/`delete_rung`/
     `replace_rung_safe`/`set_tag_comment`) write straight into the
     underlying SQLite tables and commit immediately -- there is no
-    in-memory staging step, no separate "save" call. Every method that
-    needs to resolve a name against this project's current live state
+    in-memory staging step, no separate "save" call -- UNLESS called inside
+    a `.transaction()` block (see its own docstring), which defers every
+    edit's commit to the block's own exit instead, rolling all of them back
+    together if anything inside the block raises. Every method that needs
+    to resolve a name against this project's current live state
     (`edit_tag`, `insert_rung`, `to_controller`, ...) reads the DB fresh
-    each call, so edits made by a different process against the same
-    `acd_path`/`project_dir` (opened via its own `open_project_db()` call)
-    are visible immediately, no polling/refresh step needed.
+    each call (including its own uncommitted writes from earlier in the
+    same `.transaction()` block, if any -- a single SQLite connection
+    always sees its own in-flight changes), so edits made by a different
+    process against the same `acd_path`/`project_dir` (opened via its own
+    `open_project_db()` call) are visible immediately once committed, no
+    polling/refresh step needed.
 
     Holds this project's `_ProjectLock` for its entire lifetime (acquired
     by `open_project_db()` before this object is constructed, released by
@@ -527,6 +549,7 @@ class ProjectDB:
         self.project_dir = project_dir
         self._conn = conn
         self._lock = lock
+        self._in_transaction = False
 
     def close(self) -> None:
         self._conn.close()
@@ -537,6 +560,49 @@ class ProjectDB:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Batch several edit calls into ONE atomic unit: nothing commits
+        until the `with` block exits cleanly; if anything inside it raises,
+        every edit made so far in the block is rolled back together, not
+        left as whatever partial state happened to exist at the moment of
+        the exception. See this module's own top-level docstring
+        ("ATOMICITY ACROSS SEVERAL EDITS") for the real report that
+        prompted this -- without it, each edit method commits independently
+        the instant it returns, so a script that raises partway through a
+        multi-step edit leaves everything up to that point durably sitting
+        in the DB with nothing marking it as an incomplete attempt.
+
+            with db.transaction():
+                db.new_member(dt_name, "Foo", "DINT")
+                db.new_tag("Tag1", "DINT")
+                db.new_tag("Tag2", "DINT")
+                db.insert_rung(routine_name, 0, "...")
+            # all four committed together, or none of them did
+
+        Do NOT call the stateless `db_*` functions (`db_new_tag`, ...) from
+        inside this block -- each of those opens its OWN connection and
+        tries to acquire the SAME project lock this transaction is already
+        holding, and will hang until that call's own lock-acquire timeout
+        rather than deadlock instantly. Use this `ProjectDB` instance's own
+        methods instead (`db.new_tag(...)`, not `acd.db_new_tag(...)`).
+
+        Cannot be nested (raises `RuntimeError`) -- this is one flat
+        transaction, not SAVEPOINT-based partial rollback.
+        """
+        if self._in_transaction:
+            raise RuntimeError("ProjectDB.transaction() cannot be nested")
+        self._in_transaction = True
+        try:
+            yield self
+        except Exception:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
+        finally:
+            self._in_transaction = False
 
     # ---- scope resolution helpers ----
 
@@ -610,7 +676,8 @@ class ProjectDB:
                 (tag_id, path, text),
             )
         cur.execute("UPDATE proj_meta SET dirty=1")
-        self._conn.commit()
+        if not self._in_transaction:
+            self._conn.commit()
         return tag_id
 
     def edit_tag(self, name: str, program_name: Union[str, None] = None,
@@ -640,7 +707,8 @@ class ProjectDB:
             cur.execute("INSERT INTO proj_tag_comments (tag_id, path, text) VALUES (?, '', ?)",
                         (tag_id, description))
         cur.execute("UPDATE proj_meta SET dirty=1")
-        self._conn.commit()
+        if not self._in_transaction:
+            self._conn.commit()
 
     def set_tag_comment(self, name: str, path: str, text: str,
                          program_name: Union[str, None] = None) -> None:
@@ -662,7 +730,8 @@ class ProjectDB:
         cur.execute("INSERT INTO proj_tag_comments (tag_id, path, text) VALUES (?, ?, ?)",
                     (tag_id, path, text))
         cur.execute("UPDATE proj_meta SET dirty=1")
-        self._conn.commit()
+        if not self._in_transaction:
+            self._conn.commit()
 
     def new_member(self, data_type_name: str, name: str, member_data_type: str,
                     dimension: int = 0, radix: Union[str, None] = None,
@@ -706,7 +775,8 @@ class ProjectDB:
         )
         member_id = cur.lastrowid
         cur.execute("UPDATE proj_meta SET dirty=1")
-        self._conn.commit()
+        if not self._in_transaction:
+            self._conn.commit()
         return member_id
 
     def insert_rung(self, routine_name: str, index: int, text: str,
@@ -741,7 +811,8 @@ class ProjectDB:
             (routine_id, index, text, comment),
         )
         cur.execute("UPDATE proj_meta SET dirty=1")
-        self._conn.commit()
+        if not self._in_transaction:
+            self._conn.commit()
 
     def delete_rung(self, routine_name: str, index: int,
                      program_name: Union[str, None] = None) -> None:
@@ -762,7 +833,8 @@ class ProjectDB:
             (routine_id,),
         )
         cur.execute("UPDATE proj_meta SET dirty=1")
-        self._conn.commit()
+        if not self._in_transaction:
+            self._conn.commit()
 
     def replace_rung_safe(self, routine_name: str, index: int, expected_old: str,
                            new_text: str, program_name: Union[str, None] = None) -> None:
@@ -785,7 +857,8 @@ class ProjectDB:
         cur.execute("UPDATE proj_rungs SET text=? WHERE routine_id=? AND rung_index=?",
                     (new_text, routine_id, index))
         cur.execute("UPDATE proj_meta SET dirty=1")
-        self._conn.commit()
+        if not self._in_transaction:
+            self._conn.commit()
 
     # ---- rehydration ----
 
@@ -992,6 +1065,38 @@ def _run(acd_path, project_dir, verbose, fn):
     db = open_project_db(acd_path, project_dir=project_dir, verbose=verbose)
     try:
         return fn(db)
+    finally:
+        db.close()
+
+
+@contextlib.contextmanager
+def db_transaction(acd_path, project_dir=None, verbose: bool = False):
+    """Context manager: batch several edits into ONE atomic unit, using the
+    yielded `ProjectDB`'s own methods -- commits everything together on a
+    clean exit, rolls back everything together if an exception propagates
+    out of the block. See `ProjectDB.transaction()`'s own docstring for the
+    full rationale and the "don't call db_* functions inside this block"
+    warning (each of those opens a separate connection and would deadlock
+    against this one's still-held lock).
+
+        with db_transaction(acd_path) as db:
+            db.new_member(dt_name, "Foo", "DINT")
+            db.new_tag("Tag1", "DINT")
+            db.insert_rung(routine_name, 0, "...")
+        # all three committed together, or none of them did
+
+    Use this whenever a script needs several edits to succeed or fail as
+    one unit -- without it, each db_* call commits independently the
+    instant it returns, so a script that raises partway through a
+    multi-step edit leaves everything up to that point durably sitting in
+    the DB, with nothing marking it as an incomplete attempt (a real
+    behavioral difference from the old in-memory workflow, where a crashed
+    script left zero durable side effects for free).
+    """
+    db = open_project_db(acd_path, project_dir=project_dir, verbose=verbose)
+    try:
+        with db.transaction():
+            yield db
     finally:
         db.close()
 

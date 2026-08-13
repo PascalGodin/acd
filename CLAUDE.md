@@ -2571,6 +2571,63 @@ itself rather than depending on the small `CuteLogix.ACD` fixture happening to t
 internal `log.info()` call it may not have any real reason to emit (no deleted UDT members in that
 fixture) regardless of whether the fix is present.
 
+### Second real-usage feedback: partial multi-step edits are now durable, not atomic-by-accident
+
+A follow-up report from the same downstream agent, articulating a real architectural shift in
+failure-mode risk that neither the original design discussion nor the first feedback round had
+addressed. With the OLD in-memory workflow (`load_acd()` + edit + `export_routine()`), a script that
+raised partway through (collision asserts, typos, the `dimension=None` mistake documented elsewhere
+in this file, ...) left zero durable side effects — not because anything was designed to guarantee
+that, but purely as a side effect of nothing ever persisting between separate process invocations in
+the first place. A failed script was, for free, a clean slate to just fix and rerun.
+
+With `db_*`, each call commits independently the instant it returns. A script doing several edits in
+a row — add a UDT member, create 3 tags, edit 2 rungs — that raises on step 4 has already durably
+committed steps 1-3, with nothing in the DB marking that as an incomplete attempt. The practical
+mitigation the agent had already been relying on (check `db_get_project_summary`/`db_list_tags` at
+the start of a retry to spot and clean up a stray partial attempt) works, but is easy to forget, and
+puts the burden on every caller to reimplement the same defensive check.
+
+Added real transaction support rather than leaving this as caller discipline, matching this whole
+subsystem's own established principle (see the `_ProjectLock`/`db_*` redesign above: don't rely on a
+caller remembering something, make the failure mode structurally impossible instead):
+
+- **`ProjectDB.transaction()`** (a context manager): every edit method's own `self._conn.commit()`
+  becomes conditional (`if not self._in_transaction: self._conn.commit()`) — inside a `with
+  db.transaction():` block, nothing commits until the block exits cleanly; `self._conn.rollback()`
+  runs instead if anything inside it raises, undoing every edit made so far in the block, not just
+  the one that failed. Cannot be nested (raises `RuntimeError`) — this is one flat transaction, not
+  SAVEPOINT-based partial rollback, which wasn't asked for and would add real complexity for no
+  reported need.
+- **`db_transaction(acd_path)`** (a `@contextlib.contextmanager` function): the `db_*`-surface
+  equivalent — opens a `ProjectDB`, wraps the whole `with` block in `.transaction()`, closes on exit
+  either way. Exported at the top level (`acd/__init__.py`) and documented in its module docstring
+  alongside the other `db_*` functions, since this fills a real gap in the *recommended* workflow,
+  not just the advanced `ProjectDB` one.
+- **A real footgun, called out explicitly in both docstrings**: calling a stateless `db_*` function
+  (`db_new_tag`, ...) from INSIDE a `db_transaction()`/`.transaction()` block doesn't raise or silently
+  misbehave — it hangs. Each `db_*` call opens its own separate connection and tries to acquire the
+  SAME project lock the enclosing transaction is already holding, blocking until that inner call's own
+  `_ProjectLock` timeout. Must use the yielded `db` object's own methods (`db.new_tag(...)`) inside the
+  block, never `acd.db_new_tag(...)`.
+- Reads (`to_controller()`, `list_tags()`, ...) called from inside an open transaction correctly see
+  its own uncommitted writes — a single SQLite connection always sees its own in-flight changes, no
+  special handling needed; verified directly
+  (`test_transaction_sees_its_own_uncommitted_writes`).
+- Cross-process isolation was already covered by the existing `_ProjectLock` (held for the whole
+  `ProjectDB`/`db_transaction()` lifetime, transaction or not) — a transaction in progress on one
+  connection already fully blocks any other process's `open_project_db()`/`db_*` call for its
+  duration, so adding rollback semantics didn't need any new concurrency-control work on top of what
+  already existed.
+
+Verified with the exact reported scenario, not just the individual primitives: a transaction adding
+a UDT member, two tags, and a rung, deliberately failing on a simulated "step 5," confirming NONE of
+the first four steps are visible afterward (`test_transaction_partial_multi_step_edit_rolls_back_completely`)
+— plus commit-together, rollback-together, nesting-raises, and mid-transaction-visibility as separate
+tests. Full suite unaffected by this change outside the new tests (every edit method's *end result*
+for a caller not using `.transaction()` is identical to before — commit still happens, just
+conditionally rather than unconditionally).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

@@ -90,6 +90,27 @@ EDITS -- durable the moment the call returns (see above), each raising
     otherwise) -- guards against clobbering a rung someone hand-edited in
     Studio since your last read.
 
+MULTI-STEP EDITS THAT MUST SUCCEED OR FAIL TOGETHER -- each `db_*` call
+above commits the instant it returns; a script doing several of them in a
+row (e.g. add a UDT member, then create 3 tags, then edit 2 rungs) that
+raises partway through leaves everything up to that point durably sitting
+in the DB, with nothing marking it as an incomplete attempt -- unlike the
+old in-memory workflow, where a crashed script left zero durable side
+effects for free (nothing was ever written until a final export call
+succeeded). Use `db_transaction(acd_path)` for anything that needs
+all-or-nothing semantics:
+
+    with db_transaction(acd_path) as db:
+        db.new_member(dt_name, "Foo", "DINT")
+        db.new_tag("Tag1", "DINT")
+        db.insert_rung(routine_name, 0, "...")
+    # all three committed together, or (if anything raised) none did
+
+Inside the block, call methods on the yielded `db` (`db.new_tag(...)`), NOT
+the top-level `db_*` functions (`db_new_tag(...)`) -- each of those opens
+its own separate connection and would deadlock trying to acquire the same
+project lock this transaction is already holding.
+
 EXPORTING TO REAL STUDIO 5000 -- the only durable write path (see above):
   - `db_export_routine(acd_path, routine_name, output_path,
     program_name=None, owner=None, validate=False)` -- a standalone
@@ -153,6 +174,7 @@ from acd.api import diff_lines, find_io_addresses  # noqa: F401
 from acd.l5x.project_db import (  # noqa: F401
     open_project_db,
     ProjectDB,
+    db_transaction,
     db_new_tag,
     db_edit_tag,
     db_set_tag_comment,

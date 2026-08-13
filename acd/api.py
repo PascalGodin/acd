@@ -220,14 +220,14 @@ _IO_ADDRESS_RE = re.compile(
 
 def find_io_addresses(text: str) -> List[str]:
     """Extract every I/O-style tag address referenced in one rung/ST-line of
-    text, e.g. "IO024:I.Data[0].13", "Remote_GraderConsole:3:I.Pt13.Data",
-    "Local:10:I.Data.11", "Sorter_VFD:I.DriveStatus_Active" -- in
+    text, e.g. "IO024:I.Data[0].13", "Remote_Rack1:3:I.Pt13.Data",
+    "Local:10:I.Data.11", "MyVFD:I.DriveStatus_Active" -- in
     left-to-right order, duplicates included.
 
     A real I/O address always contains a ":" (reserved by Rockwell's own
     tag-naming rules for module addressing), so this never matches a plain
-    UDT member path like "M304_Sorter_Lug_Chain.VFD.Running" -- no
-    false-positive collisions with ordinary tag/member references.
+    UDT member path like "MyMotor.VFD.Running" -- no false-positive
+    collisions with ordinary tag/member references.
 
     Use this instead of writing a new regex for this address shape --
     hand-rolled versions are easy to get subtly wrong (unbalanced brackets,
@@ -500,11 +500,10 @@ def find_tag_references(
     `f"AOI:{aoi_name}"`.
 
     By default `name` is matched as a whole token with word boundaries on
-    both sides -- searching for "TrimPattern" will NOT match inside
-    "TrimPattern2" or ".TrimPattern_Old". Pass `regex=True` to supply your
-    own pattern instead (e.g. a family of names, or an address suffix like
-    `r"\\.Length_In\\b"`) -- `name` is then used as a raw `re` pattern, not
-    escaped.
+    both sides -- searching for "MyTag" will NOT match inside "MyTag2" or
+    ".MyTag_Old". Pass `regex=True` to supply your own pattern instead (e.g.
+    a family of names, or an address suffix like `r"\\.MemberName\\b"`) --
+    `name` is then used as a raw `re` pattern, not escaped.
     """
     pattern = name if regex else r"\b" + re.escape(name) + r"\b"
     compiled = re.compile(pattern)
@@ -825,18 +824,19 @@ def _referenced_tag_names(rung_texts) -> set:
     AFI (Always False Instruction) mnemonic -- "AFI()" in the rung text
     wrongly matched that unrelated real tag by name, pulling it in as
     context even though the rung has nothing to do with it. This exclusion
-    is safe for AOI instance calls too (e.g. "AOI_RPMtoFPM(TestFPM,...)"):
+    is safe for AOI instance calls too (e.g. "MyAOI(MyAoiInstance,...)"):
     the AOI's own mnemonic name isn't a tag and was never meant to be
     matched here -- it's resolved separately via the instance tag's own
     data_type field (see _resolve_type_closure()).
 
     A token immediately preceded by "." is also excluded: in Rockwell
-    address syntax "." always introduces a MEMBER name (e.g. "Length_In" in
-    "ToTrim[Timing.Length_Lug].Length_In"), never a fresh, independent tag
-    reference -- a real tag reference never itself follows a literal ".".
-    Found via the same real project: an unrelated real tag happened to be
-    named "Length_In", coincidentally matching the member-access suffix
-    ".Length_In" in several rungs and getting wrongly pulled in as context.
+    address syntax "." always introduces a MEMBER name (e.g. "InputLength"
+    in "MyTag[SubStruct.SomeMember].InputLength"), never a fresh,
+    independent tag reference -- a real tag reference never itself follows
+    a literal ".". Found via a real project: an unrelated real tag happened
+    to be named "InputLength" (renamed here), coincidentally matching a
+    member-access suffix of the same name in several rungs and getting
+    wrongly pulled in as context.
     """
     import re
     token_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -857,10 +857,10 @@ def _referenced_tag_names(rung_texts) -> set:
 def _referenced_modules(rung_texts, project: RSLogix5000Content) -> list:
     """Resolve which Module dependencies a routine's rung text needs, the
     same way Studio's own "Export Routine" does (confirmed against a real
-    export of Motors/Main_Motors in BPM_TrimmerSorter_20260709.ACD, whose
-    rung text references "Local:12:I.Data.0"/"Local:12:I.Data.1" and
-    "VFD_P_INTBL2:I.OutputFreq" -- Studio's own <Modules Use="Context">
-    section included exactly {"AC_IN_12", "Local", "VFD_P_INTBL2"}).
+    export of a routine whose rung text references "Local:12:I.Data.0"/
+    "Local:12:I.Data.1" and "VFD1:I.OutputFreq" -- Studio's own
+    <Modules Use="Context"> section included exactly {"InputCard1",
+    "Local", "VFD1"}).
 
     Standard Logix I/O tag addressing has two shapes: "ModuleName:Type..."
     (a directly-addressed module, e.g. an Ethernet-connected drive) needs
@@ -868,12 +868,12 @@ def _referenced_modules(rung_texts, project: RSLogix5000Content) -> list:
     addressing, e.g. a local-chassis input card) needs BOTH the chassis
     module itself (here "Local") AND whichever module actually occupies
     that slot (found via Module.parent_module == chassis name and
-    Module._slot == the slot number -- here that's "AC_IN_12", slot 12 of
+    Module._slot == the slot number -- here that's "InputCard1", slot 12 of
     "Local") -- confirmed exactly against the real export above (it
-    included "AC_IN_12" and "Local" for the 3-part reference, but did NOT
-    include "Ethernet2", the parent of the 2-part-addressed
-    "VFD_P_INTBL2" -- so a directly-addressed module's own parent is NOT
-    walked, only a slot occupant's rack).
+    included "InputCard1" and "Local" for the 3-part reference, but did NOT
+    include "EthernetBridge1", the parent of the 2-part-addressed "VFD1" --
+    so a directly-addressed module's own parent is NOT walked, only a slot
+    occupant's rack).
 
     Caveat: verified against exactly one real project's one rack (a local
     chassis) plus one direct Ethernet device -- topologies with bridged/
@@ -910,10 +910,10 @@ def _referenced_called_routines(rung_texts, program) -> list:
     text calls via JSR (subroutine calls can't cross program boundaries in
     native ladder logic), so they can be included as empty
     <Routine Use="Reference"> stubs the way Studio's own "Export Routine"
-    does -- confirmed against a real export: Motors/Main_Motors calls
-    "JSR(Infeed_LandingTable,0);", and the real export included an empty
-    <Routine Use="Reference" Name="Infeed_LandingTable"></Routine> alongside
-    the actual <Routine Use="Target" Name="Main_Motors">.
+    does -- confirmed against a real export: a routine calls
+    "JSR(CalledRoutine,0);", and the real export included an empty
+    <Routine Use="Reference" Name="CalledRoutine"></Routine> alongside the
+    actual <Routine Use="Target" Name="...">.
     """
     import re
     jsr_re = re.compile(r"\bJSR\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)")
@@ -1059,17 +1059,17 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     <AddOnInstructionDefinitions Use="Context">, placed right after
     <Modules Use="Context"> and before <Tags Use="Context"> -- this whole
     section's placement/shape IS now verified against a real Studio export
-    (Motors/Main_Motors, which calls AOI_RPMtoFPM -- see CLAUDE.md "Native-
-    import escape hatches"). Module dependencies (a routine referencing an
-    I/O tag, e.g. "Local:12:I.Data.0" or a direct-addressed
-    "VFD_P_INTBL2:I.OutputFreq") are resolved via _referenced_modules() and
-    emitted as empty <Module Use="Reference" Name="..."> stubs under
-    <Modules Use="Context"> -- also verified against that same real export.
-    Routine dependencies (the target routine calling another routine in the
-    same program via JSR) are resolved via _referenced_called_routines() and
-    emitted as an empty <Routine Use="Reference" Name="..."> stub alongside
-    the real <Routine Use="Target">-- also verified against that same
-    export (Main_Motors calls JSR(Infeed_LandingTable,0)).
+    (a routine that calls an AOI instruction -- see CLAUDE.md "Native-import
+    escape hatches"). Module dependencies (a routine referencing an I/O tag,
+    e.g. "Local:12:I.Data.0" or a direct-addressed "VFD1:I.OutputFreq") are
+    resolved via _referenced_modules() and emitted as empty
+    <Module Use="Reference" Name="..."> stubs under <Modules Use="Context">
+    -- also verified against that same real export. Routine dependencies
+    (the target routine calling another routine in the same program via
+    JSR) are resolved via _referenced_called_routines() and emitted as an
+    empty <Routine Use="Reference" Name="..."> stub alongside the real
+    <Routine Use="Target"> -- also verified against that same export (the
+    target routine calls JSR(CalledRoutine,0)).
 
     ST routines are supported the same way: `Routine.to_xml()` already
     renders an ST routine's own content as <STContent><Line .../></STContent>
@@ -1184,28 +1184,28 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
             break
         referenced_names |= new_names
 
-    # An Alias's own target can resolve to an I/O tag (e.g. LngthLmt_16ft ->
-    # "Remote_TrimmerIO:0:I.Data.7") -- the base-name resolution above
-    # correctly identifies "Remote_TrimmerIO:0:I" as a referenced name, but
-    # that literal I/O Tag object must NOT be emitted as its own <Tag>
-    # element: Tag._l5x_exclude already encodes exactly this rule for a
-    # normal full-project export (I/O tags never appear as standalone
-    # <Tag> elements there either), but export_routine() builds its own
-    # ad-hoc tag lists rather than going through that generic list-section
+    # An Alias's own target can resolve to an I/O tag (e.g. MyAliasTag ->
+    # "Remote_Rack1:0:I.Data.7") -- the base-name resolution above correctly
+    # identifies "Remote_Rack1:0:I" as a referenced name, but that literal
+    # I/O Tag object must NOT be emitted as its own <Tag> element:
+    # Tag._l5x_exclude already encodes exactly this rule for a normal
+    # full-project export (I/O tags never appear as standalone <Tag>
+    # elements there either), but export_routine() builds its own ad-hoc tag
+    # lists rather than going through that generic list-section
     # serialization, so the exclusion was never applied here. Confirmed via
     # a real Studio 5000 import rejecting exactly this: "Error creating
-    # 'Tag[@Name="Remote_TrimmerIO:0:I"]' (Invalid name.)".
+    # 'Tag[@Name="Remote_Rack1:0:I"]' (Invalid name.)".
     program_tags = [t for t in program_tags if not t._l5x_exclude]
 
     # The I/O tag's *owning Module(s)* (per the rack/slot rule in
     # _referenced_modules()) ARE what Studio references instead -- verified
-    # against a real Studio export of LS_Read: LngthLmt_16ft's alias target
-    # above needs both "Remote_TrimmerIO" (the rack) and "Trimmer_Inputs"
-    # (the module occupying slot 0 of that rack), even though neither name
-    # appears literally in the routine's own rung text -- only in the
-    # alias's target string. Collected here (any referenced_names entry
-    # that looks like an I/O tag reference) and fed to _referenced_modules()
-    # below alongside the routine's own rungs.
+    # against a real Studio export: an alias's target above needs both
+    # "Remote_Rack1" (the rack) and "InputModule1" (the module occupying
+    # slot 0 of that rack), even though neither name appears literally in
+    # the routine's own rung text -- only in the alias's target string.
+    # Collected here (any referenced_names entry that looks like an I/O tag
+    # reference) and fed to _referenced_modules() below alongside the
+    # routine's own rungs.
     alias_io_targets = [name for name in referenced_names if ":" in name]
 
     # Standard Logix scoping: a program-scope tag shadows a same-named
@@ -1239,7 +1239,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # successfully, then diffing it attribute-by-attribute against ours.
     data_types_xml = "".join(dt.to_xml() for dt in referenced_data_types)
 
-    # Modules: verified against the real Motors/Main_Motors export -- see
+    # Modules: verified against a real routine export -- see
     # _referenced_modules() for the rack/slot-vs-direct-addressing rule.
     # Each <Module> is an empty Use="Reference" stub (just a name), not a
     # full definition -- confirmed against the real export. Also scans
@@ -1264,7 +1264,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
 
     # Routines called via JSR within the same program: empty Use="Reference"
     # stubs alongside the real Use="Target" routine -- verified against that
-    # same real export (Main_Motors calls JSR(Infeed_LandingTable,0)).
+    # same real export (the target routine calls JSR(CalledRoutine,0)).
     referenced_routines = _referenced_called_routines(routine_lines, program)
     called_routines_xml = "".join(
         f'<Routine Use="Reference" Name="{_escape_xml_attr(r.name)}">\n</Routine>\n'
@@ -1279,10 +1279,10 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
 
     # A real "Export Routine" output includes an XML comment right after the
     # declaration, mirroring the routine's own <Description> (e.g. a routine
-    # named "Lug_Skip" with description "Shift the Data on the Grading Chain
-    # and Start a Skip if needed" gets that exact text as a leading
-    # "<!--...-->" comment). "--" is illegal inside an XML comment body, so
-    # it's split apart if present to keep the file well-formed.
+    # with description "Shift the data forward and start a new cycle if
+    # needed" gets that exact text as a leading "<!--...-->" comment).
+    # "--" is illegal inside an XML comment body, so it's split apart if
+    # present to keep the file well-formed.
     leading_comment = ""
     if routine._description:
         # Normalize line endings to bare "\n" first -- Path.write_text()'s

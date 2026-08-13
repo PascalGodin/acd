@@ -259,17 +259,17 @@ class ExportL5x:
         # inserted last here -- an accepted, pre-existing ambiguity for the rare real
         # case an object_id genuinely isn't unique, not something introduced by this fix.
         #
-        # A "__Map:" prefix (e.g. "__Map:VAB_SERVER_Bridge") marks an internal shadow
-        # comps object distinct from the real Module/device object of the same base
-        # name (confirmed: two different object_ids, different parents) -- some raw
+        # A "__Map:" prefix (e.g. "__Map:MyModule") marks an internal shadow comps
+        # object distinct from the real Module/device object of the same base name
+        # (confirmed: two different object_ids, different parents) -- some raw
         # @HEX@ tag references in SbRegion.Dat point at the shadow object rather than
         # the real one (seen on every GSV(Module, ...) instruction sampled), but real
         # Studio 5000 never emits the "__Map:" prefix itself in rendered ladder text.
         # Stripping it here, at the single shared source for both rung-text resolution
         # (SbRegionRecord.parse) and tag-ref write-back (_restore_tag_refs), keeps both
         # consistent. Found via a real V38.02 project's whole-project L5X ground truth:
-        # GSV(Module,__Map:FencePositioner1,...) where real Studio shows
-        # GSV(Module,FencePositioner1,...) -- verified against every one of 15 affected
+        # GSV(Module,__Map:MyModule,...) where real Studio shows
+        # GSV(Module,MyModule,...) -- verified against every one of 15 affected
         # routines project-wide, zero remaining differences after stripping.
         name_lookup = {
             t[0]: (t[2][len("__Map:") :] if t[2].startswith("__Map:") else t[2])
@@ -315,15 +315,15 @@ class ExportL5x:
         #
         # rung_content (t[7]) is also included: a routine's own whole-routine Description
         # and one of its rung comments can share the exact same (parent, tag_reference="",
-        # scope_id, object_id) -- verified against a real project where a "Get_Bin"
-        # routine's real Description ("Find bin for current set") and an unrelated rung
-        # comment ("****Get_BIN\nSearch for available bin...") both had object_id=1 under
-        # the same parent/scope_id, distinguished *only* by rung_content (0 for the
-        # description, nonzero for the rung comment -- the same field
-        # RoutineBuilder.build() already uses to tell them apart). Without rung_content in
-        # this key, the dedup step silently discarded whichever of the two had the shorter
-        # text -- not just a missing Description, but a risk of *also* dropping a real rung
-        # comment in the reverse case.
+        # scope_id, object_id) -- verified against a real project where a routine's real
+        # Description ("Find the next available slot") and an unrelated rung comment
+        # ("Search for an available slot...") both had object_id=1 under the same
+        # parent/scope_id, distinguished *only* by rung_content (0 for the description,
+        # nonzero for the rung comment -- the same field RoutineBuilder.build() already
+        # uses to tell them apart). Without rung_content in this key, the dedup step
+        # silently discarded whichever of the two had the shorter text -- not just a
+        # missing Description, but a risk of *also* dropping a real rung comment in the
+        # reverse case.
         seen: Dict[tuple, tuple] = {}
         for t in comment_tuples:
             key = (t[5], t[6], t[9], t[7])

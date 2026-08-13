@@ -37,7 +37,7 @@ by aligning content with `difflib`, not by index:
     changed?"); it reports nothing about tag values or rung logic changes,
     so it is the wrong default for a broad comparison.
 All three also avoid a hand-rolled regex over rung text for I/O addresses
-(`"Remote_GraderConsole:3:I.Pt13.Data"`, `"IO024:I.Data[0].13"` are easy to
+(`"Remote_Rack1:3:I.Pt13.Data"`, `"IO024:I.Data[0].13"` are easy to
 mis-tokenize) -- see `find_io_addresses()`/`io_addresses_by_routine()` if you
 need the raw address list rather than a diff.
 

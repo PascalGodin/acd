@@ -133,16 +133,16 @@ for path, text in tag._comments:
         print(f"{path}: {text}")
 
 # e.g.:
-#   HTV_BStatus_Status[10].11: Tally Package Accumulating
-#   Local:10:I.Data.13: Grader 13' PE
+#   MyStatusTag[10].11: Some bit-level description
+#   Local:10:I.Data.13: Photo-eye 13
 #   IO074:I.Data[0].0: Tray 4 / Accumulation / Motor Aux.
-#   SorterStatusToGradeScan.SorterFeedback.UsingScanSolution: Should Be 1 if...
+#   ProcessStatus.Feedback.UsingBackupSolution: Should be 1 if...
 ```
 
 These same per-element/per-bit comments are also emitted as a standalone `<Comments>` block
 in `tag.to_xml()` / L5X output (right after `<Description>`, before `<Data>`), matching a real
 Studio 5000 export — verified byte-exact (`Operand="..."` is the path above with the tag name
-stripped and upper-cased, e.g. `Operand=".GAIN"`, `Operand="[2,2,1].BFRLUG.Z5_SAWPATTERN.3"`).
+stripped and upper-cased, e.g. `Operand=".GAIN"`, `Operand="[2,2,1].MYSUBSTRUCT.SOME_MEMBER.3"`).
 This only covers regular controller/program-scoped `<Tag>` elements — per-bit comments on I/O
 module connections (`<Module><Connections><Connection><InputTag>/<OutputTag><Comments>`) are not
 yet emitted (see the note under "Convert ACD to L5X" below).
@@ -215,7 +215,7 @@ array values.
 
 **If the request is specifically about I/O address wiring** (not a general diff), use the
 narrower `diff_io_addresses()` instead — it reports *only* I/O tag address changes
-(`"IO024:I.Data[0].13"`, `"Remote_GraderConsole:3:I.Pt13.Data"`, `"Local:10:I.Data.11"`, ...) and
+(`"IO024:I.Data[0].13"`, `"Remote_Rack1:3:I.Pt13.Data"`, `"Local:10:I.Data.11"`, ...) and
 nothing else, so it's the wrong default for a broad comparison:
 
 ```python
@@ -269,7 +269,7 @@ summary = get_project_summary(project)
 #  "routine_count": N}
 
 # Name/type/line-count for every routine (or one program's) -- no rung/line content.
-for r in list_routines(project, program_name="VAB_Trim_And_Sort"):
+for r in list_routines(project, program_name="MyProgram"):
     print(r["routine"], r["type"], r["line_count"])
 # Then get_routine(project, r["routine"], ...) for one routine's actual logic.
 
@@ -279,7 +279,7 @@ for t in list_tags(project):
     print(t["name"], t["data_type"], t["dimensions"])
 
 # One tag's value, paginated if it's a large array instead of dumped in full.
-page = get_tag_value(project, "To_VABView_Bins", offset=0, limit=50)
+page = get_tag_value(project, "MyArrayTag", offset=0, limit=50)
 # {"name": ..., "data_type": ..., "dimensions": "50", "total_elements": 50,
 #  "offset": 0, "returned": 50, "value": [...]}
 ```
@@ -298,7 +298,7 @@ from acd import get_routine, tag_exists, find_tag_references, replace_rung_safe,
 # unique WITHIN a program (many projects have a "Main" in several programs) --
 # raises ValueError (listing every matching program) if the name is ambiguous
 # and no program_name was given, rather than silently picking one.
-routine = get_routine(project, "R07_Lift_Skids", program_name="VAB_Trim_And_Sort")
+routine = get_routine(project, "MyRoutine", program_name="MyProgram")
 
 # Pre-creation collision check, in a given scope (controller by default).
 if not tag_exists(project, "NewTagName"):

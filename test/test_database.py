@@ -3,7 +3,7 @@ import struct
 import pytest
 
 from acd.database.dbextract import DbExtract
-from acd.l5x.elements import ControllerBuilder, RoutineBuilder
+from acd.l5x.elements import ControllerBuilder, ModuleBuilder, RoutineBuilder
 from acd.l5x.export_l5x import (
     ExportL5x,
     _dedupe_comps_records,
@@ -211,6 +211,67 @@ def test_controller_builder_ignores_nameless_root_object():
     controller = ControllerBuilder(cur).build()
 
     assert controller.name == "CuteLogix"
+
+
+def _connection_record(code: int, rpi: int) -> bytes:
+    # Type code is a u16 at offset 90, RPI (microseconds) a u32 immediately
+    # after it at offset 92 -- see ModuleBuilder.build()'s own docstring.
+    record = bytearray(96)
+    struct.pack_into("<H", record, 90, code)
+    struct.pack_into("<I", record, 92, rpi)
+    return bytes(record)
+
+
+def test_module_builder_skips_hex_named_connection():
+    # Regression test for a real project: a "Local" chassis module had one
+    # connection whose own comp_name was a hex placeholder ("$0ce232bb$",
+    # the same "unnamed internal object" convention already handled for a
+    # Module's own name a few lines above in ModuleBuilder.build()) and an
+    # otherwise-unrecognized CIP connection-type code (10).
+    #
+    # This was investigated twice. The first attempt concluded "not in a
+    # real Studio 5000 L5X export of this project, so skip it" -- that
+    # conclusion was correct but the REASONING was wrong (L5X silence is not
+    # proof of ACD absence) and was reverted. The second, real investigation
+    # (with the user directly checking Studio 5000) confirmed what this
+    # actually is: a cached CIP MESSAGE connection. The project has 5 real
+    # `MSG` instructions (SLC_Stacker_Write/Read, SLC_Planer_Write/Read/
+    # Read2) talking to an external SLC 5/04 over DH+ through a 1756-DHRIO
+    # bridge module, all with "Cache Connections" enabled -- confirmed
+    # directly in Studio's own Message Configuration dialog -- and all
+    # sharing the same destination path (one DHRIO module/channel/node),
+    # matching "one cached connection per unique destination", not per `MSG`
+    # instruction, which is exactly why there's only one such connection
+    # (not five) in a real, otherwise very large (246-module) project. Real
+    # Studio 5000 output confirms this category of connection is never
+    # rendered as an L5X <Connection> element at all (physical CIP I/O
+    # connections only) -- fixed by skipping hex-named connections entirely
+    # rather than guessing an Input/Output Type= for something that was
+    # never an I/O connection to begin with. See CLAUDE.md's "Connection
+    # Type / RPI" section for the full investigation.
+    unzip = Unzip("../resources/CuteLogix.ACD").write_files("build")
+    exp = ExportL5x("../resources/CuteLogix.ACD", "build")
+    cur = exp._cur
+
+    local_object_id = 3363100451
+    conn_collection_id = 1867864125
+
+    # A genuine, normally-named connection with a recognized code must still
+    # come through unaffected -- this isn't a blanket "ignore odd codes" fix.
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (9001, conn_collection_id, "Standard", 0, 256, _connection_record(code=5, rpi=20000)),
+    )
+    # The hex-named connection with the unrecognized code -- must be excluded.
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (9002, conn_collection_id, "$0ce232bb$", 1, 256, _connection_record(code=10, rpi=0)),
+    )
+    exp._db.commit()
+
+    module = ModuleBuilder(cur, local_object_id).build()
+
+    assert module._connections == [("Standard", "20000", "Input")]
 
 
 def _region_map_entry(parent_id, unknown, seq_no, object_id) -> bytes:

@@ -77,19 +77,32 @@ from .model import (
     _PRIMITIVE_L5K_ZERO,
 )  # noqa: F401
 
-from .builders import (
+from .builders_common import (
     radix_enum,
     external_access_enum,
     _resolve_bit_target,
+    _build_hex_oid_map,
+    _resolve_tag_name_from_oid,
+)  # noqa: F401
+
+from .builders_datatype import (
     MemberBuilder,
     DataTypeBuilder,
     _apply_dead_member_byte_corrections,
+)  # noqa: F401
+
+from .builders_module import (
     ModuleBuilder,
-    _build_hex_oid_map,
-    _resolve_tag_name_from_oid,
+    _CONNECTION_TYPE_BY_CODE,
+)  # noqa: F401
+
+from .builders_tag import (
     TagBuilder,
     _aoi_tag_usage_flags,
     _aoi_tag_data_type,
+)  # noqa: F401
+
+from .builders_routine import (
     ParameterBuilder,
     LocalTagBuilder,
     routine_type_enum,
@@ -100,13 +113,15 @@ from .builders import (
     _filetime_to_iso,
     _parse_aoi_nameless,
     AoiBuilder,
+    _ST_LINE_RECORD_TYPE,
+)  # noqa: F401
+
+from .builders_controller import (
     ProgramBuilder,
     TaskBuilder,
     ControllerBuilder,
     ProjectBuilder,
     DumpCompsRecords,
-    _CONNECTION_TYPE_BY_CODE,
-    _ST_LINE_RECORD_TYPE,
     _TASK_TYPE_MAP,
 )  # noqa: F401
 

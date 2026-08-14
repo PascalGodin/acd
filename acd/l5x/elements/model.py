@@ -5,7 +5,13 @@ from typing import Dict, List, Tuple, Union
 
 from acd.l5x.port_structures import PORT_STRUCTURES
 
-from .base import L5xElement, _escape_xml_attr, _multiline_xml_text, _sanitize_xml_text
+from .base import (
+    L5xElement,
+    _escape_xml_attr,
+    _multiline_xml_text,
+    _sanitize_xml_text,
+    _validate_rll_rung_syntax,
+)
 from .rendering import (
     _PRIMITIVE_RADIX,
     _SKIP_DECORATED,
@@ -832,7 +838,15 @@ class Routine(L5xElement):
         only edit an EXISTING rung's text, identified by a real object_id
         in `_rung_ids`, never create a new one. Use `export_routine()` for
         a routine containing a newly-inserted rung.
+
+        For an RLL routine, `text` is checked with `_validate_rll_rung_syntax()`
+        (unbalanced brackets, a one-member `"[...]"` branch group) before
+        being inserted -- raises `ValueError` instead of accepting
+        obviously-malformed rung text that would only be caught later by a
+        real Studio 5000 import.
         """
+        if self.type == "RLL":
+            _validate_rll_rung_syntax(text)
         self.rungs.insert(index, text)
         self._rung_ids.insert(index, None)
         self._rung_comments = {

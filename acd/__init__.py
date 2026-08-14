@@ -91,12 +91,18 @@ EDITS -- durable the moment the call returns (see above), each raising
     member to an EXISTING UDT, at `index` (default: appended).
   - `db_insert_rung(acd_path, routine_name, index, text, comment=None,
     program_name=None)` / `db_delete_rung(acd_path, routine_name, index,
-    program_name=None)`
+    program_name=None)` -- for an RLL routine, `text` is checked for
+    unbalanced brackets and a one-member `"[...]"` branch group (see
+    `_validate_rll_rung_syntax()`) before being inserted; raises
+    `ValueError` instead of silently accepting rung text a real Studio
+    5000 import would reject.
   - `db_replace_rung_safe(acd_path, routine_name, index, expected_old,
     new_text, program_name=None)` -- edit an EXISTING rung's text, but
     only if it still matches `expected_old` (raises with a readable diff
     otherwise) -- guards against clobbering a rung someone hand-edited in
-    Studio since your last read.
+    Studio since your last read. This guard is about editing the WRONG
+    rung, not rung grammar -- `new_text` gets the same RLL syntax check
+    as `db_insert_rung()` above, run separately, after the match check.
   - `db_set_rung_comment(acd_path, routine_name, index, comment,
     program_name=None)` -- set or clear (`comment=None`) a rung's comment
     WITHOUT touching its text; use this instead of delete_rung+insert_rung
@@ -136,17 +142,21 @@ its own separate connection and would deadlock trying to acquire the same
 project lock this transaction is already holding.
 
 EXPORTING TO REAL STUDIO 5000 -- the only durable write path (see above).
-`validate` defaults to `True` on BOTH functions below -- the check is one
-extra graph-walk pass, and the failure mode it catches (a struct-typed
-name that doesn't resolve, silently rendered as a bare zero instead of a
-real nested structure) is silent corruption, not a loud error, which is
-the wrong kind of thing to leave opt-in. Pass `validate=False` explicitly
-if you're confident it's unnecessary and want to skip the pass:
+`validate` defaults to `True` on BOTH functions below -- both checks it
+runs are cheap relative to a full edit -> export -> Studio-import round
+trip, and the failure modes they catch (a struct-typed name that doesn't
+resolve, silently rendered as a bare zero instead of a real nested
+structure; for `db_export_routine`, malformed RLL rung syntax -- see
+`db_insert_rung` above) are silent/late, not loud errors up front, which
+is the wrong kind of thing to leave opt-in. Pass `validate=False`
+explicitly if you're confident it's unnecessary and want to skip the pass:
   - `db_export_routine(acd_path, routine_name, output_path,
     program_name=None, owner=None, validate=True)` -- a standalone
     partial L5X for Studio's "Import Routine" feature, covering both rung
     edits and any tag this routine's logic references. Validates every
-    struct-typed name reachable from a referenced tag's own DataType tree.
+    struct-typed name reachable from a referenced tag's own DataType tree,
+    AND (for an RLL routine) every rung's syntax via
+    `_validate_rll_rung_syntax()`.
   - `db_export_datatype(acd_path, data_type_name, output_path, owner=None,
     validate=True)` -- a standalone partial L5X for Studio's "Import Data
     Type..." feature, for creating/modifying a UDT (e.g. inserting a

@@ -34,6 +34,7 @@ from acd.l5x.elements import (
     _multiline_xml_text,
     _validate_tag_types_resolve,
     _validate_data_type_resolves,
+    _validate_rll_rung_syntax,
     new_member,
 )
 
@@ -527,6 +528,14 @@ def replace_rung_safe(routine: Routine, index: int, expected_old: str, new_text:
 
     Raises ValueError, with both the expected and actual text shown, if
     they don't match. Does not touch `routine.rungs` at all in that case.
+
+    For an RLL routine, `new_text` is also checked with
+    `_validate_rll_rung_syntax()` (unbalanced brackets, a one-member
+    `"[...]"` branch group) before being applied -- raises `ValueError`
+    instead of accepting obviously-malformed rung text that would only be
+    caught later by a real Studio 5000 import. Runs AFTER the
+    expected-text match check, so a mismatch is always reported as a
+    mismatch, never masked by a syntax error in `new_text`.
     """
     actual = routine.rungs[index]
     if actual != expected_old:
@@ -536,6 +545,8 @@ def replace_rung_safe(routine: Routine, index: int, expected_old: str, new_text:
             f"  expected: {expected_old!r}\n"
             f"  actual:   {actual!r}"
         )
+    if routine.type == "RLL":
+        _validate_rll_rung_syntax(new_text)
     routine.rungs[index] = new_text
 
 
@@ -1102,22 +1113,32 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
             license owner, e.g. "MyCompany, MyCompany" -- a real export
             included this attribute, but it's not clear whether Studio 5000
             requires it to import; omitted entirely if not supplied).
-        validate: If True, verify every struct-typed name reachable from a
-            referenced tag's own DataType tree actually resolves (see
-            `_validate_tag_types_resolve()`) before writing any XML, raising
-            ValueError with the specific tag/member/type responsible instead
-            of silently rendering a bare zero in its place. Catches the
-            "mutate an existing UDT with live tag instances, then export a
-            routine referencing one in the same session" class of bug (see
+        validate: If True, runs two independent checks before writing any
+            XML, each raising ValueError on the first problem found instead
+            of silently producing a file only a real Studio 5000 import
+            would reject:
+            (1) every struct-typed name reachable from a referenced tag's
+            own DataType tree actually resolves (see
+            `_validate_tag_types_resolve()`) -- catches the "mutate an
+            existing UDT with live tag instances, then export a routine
+            referencing one in the same session" class of bug (see
             CLAUDE.md) at the point of the mistake rather than at the next
-            Studio 5000 import attempt. Off by default (matches every
-            existing caller's behavior unchanged) since it's an extra pass
-            over the whole referenced-type graph on every call.
+            Studio 5000 import attempt;
+            (2) for an RLL routine, every rung in `routine.rungs` passes
+            `_validate_rll_rung_syntax()` (unbalanced brackets, a
+            one-member `"[...]"` branch group left over after an edit
+            removed its sibling) -- this is a narrow syntax lint, NOT a
+            real ladder-logic grammar checker, and has nothing to do with
+            check (1); a rung can pass one and fail the other independently.
+            Off by default (matches every existing caller's behavior
+            unchanged) since both are an extra pass over the routine/type
+            graph on every call.
 
     Raises:
         ValueError: if `routine` isn't found in any program of `project`, or
             (with `validate=True`) if a referenced tag's DataType tree
-            contains an unresolved type name.
+            contains an unresolved type name, or an RLL rung fails
+            `_validate_rll_rung_syntax()`.
 
     Example (RLL):
         project = load_acd("MyController.ACD")
@@ -1323,6 +1344,12 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
 
     if validate:
         _validate_tag_types_resolve(controller_tags + program_tags, project.controller._data_types_map)
+        if routine.type == "RLL":
+            for i, rung_text in enumerate(routine.rungs):
+                try:
+                    _validate_rll_rung_syntax(rung_text)
+                except ValueError as e:
+                    raise ValueError(f"Rung {i} of routine {routine.name!r}: {e}") from e
 
     Path(output_path).write_text(xml, encoding="utf-8")
 

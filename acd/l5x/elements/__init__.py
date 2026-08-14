@@ -7,6 +7,7 @@ from .base import (
     _escape_xml_attr,
     _multiline_xml_text,
     _sanitize_xml_text,
+    _validate_rll_rung_syntax,
     L5xElementBuilder,
     L5xElement,
     _XML_ILLEGAL_RE,

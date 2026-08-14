@@ -2766,6 +2766,80 @@ Covered by new tests in `test/test_project_db.py`: `test_set_rung_comment_change
 `test_set_tag_comment_empty_text_clears_it` — full suite re-run clean (220 passed, 2 skipped, up from
 213 passed before this round).
 
+### RLL rung-text syntax lint (`_validate_rll_rung_syntax`) — a real error only Studio's own import parser caught
+
+A downstream agent hit a real (self-caused, not this library's fault) editing mistake: removing one
+of two parallel branches from a `"[...]"` group in a real rung but leaving the brackets around what
+became a single branch (`"[MOVE(...) FOR(...) ]"`). In this ASCII RLL dialect `"[...]"` means
+"parallel branches" and needs >= 2 comma-separated members — a single remaining branch should have
+no brackets at all. Nothing in the `db_*` surface caught it: `db_replace_rung_safe()`'s guard only
+checks you're editing the rung you *think* you are (an optimistic-concurrency check against the OLD
+text), not the grammar of the NEW text; `db_export_routine(validate=True)`'s existing check
+(`_validate_tag_types_resolve()`) walks struct-typed tag names for resolvability, a data-shape
+check with nothing to do with RLL syntax. The only thing that actually caught the error was Studio
+5000's own import parser, after a full edit -> export -> import round trip.
+
+Added `_validate_rll_rung_syntax(text)` (`acd/l5x/elements/base.py`, exported through
+`acd.l5x.elements`) — deliberately narrow, NOT a real ladder-logic grammar checker (an actual
+grammar checker is a much bigger undertaking the agent explicitly declined to prescribe: "I don't
+know how far it's worth going toward a real RLL grammar checker; that's their call, not mine to
+prescribe"). Just the two cheapest, lowest-false-positive checks available without one:
+- Unbalanced `(`/`)`/`[`/`]`.
+- A branch `"[...]"` group with fewer than 2 top-level (not nested) comma-separated members —
+  exactly the reported bug.
+
+**The one real design subtlety**: a `[` can mean two different things in this dialect — a parallel-
+branch group (`"XIC(A)[OTE(B),OTE(C)]"`) or an array-index operand (`"MyArray[5]"`,
+`"MyArray[2,2,1]"` — multi-dimensional indices are genuinely comma-separated too, see the
+comment-resolution section above). Applying the branch-multiplicity check to BOTH would misclassify
+every single-element array index as an invalid one-branch group. Distinguished by the character
+immediately preceding the `[` (no whitespace-skipping — array-index brackets are always written
+adjacent to their operand): an identifier char, `_`, or `.` means "array index" (skip the
+branch-multiplicity check entirely); anything else (`(`, `)`, `,`, `;`, another `[`/`]`, whitespace,
+or start-of-string) means "branch group." Verified this correctly handles nested branches too
+(`"[[XIC(A),XIC(B)],XIC(C)]"` — the inner `[` is preceded by `[`, correctly still a branch, not an
+index) via `TestValidateRllRungSyntax` in `test/test_api.py`.
+
+Single-quoted string literals (Rockwell's own `"$'"`-escaped convention, see `_l5k_string_padded`)
+are skipped whole rather than parsed as syntax — a STRING tag's literal value can legitimately
+contain brackets/commas/parens (e.g. `MOV('a[1,2](x',MyStringTag.DATA[0])`) that have nothing to do
+with RLL grammar and must never trip this check.
+
+**Wired into every place raw rung text enters the system**, per the agent's own suggested angle
+("even a narrow lint ... checked at db_insert_rung/db_replace_rung_safe/db_export_routine time,
+would've caught this immediately"):
+- `Routine.insert_rung()` (`elements/model.py`) — the in-memory list-splice version.
+- `replace_rung_safe()` (`acd/api.py`) — runs AFTER the expected-old-text match check, so a mismatch
+  is always reported as a mismatch, never masked by `new_text` also happening to be malformed.
+- `ProjectDB.insert_rung()` / `ProjectDB.replace_rung_safe()` (`project_db.py`, and therefore
+  `db_insert_rung()`/`db_replace_rung_safe()`) — added `ProjectDB._routine_type()` (a small
+  `SELECT type FROM proj_routines WHERE id=?` helper) since these SQL-backed methods didn't
+  previously need to know a routine's type at all.
+- `export_routine(..., validate=True)` — extended the EXISTING `validate` flag (previously only
+  `_validate_tag_types_resolve()`) to also sweep every rung of an RLL routine, independent of
+  whether the rung entered `.rungs` via `insert_rung()` or some other path (e.g. rehydrated from a
+  DB written before this check existed, or `.rungs.append()`'d directly in a script) — this is the
+  defense-in-depth layer: `insert_rung()`'s own guard only protects rungs that go through it.
+  `ProjectDB.export_routine()`/`db_export_routine()` already default `validate=True` (see the third
+  feedback round above), so this protection is on by default at the `db_*` layer with no caller
+  change needed.
+
+All four call sites are guarded by `routine.type == "RLL"` (or the SQL equivalent via
+`_routine_type()`) — an ST routine's `._st_lines` has completely different syntax and was never in
+scope for this check.
+
+Covered by `TestValidateRllRungSyntax` in `test/test_api.py` (the pure function: valid two/nested
+branch groups, array-index exclusion incl. multi-dim, single- and zero-member branch rejection,
+unbalanced brackets/parens, string-literal skipping incl. escaped quotes, unterminated string
+literal, empty text is a no-op) plus integration tests at each of the four call sites above
+(`test_replace_rung_safe_rejects_malformed_rll_syntax`,
+`test_routine_insert_rung_rejects_malformed_rll_syntax`,
+`test_export_routine_validate_rejects_malformed_rll_syntax` — via `.rungs.append()`, NOT
+`insert_rung()`, specifically to prove the `export_routine()` sweep doesn't just rely on
+`insert_rung()`'s own guard — and the `project_db.py` equivalents in `test/test_project_db.py`,
+including `test_replace_rung_safe_mismatch_takes_priority_over_syntax_error` locking in the
+ordering guarantee).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

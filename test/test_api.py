@@ -29,7 +29,7 @@ from acd.api import (
     tag_exists,
     _sync_data_types_map,
 )
-from acd.l5x.elements import DataType, Tag, new_member, new_tag
+from acd.l5x.elements import DataType, Tag, new_member, new_tag, _validate_rll_rung_syntax
 
 
 def test_import_from_file():
@@ -832,6 +832,104 @@ def test_replace_rung_safe_mismatch_raises_and_does_not_mutate():
         replace_rung_safe(routine, 0, "definitely not the real text", "NEW_TEXT();")
 
     assert routine.rungs[0] == original
+
+
+def test_replace_rung_safe_rejects_malformed_rll_syntax():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    old_text = routine.rungs[0]
+
+    with pytest.raises(ValueError, match="only 1 member"):
+        replace_rung_safe(routine, 0, old_text, "[MOVE(A,B) FOR(C,D,E) ];")
+
+    assert routine.rungs[0] == old_text
+
+
+def test_routine_insert_rung_rejects_malformed_rll_syntax():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    original_rungs = list(routine.rungs)
+
+    with pytest.raises(ValueError, match="only 1 member"):
+        routine.insert_rung(0, "[MOVE(A,B) FOR(C,D,E) ];")
+
+    assert routine.rungs == original_rungs
+
+
+def test_export_routine_validate_rejects_malformed_rll_syntax(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    # Bypass insert_rung()'s own guard to simulate a rung that became
+    # malformed some other way (e.g. rehydrated from a DB written before
+    # this check existed) -- export_routine(validate=True) must catch it
+    # independently, not only rely on insert_rung()'s own guard.
+    routine.rungs.append("[MOVE(A,B) FOR(C,D,E) ];")
+
+    with pytest.raises(ValueError, match=r"Rung \d+ of routine .*only 1 member"):
+        export_routine(project, routine, str(tmp_path / "bad.L5X"), validate=True)
+
+
+def test_export_routine_validate_false_does_not_check_rll_syntax(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    routine.rungs.append("[MOVE(A,B) FOR(C,D,E) ];")
+
+    export_routine(project, routine, str(tmp_path / "bad.L5X"), validate=False)
+
+    assert (tmp_path / "bad.L5X").exists()
+
+
+class TestValidateRllRungSyntax:
+    def test_valid_two_branch_group(self):
+        _validate_rll_rung_syntax("XIC(A)[OTE(B),OTE(C)];")
+
+    def test_valid_nested_branch_group(self):
+        _validate_rll_rung_syntax("[[XIC(A),XIC(B)],XIC(C)];")
+
+    def test_valid_array_index_not_treated_as_branch(self):
+        _validate_rll_rung_syntax("MOV(MyArray[5],Result);")
+
+    def test_valid_multidim_array_index_not_treated_as_branch(self):
+        _validate_rll_rung_syntax("MOV(MyArray[2,2,1],Result);")
+
+    def test_single_branch_bracket_raises(self):
+        with pytest.raises(ValueError, match="only 1 member"):
+            _validate_rll_rung_syntax("[MOVE(A,B) FOR(C,D,E) ];")
+
+    def test_empty_branch_bracket_raises_with_zero_members(self):
+        with pytest.raises(ValueError, match="only 0 member"):
+            _validate_rll_rung_syntax("XIC(A)[];")
+
+    def test_unbalanced_open_paren_raises(self):
+        with pytest.raises(ValueError, match="Unbalanced"):
+            _validate_rll_rung_syntax("XIC(A OTE(B);")
+
+    def test_unbalanced_close_paren_raises(self):
+        with pytest.raises(ValueError, match="Unbalanced"):
+            _validate_rll_rung_syntax("XIC(A))OTE(B);")
+
+    def test_unbalanced_open_bracket_raises(self):
+        with pytest.raises(ValueError, match="Unbalanced"):
+            _validate_rll_rung_syntax("[XIC(A),XIC(B);")
+
+    def test_string_literal_punctuation_does_not_trip_check(self):
+        # A STRING tag's literal value can contain brackets/commas/parens --
+        # none of it is real RLL syntax and must not be parsed as such.
+        _validate_rll_rung_syntax("MOV('a[1,2](x',MyStringTag.DATA[0]);")
+
+    def test_escaped_quote_in_string_literal_does_not_end_it_early(self):
+        _validate_rll_rung_syntax("MOV('it$'s a test',MyStringTag.DATA[0]);")
+
+    def test_unterminated_string_literal_raises(self):
+        with pytest.raises(ValueError, match="Unterminated string literal"):
+            _validate_rll_rung_syntax("MOV('unterminated,MyTag);")
+
+    def test_empty_text_is_a_noop(self):
+        _validate_rll_rung_syntax("")
+        _validate_rll_rung_syntax("   ")
+
+    def test_plain_series_instructions_no_brackets_valid(self):
+        _validate_rll_rung_syntax("XIC(A)MOV(1,B)OTE(C);")
 
 
 def test_load_acd_verbose_false_suppresses_info_and_debug(capsys):

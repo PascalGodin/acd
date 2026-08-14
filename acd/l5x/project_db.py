@@ -90,6 +90,7 @@ from acd.l5x.elements import (
     RSLogix5000Content,
     Routine,
     Tag,
+    _validate_rll_rung_syntax,
     new_member as _new_member,
     new_tag as _new_tag,
 )
@@ -642,6 +643,11 @@ class ProjectDB:
             )
         return rows[0][0]
 
+    def _routine_type(self, routine_id: int) -> str:
+        return self._conn.execute(
+            "SELECT type FROM proj_routines WHERE id=?", (routine_id,)
+        ).fetchone()[0]
+
     # ---- edits ----
 
     def new_tag(self, name: str, data_type: str, program_name: Union[str, None] = None,
@@ -798,8 +804,16 @@ class ProjectDB:
         `(routine_id, rung_index)` UNIQUE index even though the end state
         is perfectly valid; negative values can never collide with a real
         (always >= 0) rung_index, so the intermediate state is always safe.
+
+        For an RLL routine, `text` is checked with `_validate_rll_rung_syntax()`
+        (unbalanced brackets, a one-member `"[...]"` branch group) before
+        being inserted -- raises `ValueError` instead of silently accepting
+        rung text that would only be caught later by a real Studio 5000
+        import (see its own docstring for the real failure this catches).
         """
         routine_id = self._routine_id(routine_name, program_name)
+        if self._routine_type(routine_id) == "RLL":
+            _validate_rll_rung_syntax(text)
         cur = self._conn.cursor()
         cur.execute(
             "UPDATE proj_rungs SET rung_index = -(rung_index + 1) "
@@ -847,6 +861,15 @@ class ProjectDB:
         """SQL equivalent of `replace_rung_safe()` -- optimistic-concurrency
         guard: raises `ValueError` (showing expected vs. actual) if the
         rung at `index` no longer matches `expected_old`.
+
+        For an RLL routine, `new_text` is also checked with
+        `_validate_rll_rung_syntax()` (unbalanced brackets, a one-member
+        `"[...]"` branch group) before being applied -- runs AFTER the
+        expected-text match check, so a mismatch is always reported as a
+        mismatch, never masked by a syntax error in `new_text`. See its
+        own docstring for the real failure this catches: this guard only
+        protects against editing the WRONG rung, not against writing
+        syntactically-malformed rung text.
         """
         routine_id = self._routine_id(routine_name, program_name)
         cur = self._conn.cursor()
@@ -860,6 +883,8 @@ class ProjectDB:
                 f"Rung {index} has changed since last read.\n"
                 f"Expected: {expected_old!r}\nActual:   {row[0]!r}"
             )
+        if self._routine_type(routine_id) == "RLL":
+            _validate_rll_rung_syntax(new_text)
         cur.execute("UPDATE proj_rungs SET text=? WHERE routine_id=? AND rung_index=?",
                     (new_text, routine_id, index))
         cur.execute("UPDATE proj_meta SET dirty=1")
@@ -1091,14 +1116,19 @@ class ProjectDB:
         `export_routine()` in one call.
 
         `validate` defaults to `True` here (opposite of the underlying
-        `export_routine()`'s own `validate=False` default) -- the check is
-        one extra graph-walk pass, and the failure mode it prevents
-        (declared-type-vs-rendered-value mismatch, silently rendered as a
-        bare zero) is silent corruption, not a loud error, which is the
-        wrong kind of thing to leave opt-in. Found via a real report: two
-        separate rounds of live-Studio-rejection debugging in one session
-        both traced back to exactly this. Pass `validate=False` explicitly
-        to skip the check if you're confident it's unnecessary.
+        `export_routine()`'s own `validate=False` default) -- both checks
+        it runs (declared-type-vs-rendered-value resolution, and for an
+        RLL routine, `_validate_rll_rung_syntax()` on every rung) are cheap
+        relative to a full edit -> export -> Studio-import round trip, and
+        the failure modes they prevent are silent/late, not loud errors up
+        front, which is the wrong kind of thing to leave opt-in. Found via
+        real reports: two separate rounds of live-Studio-rejection
+        debugging traced back to the type-resolution gap, and a third
+        traced back to malformed rung text (a one-branch `"[...]"` group
+        left over after an edit) that neither this function's old
+        `validate=True` nor `replace_rung_safe()`'s own guard caught before
+        Studio's own import parser did. Pass `validate=False` explicitly to
+        skip both checks if you're confident they're unnecessary.
         """
         project = self.to_controller()
         routine = _get_routine(project, routine_name, program_name)

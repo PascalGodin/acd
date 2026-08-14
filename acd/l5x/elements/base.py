@@ -81,6 +81,102 @@ def _multiline_xml_text(raw: str) -> str:
     """
     return raw.replace("\r\n", "\n").replace("\r", "\n")
 
+
+def _validate_rll_rung_syntax(text: str) -> None:
+    """Catch a narrow but real class of malformed RLL rung text before it
+    round-trips through export -> Studio 5000 import: unbalanced
+    parentheses/brackets, and a `"[...]"` branch group left with only one
+    member after an edit removed a sibling branch but left the brackets
+    behind. In this ASCII RLL dialect `"[...]"` means "parallel branches"
+    and needs >= 2 comma-separated members -- a single remaining branch
+    should have no brackets at all.
+
+    Found via a real downstream-agent failure: neither
+    `ProjectDB.replace_rung_safe()`/`db_replace_rung_safe()` (which only
+    guards that you're editing the rung you think you are, not its
+    grammar) nor `export_routine(validate=True)` (which walks tag
+    DataType trees for resolvability -- a data-shape check, unrelated to
+    RLL syntax) caught `"[MOVE(...) FOR(...) ]"` (a one-branch bracket
+    left over after removing its sibling). Only Studio 5000's own import
+    parser did, after a full edit -> export -> import round trip.
+
+    Deliberately narrow, NOT a real ladder-logic grammar checker (see
+    CLAUDE.md) -- just the two cheapest, lowest-false-positive checks
+    available without one:
+    - Unbalanced `(`/`)`/`[`/`]`.
+    - A branch `"[...]"` group with fewer than 2 top-level (not nested)
+      comma-separated members.
+
+    A `[` immediately following an identifier/`.` character (e.g.
+    `"MyArray[5]"`, `"MyArray[2,2,1]"`) is treated as an array-index
+    operand, not a branch group, and is excluded from the branch-
+    multiplicity check -- conflating the two would misclassify a
+    perfectly valid single-element array index as an invalid one-branch
+    group. Single-quoted string literals (Rockwell's own `"$'"`-escaped
+    convention, see `_l5k_string_padded`) are skipped whole, so
+    punctuation inside a STRING tag's literal value can never trip this.
+
+    Raises ValueError naming the specific problem and its character
+    position; a no-op for empty/whitespace-only text.
+    """
+    if not text or not text.strip():
+        return
+    stack: List[dict] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "'":
+            j = i + 1
+            closed = False
+            while j < n:
+                if text[j] == "$" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == "'":
+                    j += 1
+                    closed = True
+                    break
+                j += 1
+            if not closed:
+                raise ValueError(
+                    f"Unterminated string literal starting at position {i} in rung text: {text!r}"
+                )
+            i = j
+            continue
+        if ch == "(":
+            stack.append({"kind": "paren", "commas": 0, "pos": i})
+        elif ch == ")":
+            if not stack or stack[-1]["kind"] != "paren":
+                raise ValueError(f"Unbalanced ')' at position {i} in rung text: {text!r}")
+            stack.pop()
+        elif ch == "[":
+            prev = text[i - 1] if i > 0 else ""
+            is_index = prev.isalnum() or prev in ("_", ".")
+            stack.append({"kind": "index" if is_index else "branch", "commas": 0, "pos": i})
+        elif ch == "]":
+            if not stack or stack[-1]["kind"] not in ("branch", "index"):
+                raise ValueError(f"Unbalanced ']' at position {i} in rung text: {text!r}")
+            frame = stack.pop()
+            if frame["kind"] == "branch" and frame["commas"] == 0:
+                inner = text[frame["pos"] + 1:i]
+                member_count = 0 if not inner.strip() else 1
+                raise ValueError(
+                    f"'[...]' branch group at position {frame['pos']} has only "
+                    f"{member_count} member(s) (no top-level comma) -- a parallel-branch "
+                    f"group needs >= 2 comma-separated members, or should be written "
+                    f"without brackets at all if only one remains: {text!r}"
+                )
+        elif ch == ",":
+            if stack:
+                stack[-1]["commas"] += 1
+        i += 1
+    if stack:
+        frame = stack[-1]
+        opener = "(" if frame["kind"] == "paren" else "["
+        raise ValueError(f"Unbalanced {opener!r} at position {frame['pos']} in rung text: {text!r}")
+
+
 @dataclass
 class L5xElementBuilder:
     _cur: Cursor

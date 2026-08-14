@@ -373,6 +373,24 @@ def test_insert_rung_shifts_later_rungs(acd_copy):
         db.close()
 
 
+def test_insert_rung_rejects_malformed_rll_syntax(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        project_before = db.to_controller()
+        routine_before = get_routine(project_before, routine_name, program_name)
+
+        with pytest.raises(ValueError, match="only 1 member"):
+            db.insert_rung(routine_name, 0, "[MOVE(A,B) FOR(C,D,E) ];",
+                            program_name=program_name)
+
+        project_after = db.to_controller()
+        routine_after = get_routine(project_after, routine_name, program_name)
+        assert routine_after.rungs == routine_before.rungs
+    finally:
+        db.close()
+
+
 def test_delete_rung_shifts_later_rungs_down(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:
@@ -416,6 +434,38 @@ def test_replace_rung_safe_applies_matching_edit(acd_copy):
         project2 = db.to_controller()
         routine2 = get_routine(project2, routine_name, program_name)
         assert routine2.rungs[0] == "NOP();"
+    finally:
+        db.close()
+
+
+def test_replace_rung_safe_rejects_malformed_rll_syntax(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        project = db.to_controller()
+        routine = get_routine(project, routine_name, program_name)
+        original_text = routine.rungs[0]
+
+        with pytest.raises(ValueError, match="only 1 member"):
+            db.replace_rung_safe(routine_name, 0, original_text,
+                                  "[MOVE(A,B) FOR(C,D,E) ];", program_name=program_name)
+
+        project2 = db.to_controller()
+        routine2 = get_routine(project2, routine_name, program_name)
+        assert routine2.rungs[0] == original_text
+    finally:
+        db.close()
+
+
+def test_replace_rung_safe_mismatch_takes_priority_over_syntax_error(acd_copy):
+    """A mismatch should always be reported as a mismatch -- never masked
+    by new_text also happening to be syntactically malformed."""
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        with pytest.raises(ValueError, match="changed since last read"):
+            db.replace_rung_safe(routine_name, 0, "not the real text",
+                                  "[MOVE(A,B) FOR(C,D,E) ];", program_name=program_name)
     finally:
         db.close()
 
@@ -556,6 +606,17 @@ def test_db_insert_rung_and_db_export_routine(acd_copy, tmp_path):
     db_export_routine(str(acd_copy), routine_name, str(output_path), program_name=program_name)
     content = output_path.read_text(encoding="utf-8")
     assert "NOP()" in content
+
+
+def test_db_insert_rung_rejects_malformed_rll_syntax(acd_copy):
+    program_name, routine_name = _first_routine_via_path(acd_copy)
+
+    with pytest.raises(ValueError, match="only 1 member"):
+        db_insert_rung(str(acd_copy), routine_name, 0, "[MOVE(A,B) FOR(C,D,E) ];",
+                        program_name=program_name)
+
+    routine = db_get_routine(str(acd_copy), routine_name, program_name=program_name)
+    assert "[MOVE(A,B) FOR(C,D,E) ];" not in routine["rungs"]
 
 
 def test_db_get_routine_returns_current_rungs_and_comments(acd_copy):

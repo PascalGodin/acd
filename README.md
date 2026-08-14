@@ -28,63 +28,59 @@ This library parses those binary databases and exposes the project contents — 
 
 ### Installing
 
+Install this fork directly (includes the persistent project DB / `db_*` API described below —
+not yet on PyPI under this name, so `pip install acd-tools` would get a different, older
+upstream project instead):
+
 ```bash
-pip install acd-tools
+pip install git+https://github.com/PascalGodin/acd.git@main
+```
+
+For local development (editable install, so changes to a checked-out copy take effect
+immediately):
+
+```bash
+pip install -e ".[dev]"
 ```
 
 ---
 
-### Quick start — read an ACD file
+### Quick start — the `db_*` API
 
-`load_acd()` extracts the ACD into a temporary directory (system temp, auto-deleted when the call
-returns — see "Low-level access via ExportL5x" below if you want the extracted files left on disk).
-`load_acd()` is quiet by default (via `loguru`) — only WARNING and above comes through: actionable
-data-quality signals (e.g. an unrecognized connection-type code, a Region Map format fallback)
-that are worth seeing even in quiet mode. Purely diagnostic, self-healing confirmations (e.g. a
-deleted UDT member that was already correctly filtered out) log at INFO, so they stay suppressed
-too — see `CLAUDE.md` for the full list of what logs where. Pass `verbose=True` if you want the
-~15-20 lines of INFO/DEBUG progress output every load produces (e.g. while debugging a load).
+**This is the recommended way to use this library, especially for an AI agent** — each `db_*`
+function takes the `.ACD` path directly, does one thing against a real, persistent SQLite file
+kept next to the ACD, and returns. There's no `load_acd()`/`project` object to hold onto and no
+separate "save" step — an edit is durable the instant the call returns, and stays visible to
+every later `db_*` call against that same file (including from a different script/process),
+until the DB is rebuilt from the real `.ACD` (a new Studio 5000 save, detected automatically, or
+an explicit `rebuild=True`). See `CLAUDE.md`'s "Persistent project DB" section for the full
+design rationale if you're modifying this library itself.
 
 ```python
-from acd.api import load_acd
+import acd
 
-project = load_acd("MyController.ACD")
-controller = project.controller
+acd.db_get_project_summary("MyController.ACD")     # names/counts overview -- call this first
+acd.db_list_routines("MyController.ACD")             # routine names/types, no content
+acd.db_get_routine("MyController.ACD", "MyRoutine")   # one routine's actual rungs/comments
+acd.db_list_tags("MyController.ACD")                   # tag names/types, no value
+acd.db_get_tag_value("MyController.ACD", "MyTag")        # one tag's value, paginated if a large array
 
-# Basic controller info
-print(controller.name)            # controller name
-print(controller.serial_number)   # e.g. "16#AB12_3456"
-print(controller.modified_date)
-
-# Iterate controller-scoped tags and their initial values
-for tag in controller.tags:
-    print(f"  {tag.name}  ({tag.data_type})")
-    if tag._initial_value is not None:
-        print(f"    initial value: {tag._initial_value}")
-
-# Walk programs -> routines -> ladder rungs
-for program in controller.programs:
-    print(f"\nProgram: {program.name}")
-    for routine in program.routines:
-        print(f"  Routine: {routine.name}  [{routine.type}]")
-        for i, rung in enumerate(routine.rungs):
-            comment = routine._rung_comments.get(i)
-            print(f"    Rung {i}: {rung}" + (f"  // {comment}" if comment else ""))
-
-# Inspect user-defined data types and their members
-for udt in controller.data_types:
-    member_names = [m.name for m in udt.members]
-    print(f"UDT {udt.name}: {member_names}")
-
-# Inspect add-on instructions
-for aoi in controller.aois:
-    print(f"AOI {aoi.name}: {len(aoi.routines)} routines, {len(aoi.tags)} params")
-
-# Inspect hardware modules
-for module in controller.modules:
-    print(f"Module {module.name}: vendor={module.vendor_id} "
-          f"type={module.product_type} code={module.product_code} slot={module.slot_no}")
+acd.db_new_tag("MyController.ACD", "MyNewTag", "DINT", value=42)
+acd.db_insert_rung("MyController.ACD", "MyRoutine", 0, "XIC(Always_Off)OTE(MyNewTag);")
+acd.db_export_routine("MyController.ACD", "MyRoutine", "out.L5X")
+# Studio 5000: right-click Routines -> Import Routine... -> select out.L5X
 ```
+
+Run `help(acd)` (or read `acd/__init__.py`'s module docstring directly) for the complete `db_*`
+function list, including multi-step atomic edits (`db_transaction`), deleting a
+tag/routine/member, and comparing two projects/routines/saves — that docstring is written to be
+the single source of truth for this API, kept in sync with the actual functions.
+
+The lower-level, single-process API this is built on (`load_acd()`, an in-memory `Controller`/
+`Tag`/`Routine` object graph, `export_routine()`, ...) is still fully supported via
+`acd.api`/`acd.l5x.elements` directly — useful for read-heavy scripts that don't need edits to
+survive across separate process invocations, or for advanced/internal work on this library
+itself. Everything below this point uses that lower-level API.
 
 ---
 

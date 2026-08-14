@@ -32,8 +32,9 @@ from acd import (
     open_project_db,
 )
 from acd.api import get_routine, load_acd
+from acd.l5x.elements import DataType, Routine, new_tag
 from acd.l5x import project_db as project_db_module
-from acd.l5x.project_db import _ProjectLock
+from acd.l5x.project_db import _materialize, _ProjectLock, _TEMPORARY_IMPORT_DATATYPE_PREFIX
 
 
 @pytest.fixture
@@ -71,6 +72,89 @@ def test_open_project_db_materializes_matching_summary(acd_copy):
         assert summary["data_types"] == [dt.name for dt in reference.controller.data_types]
     finally:
         db.close()
+
+
+def test_materialize_skips_duplicate_temporary_import_placeholder_datatypes(acd_copy):
+    # Regression test for a real reported blocker: a real .ACD legitimately
+    # contained two distinct DataType records both rendering to the exact
+    # same "ZZZZZ_TEMPORARY_IMPORT_DATATYPE_NAME_000" name (a Rockwell-
+    # internal in-flight-import placeholder, left behind by back-to-back
+    # partial-L5X imports) -- proj_data_types.name has a global UNIQUE
+    # index, so the second INSERT crashed every rebuild, which blocks
+    # EVERY db_* call (reads included) against that project, not just edits.
+    project = load_acd(str(acd_copy), verbose=False)
+    placeholder_name = f"{_TEMPORARY_IMPORT_DATATYPE_PREFIX}_000"
+    placeholder1 = DataType(placeholder_name, placeholder_name, "NoFamily", "User", [])
+    placeholder2 = DataType(placeholder_name, placeholder_name, "NoFamily", "User", [])
+    real_count = len(project.controller.data_types)
+    project.controller.data_types = list(project.controller.data_types) + [placeholder1, placeholder2]
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        _materialize(conn, project, str(acd_copy))  # must not raise
+        count = conn.execute(
+            "SELECT COUNT(*) FROM proj_data_types WHERE name LIKE ?",
+            (f"{_TEMPORARY_IMPORT_DATATYPE_PREFIX}%",),
+        ).fetchone()[0]
+        assert count == 0
+        total = conn.execute("SELECT COUNT(*) FROM proj_data_types").fetchone()[0]
+        assert total == real_count
+    finally:
+        conn.close()
+
+
+def test_materialize_raises_clear_error_on_genuine_datatype_name_collision(acd_copy):
+    # A DUPLICATE name that ISN'T the known placeholder pattern is a real,
+    # unhandled ambiguity this schema doesn't support -- must fail with a
+    # clear, named error instead of a raw/opaque sqlite3.IntegrityError, so
+    # a future instance of this (a differently-named collision, since the
+    # exact placeholder name isn't the only theoretically possible one) is
+    # fast to diagnose rather than another silent full-blocker.
+    project = load_acd(str(acd_copy), verbose=False)
+    dup1 = DataType("PDB_REAL_DUPLICATE", "PDB_REAL_DUPLICATE", "NoFamily", "User", [])
+    dup2 = DataType("PDB_REAL_DUPLICATE", "PDB_REAL_DUPLICATE", "NoFamily", "User", [])
+    project.controller.data_types = list(project.controller.data_types) + [dup1, dup2]
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="PDB_REAL_DUPLICATE"):
+            _materialize(conn, project, str(acd_copy))
+    finally:
+        conn.close()
+
+
+def test_materialize_raises_clear_error_on_controller_tag_name_collision(acd_copy):
+    # Same class of exposure the bug report explicitly asked about ("worth
+    # checking whether tags/routines/AOIs have the same exposure") --
+    # proj_tags is scoped by (program_id, name), so this needs two
+    # controller-scope tags sharing a name, which is a narrower scenario
+    # than the DataType case (global, unscoped) but not provably impossible.
+    project = load_acd(str(acd_copy), verbose=False)
+    dup1 = new_tag("PDB_DUP_TAG", "DINT")
+    dup2 = new_tag("PDB_DUP_TAG", "DINT")
+    project.controller.tags = list(project.controller.tags) + [dup1, dup2]
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="PDB_DUP_TAG"):
+            _materialize(conn, project, str(acd_copy))
+    finally:
+        conn.close()
+
+
+def test_materialize_raises_clear_error_on_routine_name_collision(acd_copy):
+    project = load_acd(str(acd_copy), verbose=False)
+    program = project.controller.programs[0]
+    dup1 = Routine("PDB_DUP_ROUTINE", "PDB_DUP_ROUTINE", "RLL", [])
+    dup2 = Routine("PDB_DUP_ROUTINE", "PDB_DUP_ROUTINE", "RLL", [])
+    program.routines = list(program.routines) + [dup1, dup2]
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="PDB_DUP_ROUTINE"):
+            _materialize(conn, project, str(acd_copy))
+    finally:
+        conn.close()
 
 
 def test_open_project_db_does_not_rebuild_on_second_open(acd_copy, monkeypatch):

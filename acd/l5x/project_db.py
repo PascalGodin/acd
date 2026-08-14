@@ -99,6 +99,22 @@ from acd.l5x.export_l5x import configure_logging, ExportL5x
 
 _DB_FILENAME = "acd.db"
 
+# A known Rockwell-internal placeholder name for an in-flight/incomplete UDT
+# import -- Comps.Dat can genuinely contain MULTIPLE distinct DataType
+# records that all render to this exact name (confirmed via a real project,
+# left behind by a run of back-to-back partial-L5X imports), always empty
+# (0 members). `proj_data_types.name` has a global UNIQUE index (see
+# _SCHEMA above) -- inserting a second one crashed EVERY rebuild, which
+# blocks every db_* call (reads included) against that project until the
+# next successful rebuild. Filtered out entirely in _materialize() below,
+# same "not a real object a caller would ever want to reference" reasoning
+# already applied elsewhere in this codebase to other Comps-level artifacts
+# (hex-named connections, "__Map:" prefixes, phantom Program/Module/Tag/
+# Routine records -- see CLAUDE.md). Matched by prefix, not exact string,
+# in case Rockwell appends a different counter suffix for a different
+# in-flight import than the "_000" observed in the one real case seen so far.
+_TEMPORARY_IMPORT_DATATYPE_PREFIX = "ZZZZZ_TEMPORARY_IMPORT_DATATYPE_NAME"
+
 # Reserved `proj_programs.id` representing controller scope -- always
 # present (inserted at rebuild time) so `proj_tags.program_id`/
 # `proj_routines.program_id` can use a real FK-style value instead of
@@ -327,6 +343,19 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
     place this module ever reads the raw comps/rungs/etc. tables' *decoded*
     shape; every other read in this module queries the `proj_*` tables
     written here.
+
+    Raises `sqlite3.IntegrityError` (with the offending name/scope, not
+    just SQLite's own opaque "UNIQUE constraint failed") if the source
+    project genuinely has two DataTypes/tags/routines sharing a name within
+    the same uniqueness scope -- these tables assume unique names (a real,
+    documented v1 limitation, see CLAUDE.md's "A real .ACD can contain two
+    DataTypes with the same name"), and a raw ACD can legitimately violate
+    that in ways this codebase already knows to filter for other object
+    kinds. Re-raising with a clear message at least makes a FUTURE instance
+    of this (a tag/routine collision, or a differently-named DataType
+    duplicate that isn't the known placeholder pattern below) fast to
+    diagnose instead of every db_* call -- reads included -- failing on an
+    opaque crash with no indication of which object or scope is responsible.
     """
     db.executescript(_SCHEMA)
     cur = db.cursor()
@@ -342,11 +371,24 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
 
     ctrl = project.controller
 
+    skipped_placeholder_dts = 0
     for dt in ctrl.data_types:
-        cur.execute(
-            "INSERT INTO proj_data_types (name, family, cls, description) VALUES (?, ?, ?, ?)",
-            (dt.name, dt.family, dt.cls, dt._description),
-        )
+        if dt.name.startswith(_TEMPORARY_IMPORT_DATATYPE_PREFIX):
+            skipped_placeholder_dts += 1
+            continue
+        try:
+            cur.execute(
+                "INSERT INTO proj_data_types (name, family, cls, description) VALUES (?, ?, ?, ?)",
+                (dt.name, dt.family, dt.cls, dt._description),
+            )
+        except sqlite3.IntegrityError as e:
+            raise sqlite3.IntegrityError(
+                f"proj_data_types: DataType name {dt.name!r} collides with another "
+                f"DataType already inserted -- Comps.Dat genuinely contains two distinct "
+                f"DataType records rendering to the same name, and this schema currently "
+                f"requires DataType names to be globally unique (see CLAUDE.md). "
+                f"Original error: {e}"
+            ) from e
         dt_id = cur.lastrowid
         for seq, m in enumerate(dt.members):
             cur.execute(
@@ -356,17 +398,32 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
                 (dt_id, seq, m.name, m.data_type, m.dimension, m.radix, int(m.hidden),
                  m.target, m.bit_number, m.external_access, m._description),
             )
-
-    def _insert_tag(program_id: int, tag: Tag) -> None:
-        cur.execute(
-            "INSERT INTO proj_tags (program_id, name, tag_type, data_type_name, radix, "
-            "external_access, constant, dimensions, target, initial_value, source_object_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (program_id, tag.name, tag.tag_type, tag.data_type, tag.radix,
-             tag.external_access, tag.constant, tag.dimensions, tag.target,
-             json.dumps(tag._initial_value) if tag._initial_value is not None else None,
-             tag._data_table_instance or None),
+    if skipped_placeholder_dts:
+        log.info(
+            f"_materialize(): skipped {skipped_placeholder_dts} "
+            f"'{_TEMPORARY_IMPORT_DATATYPE_PREFIX}*' placeholder DataType(s) -- a "
+            f"Rockwell-internal in-flight-import marker, not a real type"
         )
+
+    def _insert_tag(program_id: int, program_label: str, tag: Tag) -> None:
+        try:
+            cur.execute(
+                "INSERT INTO proj_tags (program_id, name, tag_type, data_type_name, radix, "
+                "external_access, constant, dimensions, target, initial_value, source_object_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (program_id, tag.name, tag.tag_type, tag.data_type, tag.radix,
+                 tag.external_access, tag.constant, tag.dimensions, tag.target,
+                 json.dumps(tag._initial_value) if tag._initial_value is not None else None,
+                 tag._data_table_instance or None),
+            )
+        except sqlite3.IntegrityError as e:
+            raise sqlite3.IntegrityError(
+                f"proj_tags: tag name {tag.name!r} collides with another tag already "
+                f"inserted in scope {program_label!r} -- Comps.Dat genuinely contains two "
+                f"distinct tag records sharing this (scope, name), and this schema "
+                f"currently requires tag names to be unique per scope. "
+                f"Original error: {e}"
+            ) from e
         tag_id = cur.lastrowid
         for path, text in tag._comments:
             cur.execute(
@@ -375,7 +432,7 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
             )
 
     for tag in ctrl.tags:
-        _insert_tag(_CONTROLLER_SCOPE, tag)
+        _insert_tag(_CONTROLLER_SCOPE, "<controller>", tag)
 
     for program in ctrl.programs:
         cur.execute(
@@ -386,12 +443,22 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
         )
         program_id = cur.lastrowid
         for tag in program.tags:
-            _insert_tag(program_id, tag)
+            _insert_tag(program_id, program.name, tag)
         for routine in program.routines:
-            cur.execute(
-                "INSERT INTO proj_routines (program_id, name, type, description) VALUES (?, ?, ?, ?)",
-                (program_id, routine.name, routine.type, routine._description),
-            )
+            try:
+                cur.execute(
+                    "INSERT INTO proj_routines (program_id, name, type, description) "
+                    "VALUES (?, ?, ?, ?)",
+                    (program_id, routine.name, routine.type, routine._description),
+                )
+            except sqlite3.IntegrityError as e:
+                raise sqlite3.IntegrityError(
+                    f"proj_routines: routine name {routine.name!r} collides with another "
+                    f"routine already inserted in program {program.name!r} -- Comps.Dat "
+                    f"genuinely contains two distinct routine records sharing this "
+                    f"(program, name), and this schema currently requires routine names "
+                    f"to be unique per program. Original error: {e}"
+                ) from e
             routine_id = cur.lastrowid
             for i, text in enumerate(routine.rungs):
                 source_object_id = routine._rung_ids[i] if i < len(routine._rung_ids) else None

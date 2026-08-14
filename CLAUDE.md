@@ -2993,6 +2993,72 @@ Covered by pure-function tests in `test/test_api.py` (`test_new_member_rejects_b
 `len(dt_view.members) > len(existing_members)` bug above had it existed first, a reminder to write the
 integration test before declaring a fix like this done, not just the unit test).
 
+### A real .ACD can contain two DataTypes with the same name — a full blocker, not scoped to one edit
+
+A downstream agent reported a total blocker, more severe than any prior report: EVERY `db_*` call
+against one real project crashed, including plain reads, because `open_project_db()` auto-rebuilds
+the persistent DB whenever the source `.ACD`'s mtime changes, and the rebuild itself was what
+crashed — so there was no way to even inspect the project through this layer, let alone edit it.
+
+**Root cause, confirmed by the agent via the legacy `load_acd()` loader (which bypasses the
+persistent-DB layer entirely and has no uniqueness assumption at all — it's just a plain Python
+list)**: the real `.ACD` genuinely contains TWO distinct DataType records that both decode to the
+exact same name, `ZZZZZ_TEMPORARY_IMPORT_DATATYPE_NAME_000` — a known Rockwell-internal placeholder
+name for an in-flight/incomplete UDT import, both empty (0 members), almost certainly left behind by
+a run of back-to-back partial-L5X imports (exactly the `export_datatype()`/Studio "Import Data
+Type..." workflow this whole subsystem exists to support). Not corrupted data — Rockwell's own format
+tolerates this; `proj_data_types.name` has a GLOBAL `UNIQUE INDEX ... COLLATE NOCASE` (see `_SCHEMA`
+above), an assumption that simply doesn't hold for this project. The agent explicitly flagged the
+broader question worth checking: whether tags/routines/AOIs have the same exposure, "since this
+project clearly can produce same-named entries that Rockwell's own format tolerates."
+
+**Fix, two parts:**
+1. **The immediate unblock**: `_materialize()` now filters OUT any DataType whose name starts with
+   `ZZZZZ_TEMPORARY_IMPORT_DATATYPE_NAME` (`_TEMPORARY_IMPORT_DATATYPE_PREFIX`, matched by prefix, not
+   an exact string, in case Rockwell appends a different counter suffix for a different in-flight
+   import than the `_000` observed in this one real case) BEFORE it ever reaches the `INSERT` —
+   exactly the same "not a real object a caller would ever want to reference" reasoning already
+   applied throughout this codebase to other Comps-level artifacts (hex-named cached-MSG connections,
+   `"__Map:"`-prefixed shadow entries, phantom Program/Module/Tag/Routine records — see this file's
+   own extensive history above). A skipped count is logged via `log.info()` for visibility. This
+   directly and completely resolves the reported crash: after filtering, zero placeholder entries
+   reach the `INSERT` at all, regardless of how many duplicates exist.
+2. **The broader exposure the agent asked about, addressed as diagnosability rather than a blind
+   guess**: `AOIs` are not exposed to this specific bug at all — they're never persisted through
+   `proj_*` tables in the first place (v1 scope explicitly excludes them, always re-derived fresh via
+   `ControllerBuilder` on every `to_controller()` call, see "Persistent project DB" above). `proj_tags`
+   and `proj_routines` ARE scoped uniqueness (`(program_id, name)` / `(program_id, name)`, not global
+   like DataTypes), so a real collision there needs two tags/routines sharing BOTH the same scope AND
+   the same name — a narrower, unconfirmed scenario with no known placeholder-name convention to
+   filter by (guessing one without real data would violate this project's own repeatedly-stated
+   "don't guess a fix without real data" rule). Instead of leaving those two tables exposed to the
+   exact same class of opaque crash, `_materialize()`'s DataType/tag/routine `INSERT`s are now each
+   individually wrapped to catch `sqlite3.IntegrityError` and re-raise with a clear message naming the
+   specific object and its scope, instead of SQLite's own bare "UNIQUE constraint failed" — so if a
+   real tag/routine collision (or a DataType duplicate that isn't the known placeholder pattern) is
+   ever hit in the future, it fails fast with an actionable diagnosis instead of reproducing this same
+   "every db_* call blocked, no idea why" severity from scratch.
+
+**Verified**: a synthetic reproduction (loading the small fixture ACD, then appending two DataType
+objects both named `ZZZZZ_TEMPORARY_IMPORT_DATATYPE_NAME_000` directly to
+`project.controller.data_types` before calling `_materialize()`) confirms both cases — the known
+placeholder pair is silently skipped with no crash and zero rows persisted for it, while an otherwise
+identical but NON-placeholder-named duplicate still raises, now with the offending name and table
+named directly in the error message instead of SQLite's own opaque text. The same clear-error pattern
+verified for a synthetic controller-scope tag name collision and a synthetic same-program routine
+name collision (both narrower/less-likely scenarios per the scoping above, but now diagnosable rather
+than silently unguarded either way).
+
+Covered by `test_materialize_skips_duplicate_temporary_import_placeholder_datatypes`,
+`test_materialize_raises_clear_error_on_genuine_datatype_name_collision`,
+`test_materialize_raises_clear_error_on_controller_tag_name_collision`, and
+`test_materialize_raises_clear_error_on_routine_name_collision` (`test/test_project_db.py`) — all
+constructed via direct `_materialize()` calls against a synthetic in-memory SQLite connection (not
+`open_project_db()`), since reproducing this class of bug needs to inject a genuinely duplicate-named
+object into the object graph BEFORE materialization, not something reachable through any normal edit
+API (every `db_*` edit method already enforces unique names going forward — this is specifically about
+what the SOURCE `.ACD` can already legally contain on the very first rebuild).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

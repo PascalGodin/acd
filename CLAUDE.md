@@ -41,6 +41,22 @@ pytest                    # runs from repo root; test/conftest.py chdir's into t
   in test files are relative to `test/`, e.g. `"../resources/CuteLogix.ACD"` — this works from
   any invocation directory because of the `conftest.py` autouse fixture).
 - Formatting: `black` (via pre-commit, see `.pre-commit-config.yaml`).
+- `pip install .`/`pip install git+<url>` (non-editable) now work — previously `setup.py` had a
+  custom `install` command that unconditionally tried to invoke the external Kaitai Struct
+  compiler (`kaitai-struct-compiler.bat`/`ksc`, a separate Java-based tool, not a Python
+  dependency) to regenerate `acd/generated/`, which hard-failed (`WinError 2`/`FileNotFoundError`)
+  on any machine without that compiler on PATH — confirmed by actually testing `pip install .` in
+  a throwaway venv, not assumed. `acd/generated/`'s output is already committed to git and never
+  needed regenerating for a normal install; only `pip install -e .` (which goes through a
+  different setuptools code path) ever worked, which is why this went unnoticed — every existing
+  install (this repo's own dev setup, the downstream agent's) happened to use `-e`. Regenerating
+  after changing a `.ksy` template is now a separate, explicit maintainer step: `python
+  scripts/regenerate_kaitai.py` (see README's "Developing" section). Verified after the fix: a
+  real non-editable `pip install .` in a fresh venv succeeds and `db_to_controller()` loads the
+  real `CuteLogix.ACD` fixture correctly; the editable install path (`pip install -e .`) is
+  unaffected. Found while investigating what a "lightweight, no-admin-rights" acd-tools setup for
+  a non-technical user (delegating to an AI coding agent that runs `pip install` itself) would
+  actually require — this was the real, confirmed blocker, not a hypothetical one.
 
 ## Architecture
 
@@ -2346,6 +2362,348 @@ an LLM caller to actually use it — the function matching the caller's exact me
 two routines" vs. "I have two projects") has to exist, and the guidance steering them to it has to
 be positioned where it will actually be read (at the very top, restated at the point of need), not
 just documented accurately somewhere in the file.
+
+## Persistent project DB (`acd/l5x/project_db.py`) — `db_*` functions / `open_project_db()`/`ProjectDB`
+
+Added after a downstream agent's session hit a real correctness bug: since raw ACD write-back is
+blocked (see "ACD write-back" below — no `FileInfo.Dat` signing key, so the only durable edit path
+is a real Studio 5000 import of an `export_routine()`/`export_datatype()` output), every one-off
+Python script in that session did a fresh `load_acd()` from the same unmodified `.ACD` on disk.
+Tags created via `new_tag()` in one script existed only in that process's memory — the next
+script's fresh load didn't have them, and `export_routine()`'s dependency scan silently omitted a
+`<Tag>` for any name it couldn't find, producing a quietly incomplete export with no error. The
+user's framing, arrived at through discussion, is the design target: this should feel like editing
+Studio 5000's own **offline project state** — an edit (`new_tag`, add a UDT member, insert a rung,
+set a comment) writes directly into the current project, no separate "pending edits"/journal/replay
+concept — until it's explicitly rebuilt from the real `.ACD` (a new Studio save, detected via the
+source file's mtime, or an explicit `rebuild=True`).
+
+**Where it lives, concretely**: `ExportL5x` already builds a real SQLite file (`acd.db`) next to
+the source `.ACD` on every load (see "Ingestion robustness" area of `export_l5x.py`) — not
+`:memory:`, and (when constructed directly, not via `load_acd()`) not a throwaway temp dir either,
+it defaults to a stable directory next to the ACD. `project_db.py` adds a second, higher-level set
+of tables to that SAME file — normalized/decoded shape (`proj_data_types`, `proj_members`,
+`proj_programs`, `proj_tags`, `proj_tag_comments`, `proj_routines`, `proj_rungs`, `proj_st_lines`,
+`proj_meta`) sitting alongside the existing raw binary-decode tables (`comps`, `rungs`,
+`region_map`, `comments`, `nameless`, `regnlink*`) that `ExportL5x` itself owns. **Every new table
+is prefixed `proj_` deliberately** — the first working version used unprefixed names and its own
+`rungs` table silently collided with (and `DROP TABLE`'d) `ExportL5x`'s own raw `rungs` table
+(`object_id, rung, seq_number`), breaking `RoutineBuilder` with `no such column: r.rung` the moment
+anything tried to read raw rung data again. Caught immediately by a real end-to-end smoke test, not
+by code review — a reminder that adding tables to a database you don't fully own the schema of
+needs an explicit namespace, not just "these names sound fine."
+
+**Key architectural decision: rehydrate into the existing object graph, never rewrite rendering.**
+`export_routine()`/`export_datatype()`/`Tag.to_xml()`/`_resolve_type_closure()` are the most
+heavily real-Studio-import-verified code in this whole library (see the "Native-import escape
+hatches" and "Partial/context L5X exports" sections above — many rounds of real import failures
+fixed one at a time). Rewriting them to query SQL directly would re-risk all of that for no benefit.
+Instead, `ProjectDB.to_controller()` rehydrates a **fresh, real `Controller`/`RSLogix5000Content`**
+object graph from the `proj_*` tables (cheap — plain `SELECT`s into dataclasses, no binary
+decoding) and hands it to the exact same, unmodified `export_routine()`/`export_datatype()`
+functions. `.modules`/`.aois`/`.tasks` and every Controller-level scalar field are **not** part of
+the new tables at all (nothing edits these yet — v1 scope is tags, UDT members, rungs, tag comments
+only, matching exactly what caused the original bug report) — `to_controller()` re-derives them
+fresh from the raw tables via the same `ControllerBuilder` a plain `load_acd()` uses, every call.
+This is zero new decode logic for that part, at the cost of redoing that decode work (though never
+re-parsing/re-unzipping the source `.ACD` itself) every time `to_controller()` runs — an accepted
+v1 simplicity tradeoff, not a bug; a future pass could special-case skipping the tag/data_type
+portion of that rebuild if the redundant decode cost ever actually matters in practice.
+
+**A second real bug, also only caught via an end-to-end smoke test, not by review**: shifting
+`rung_index` (or UDT member `seq`) values with a single `UPDATE ... SET x = x + 1 WHERE x >= ?`
+against a table with a `UNIQUE(routine_id, rung_index)` index intermittently raised
+`sqlite3.IntegrityError` — SQLite does not guarantee the row-processing order of a single UPDATE
+statement, so shifting row A (index 5→6) can momentarily collide with row B (still at 6, not yet
+processed) even though the *final* state after the whole statement would be perfectly valid; SQLite
+has no deferred-UNIQUE-constraint mechanism (only foreign keys can be deferred). Fixed in
+`insert_rung()`/`delete_rung()`/`new_member()` with a two-phase shift through a temporary *negative*
+value (`x = -(x±1)`, then `x = -x` for every row `< 0`) — negative values can never collide with a
+real (always `>= 0`) index/seq, so the intermediate state is always safe regardless of row order.
+
+**Design points, for anyone extending this**:
+- The `proj_programs` table has a reserved `id=0` row (name `""`) representing controller scope,
+  rather than using `NULL` for `program_id` — SQLite's `UNIQUE` semantics treat every `NULL` as
+  distinct from every other `NULL`, so two different controller-scope tags named identically would
+  NOT have collided under a `(NULL, name)` unique index; a real sentinel row avoids this pitfall
+  and keeps `tags.program_id`/`routines.program_id` genuine, always-non-NULL foreign keys.
+- `Tag._initial_value` (an arbitrarily nested dict/list/scalar) is stored as a JSON text column
+  (`json.dumps`/`json.loads`) — the natural fit given SQLite has no native nested-value column type.
+- Deliberately NOT persisted (decode-only fields, irrelevant to rendering):
+  `Member._byte_offset`, `DataType._dead_member_bytes`, `Tag._data_table_instance` (this last one IS
+  captured as `proj_tags.source_object_id` for traceability, just never read back on rehydration).
+  `Tag._data_types_map`/`Controller._data_types_map` (the shared-by-reference dict used everywhere
+  in the existing decode/render code, see "Mutating a UDT with live tag instances" above) is never
+  a stored column at all — rebuilt fresh in-memory on every `to_controller()` call, seeded from a
+  COPY of the freshly-built `Controller._data_types_map` (to retain `ProductDefined`/module-defined
+  types, needed for I/O tag rendering but never stored in `proj_data_types`) and then overlaid with
+  every `proj_data_types` entry (which may include brand-new/edited User types) before being wired
+  onto every rehydrated `Tag` by reference — the same "one shared dict object" pattern
+  `ControllerBuilder.build()` already uses, just re-derived per rehydration instead of per load.
+**Windows file-locking bug (found, then actually fixed — not just documented as a caveat)**: a
+rebuild does `os.remove()` on the existing `acd.db` (inherited from `ExportL5x.__post_init__`'s own
+always-wipe behavior). If another connection to that exact file was still open anywhere — even in
+the SAME process — Windows raises `PermissionError` rather than allowing the delete (unlike POSIX,
+which allows deleting an open file). First response to this was to document it as a known caveat
+("don't do that"), relying on every caller remembering to `.close()` before anything else might
+trigger a rebuild against the same path — directly contradicted by the user, who pushed back: this
+should be the API's job, not caller discipline the agent has to get right every time. Correct
+critique — the real problem was that `open_project_db()`/`ProjectDB` hands the caller a long-lived
+connection to manage at all, which is exactly the kind of lifecycle detail a "just call the surface
+function" API shouldn't require. Fixed with two changes together, not one:
+
+1. **`_ProjectLock`** (`project_db.py`) — a cross-process mutex over one project, backed by an
+   exclusively-created lock file (`project_dir/.lock`, via `os.open(..., O_CREAT | O_EXCL)`, atomic
+   identically on Windows and POSIX). Acquired by `open_project_db()` before even checking
+   staleness, held for the `ProjectDB`'s entire lifetime, released by `.close()` — including around
+   `_rebuild_project_db()` itself. This is what actually closes the gap: a rebuild can never race a
+   still-open connection, because nothing else can be mid-operation while the lock is held, and
+   rebuild itself waits for the lock before touching the file. A lock file untouched for over
+   `_LOCK_STALE_SECONDS` (120s — no legitimate operation here should ever take that long) is assumed
+   abandoned by a crashed holder and stolen rather than waited out, via an mtime-age heuristic (not
+   real PID liveness — simpler, no new dependency, and a false "still alive" read only costs an
+   extra `_LOCK_TIMEOUT_SECONDS`-long wait, never wrong behavior).
+2. **The `db_*` functions** (`db_new_tag`, `db_edit_tag`, `db_new_member`, `db_insert_rung`,
+   `db_delete_rung`, `db_replace_rung_safe`, `db_export_routine`, `db_export_datatype`,
+   `db_list_tags`, `db_list_routines`, `db_tag_exists`, `db_get_project_summary`,
+   `db_to_controller`) — stateless, one-call-does-everything wrappers (open → do the one thing →
+   close, via a shared `_run()` helper) that are now the *documented default surface*, matching this
+   repo's existing `acd.api` convention of flat functions over stateful handles. There's no
+   connection object for a caller to see, so there's nothing to forget to close.
+   `open_project_db()`/`ProjectDB` are still there (also lock-protected) for a script batching many
+   edits in one session that wants to hold the lock across all of them rather than pay one
+   acquire/release cycle per edit — documented as the secondary, advanced option, not removed.
+
+Covered by `test/test_project_db.py`: rebuild/materialization matches a plain `load_acd()`'s counts,
+no-rebuild-on-unchanged-mtime via a monkeypatched call spy, rebuild-on-changed-mtime discarding
+prior edits, every edit method (both the `ProjectDB` and `db_*` forms) persisting across a
+close/reopen cycle including program-scope isolation and duplicate-name rejection, rung
+insert/delete/replace-safe index arithmetic, end-to-end `export_routine()`/`export_datatype()`
+producing XML that contains a DB-created tag/member, and `_ProjectLock` specifically (a second
+acquirer times out while the first holds it, a waiting acquirer succeeds once the holder releases —
+verified with a real background thread, not simulated — and a stale lock is stolen quickly rather
+than waited out for the full timeout) — all against the real `CuteLogix.ACD` fixture.
+
+**A third real bug, found only through repeated test runs, not a single pass**: the lock's own
+acquire loop only caught `FileExistsError` on the `os.open(..., O_CREAT|O_EXCL)` create — but a
+real background-thread test (`test_project_lock_waiter_succeeds_once_released`) failed intermittently
+with `PermissionError` instead. This is a genuine Windows NTFS timing quirk, not a hypothetical:
+immediately re-creating a filename right after another thread/process deletes it can transiently
+raise `PermissionError` rather than either succeeding or reporting `FileExistsError` (deletion isn't
+always atomic from a following create's perspective). `acquire()` now catches `(FileExistsError,
+PermissionError)` identically — both mean "can't acquire right now," handled by the exact same
+retry/stale-check/timeout logic either way. Re-ran the lock tests 8 times in a row after the fix
+(a single clean pass proves nothing for a race condition) before trusting it.
+
+### API surface: `db_*` only, everything else deliberately unexported from `acd`
+
+First cut of this feature re-exported the ENTIRE existing in-memory API (`load_acd`, `get_routine`,
+`list_tags`, `export_routine`, `new_tag`, ...) from `acd/__init__.py` alongside the new `db_*`
+functions — i.e. both surfaces sitting side by side at the top level. The user pushed back directly:
+their fear was that an agent would "silently decide to use the legacy ones instead of using the top
+level ones" — a real risk specifically because this library's own stated audience is AI agents,
+which will happily reach for whichever similarly-named function is sitting right there rather than
+reliably reading a docstring recommendation first. A recommendation in prose doesn't stop an agent
+from calling `acd.load_acd()` if it's importable and looks like it does the job.
+
+Fixed by actually removing the legacy functions from `acd/__init__.py`'s top-level namespace, not
+just documenting a preference — `acd.load_acd`/`acd.get_routine`/`acd.list_tags`/`acd.export_routine`/
+`acd.new_tag`/etc. no longer exist as `acd.X` at all. They still work exactly as before via
+`acd.api.X`/`acd.l5x.elements.X` (every `db_*` function is itself built on top of them internally,
+and any advanced caller can still reach them deliberately) — but `import acd; dir(acd)` /
+`help(acd)` now shows only the `db_*` functions, `open_project_db`/`ProjectDB`, and the two pure
+utilities with no project/DB dependency at all (`find_io_addresses`, `diff_lines`). Verified this
+was a safe removal, not just a hoped-for one: grepped the whole existing test suite first — every
+test file already imports from `acd.api`/`acd.l5x.elements` submodule paths directly, not the
+top-level `acd` package, so nothing broke.
+
+This also exposed real, pre-existing gaps in `db_*` coverage that had to be filled before the
+restriction made sense: there was no `db_*` way to read a specific routine's actual rung content
+(only counts via `db_list_routines`), read a tag's value, find tag references, list I/O addresses,
+or diff two projects/routines — an agent needing any of those would have had no choice but to reach
+for `db_to_controller()` and then call the legacy in-memory functions on the result anyway, defeating
+the whole point of restricting the surface. Added `db_get_routine()` (returns a plain dict — name/
+type/description/rungs/rung_comments/st_lines — not a `Routine` object, keeping the DB surface
+self-contained), `db_get_tag_value()`, `db_find_tag_references()`, `db_io_addresses_by_routine()`,
+and three two-project comparison functions (`db_diff_project()`, `db_diff_routine()`,
+`db_diff_io_addresses()` — these don't fit as `ProjectDB` instance methods since an instance is
+scoped to one project; each opens/rehydrates/closes both sides independently, through the same
+`_ProjectLock` every other `db_*` call goes through).
+
+A genuine bug found and fixed while adding tests for these: `_first_routine(open_project_db(...))`
+(a test helper, not library code) passed a throwaway `ProjectDB` straight into a helper that never
+closes it — leaking that project's lock file for the rest of the test and hanging any later
+`db_*`/`open_project_db()` call against the same path until the lock's own timeout. The exact same
+"nothing forces a caller to close this" class of bug the whole `_ProjectLock`/`db_*` redesign above
+was built to eliminate from the *library's* surface — reappeared immediately in hand-written test
+code the moment a raw `open_project_db()` call got used carelessly, which is itself a small,
+concrete demonstration of why the user's original instinct (make forgetting-to-close structurally
+impossible, not just documented) was the right one.
+
+### First real-usage feedback round (two real bugs, one confirmed-as-designed)
+
+Asked the downstream agent that had actually been using `db_*` against a real project for direct
+feedback rather than waiting for it to surface as a bug report. Got three concrete items, two real:
+
+1. **A rebuild triggered by the source `.ACD`'s mtime changing silently discards any edit made
+   since the last rebuild that was never exported** — and for this real project specifically, the
+   source file gets re-synced from Studio mid-session more than once in a single day. An edit made
+   and not immediately exported can vanish with nothing but an `log.info()` line, indistinguishable
+   from the normal "old project, fresh start" case. Fixed by adding `proj_meta.dirty` (flipped to 1
+   by every edit method in the same commit as the edit itself, defaulting to 0 on a fresh
+   `_materialize()`) — `open_project_db()` now checks it before any rebuild (mtime-triggered OR
+   explicit `rebuild=True`) and logs a `log.warning()` naming the risk plainly if it would discard
+   real edits, instead of the same `log.info()` a routine "nothing to lose" rebuild gets. Deliberately
+   NOT a hard block/raise — the whole point of the wipe-and-rebuild model is that it's always
+   allowed, this only adds visibility into when it's throwing something away.
+2. **`db_*` functions didn't inherit `load_acd()`'s quiet-by-default logging** — confirmed directly:
+   `ExportL5x.__post_init__` is the only place the quiet/verbose reconfiguration ran, but
+   `ProjectDB.to_controller()` calls `ControllerBuilder` directly against an already-open connection,
+   which never goes through `ExportL5x` at all on `open_project_db()`'s "reuse existing DB, no
+   rebuild needed" path — meaning a process that never happens to trigger a rebuild never reconfigures
+   loguru's sink, so `ControllerBuilder`'s own `log.info()` calls (e.g. the deleted-member diagnostics
+   documented elsewhere in this file) print unfiltered regardless of `verbose=False`. Fixed by
+   extracting the reconfiguration into `configure_logging(verbose)` (`export_l5x.py`, used by both
+   `ExportL5x.__post_init__` and `open_project_db()`, called unconditionally at the very top of the
+   latter, before any rebuild-or-reuse decision is even made).
+3. **A new `acd.db` file — and its own subfolder, named after the ACD stem — appears directly in the
+   project's own working directory** (e.g. `source/BPM_TrimmerSorter_VAB_20260813/acd.db`), not a
+   temp dir. Confirmed as-designed, not a bug: this is the literal persistence mechanism the whole
+   feature exists to provide (see "Persistent project DB" above) — `ExportL5x` already had this exact
+   default-location behavior for any direct call without an explicit `temp_dir`, `db_*`/
+   `open_project_db()` are just the first thing to actually exercise it routinely. No code change;
+   documented here so the answer doesn't need re-deriving next time it comes up. If a downstream
+   project's own working directory is itself version-controlled, that project's `.gitignore` (not
+   this repo's) is the right place to exclude these — not something for acd-tools itself to manage.
+
+Covered by three new tests in `test/test_project_db.py`
+(`test_open_project_db_warns_when_rebuild_discards_dirty_edits`,
+`test_open_project_db_does_not_warn_when_rebuild_has_nothing_to_discard`,
+`test_open_project_db_configures_quiet_logging_even_without_rebuild`) — the warning tests assert
+against real captured `stderr` (via pytest's `capsys`) rather than a separately-added loguru sink,
+since `configure_logging()`'s own `log.remove()` call (run at the very top of `open_project_db()`)
+would silently wipe any sink a test added beforehand; the logging test spies on `configure_logging`
+itself rather than depending on the small `CuteLogix.ACD` fixture happening to trigger a specific
+internal `log.info()` call it may not have any real reason to emit (no deleted UDT members in that
+fixture) regardless of whether the fix is present.
+
+### Second real-usage feedback: partial multi-step edits are now durable, not atomic-by-accident
+
+A follow-up report from the same downstream agent, articulating a real architectural shift in
+failure-mode risk that neither the original design discussion nor the first feedback round had
+addressed. With the OLD in-memory workflow (`load_acd()` + edit + `export_routine()`), a script that
+raised partway through (collision asserts, typos, the `dimension=None` mistake documented elsewhere
+in this file, ...) left zero durable side effects — not because anything was designed to guarantee
+that, but purely as a side effect of nothing ever persisting between separate process invocations in
+the first place. A failed script was, for free, a clean slate to just fix and rerun.
+
+With `db_*`, each call commits independently the instant it returns. A script doing several edits in
+a row — add a UDT member, create 3 tags, edit 2 rungs — that raises on step 4 has already durably
+committed steps 1-3, with nothing in the DB marking that as an incomplete attempt. The practical
+mitigation the agent had already been relying on (check `db_get_project_summary`/`db_list_tags` at
+the start of a retry to spot and clean up a stray partial attempt) works, but is easy to forget, and
+puts the burden on every caller to reimplement the same defensive check.
+
+Added real transaction support rather than leaving this as caller discipline, matching this whole
+subsystem's own established principle (see the `_ProjectLock`/`db_*` redesign above: don't rely on a
+caller remembering something, make the failure mode structurally impossible instead):
+
+- **`ProjectDB.transaction()`** (a context manager): every edit method's own `self._conn.commit()`
+  becomes conditional (`if not self._in_transaction: self._conn.commit()`) — inside a `with
+  db.transaction():` block, nothing commits until the block exits cleanly; `self._conn.rollback()`
+  runs instead if anything inside it raises, undoing every edit made so far in the block, not just
+  the one that failed. Cannot be nested (raises `RuntimeError`) — this is one flat transaction, not
+  SAVEPOINT-based partial rollback, which wasn't asked for and would add real complexity for no
+  reported need.
+- **`db_transaction(acd_path)`** (a `@contextlib.contextmanager` function): the `db_*`-surface
+  equivalent — opens a `ProjectDB`, wraps the whole `with` block in `.transaction()`, closes on exit
+  either way. Exported at the top level (`acd/__init__.py`) and documented in its module docstring
+  alongside the other `db_*` functions, since this fills a real gap in the *recommended* workflow,
+  not just the advanced `ProjectDB` one.
+- **A real footgun, called out explicitly in both docstrings**: calling a stateless `db_*` function
+  (`db_new_tag`, ...) from INSIDE a `db_transaction()`/`.transaction()` block doesn't raise or silently
+  misbehave — it hangs. Each `db_*` call opens its own separate connection and tries to acquire the
+  SAME project lock the enclosing transaction is already holding, blocking until that inner call's own
+  `_ProjectLock` timeout. Must use the yielded `db` object's own methods (`db.new_tag(...)`) inside the
+  block, never `acd.db_new_tag(...)`.
+- Reads (`to_controller()`, `list_tags()`, ...) called from inside an open transaction correctly see
+  its own uncommitted writes — a single SQLite connection always sees its own in-flight changes, no
+  special handling needed; verified directly
+  (`test_transaction_sees_its_own_uncommitted_writes`).
+- Cross-process isolation was already covered by the existing `_ProjectLock` (held for the whole
+  `ProjectDB`/`db_transaction()` lifetime, transaction or not) — a transaction in progress on one
+  connection already fully blocks any other process's `open_project_db()`/`db_*` call for its
+  duration, so adding rollback semantics didn't need any new concurrency-control work on top of what
+  already existed.
+
+Verified with the exact reported scenario, not just the individual primitives: a transaction adding
+a UDT member, two tags, and a rung, deliberately failing on a simulated "step 5," confirming NONE of
+the first four steps are visible afterward (`test_transaction_partial_multi_step_edit_rolls_back_completely`)
+— plus commit-together, rollback-together, nesting-raises, and mid-transaction-visibility as separate
+tests. Full suite unaffected by this change outside the new tests (every edit method's *end result*
+for a caller not using `.transaction()` is identical to before — commit still happens, just
+conditionally rather than unconditionally).
+
+### Third real-usage feedback: no way to delete anything, and `validate=False` was the wrong default
+
+Two more items from the same downstream agent, both grounded in a real thing that happened this
+session, not hypotheticals:
+
+1. **No `db_delete_tag`/`db_delete_routine`/`db_delete_member`.** Hit directly: a routine
+   (`S06_Bin_Criteria_Check` in the real project) got redesigned away — its logic moved inline into
+   another routine's RLL — leaving it and six now-unused tags as orphaned dead code, with no way to
+   remove them from the persistent DB short of a manual Studio deletion. The agent correctly split
+   this into two separate halves, and only one of them is actually buildable right now:
+   - **Deleting something in the real `.ACD`/Studio project** — almost certainly needs a manual
+     Studio action regardless of what this library does. Studio's native "Import Routine"/"Import
+     Data Type..." mechanism (the only durable write path this library has, see "ACD write-back"
+     above) can only add/update entities present in the partial L5X; it has no delete semantics for
+     something simply left out. No attempt was made to invent an L5X-based delete trick to work
+     around this — this project's own repeated "don't guess a fix without real data" lesson applies
+     directly here, and there's no real Studio behavior to test such a trick against without actual
+     access to try it.
+   - **Removing the entry from the persistent DB's own bookkeeping** — squarely buildable, and
+     valuable on its own even without the first half: without it, an abandoned tag/routine/member
+     keeps showing up in `db_list_tags()`/`db_list_routines()`/`db_get_project_summary()` forever,
+     with nothing distinguishing "still relevant" from "dead, forgot to clean up." Added
+     `delete_tag()`/`delete_routine()`/`delete_member()` on `ProjectDB` (each a straightforward
+     `DELETE` from the relevant `proj_*` table plus its child rows — `proj_tag_comments` for a tag,
+     `proj_rungs`/`proj_st_lines` for a routine — marking `proj_meta.dirty=1` the same way every
+     other edit method does) and the matching `db_delete_tag`/`db_delete_routine`/`db_delete_member`
+     stateless wrappers. Both docstrings state the real-`.ACD` limitation explicitly, right up front,
+     rather than letting a caller assume "delete" means "gone from Studio too."
+2. **`validate=False` as the default on `export_routine()`/`export_datatype()` was the wrong
+   asymmetry for the `db_*`/`ProjectDB` layer specifically.** The check is one extra graph-walk pass,
+   and it catches exactly the bug class (declared-type-vs-rendered-value mismatch, silently rendered
+   as a bare zero instead of raising) that took two separate rounds of live-Studio-rejection
+   debugging to fully run down earlier this same session (see "Initial-value decoding offset bugs"
+   and the AOI-instance-value gaps elsewhere in this file for the general pattern) — a real, not
+   hypothetical, cost of leaving it off by default. Flipped `ProjectDB.export_routine()`/
+   `db_export_routine()` and `ProjectDB.export_datatype()`/`db_export_datatype()` to `validate=True`
+   by default, with an explicit `validate=False` opt-out — **scoped to this layer only**, not the
+   underlying `acd.api.export_routine()`/`export_datatype()`, whose own defaults stay `False`
+   unchanged (no reason to risk an unrelated behavior change to callers of the lower-level functions
+   this session never touched).
+
+   This exposed a real, pre-existing gap: `export_datatype()` had **no `validate` parameter at all**
+   — only `export_routine()` did. `_validate_tag_types_resolve()`'s own recursive type-graph walker
+   was written specifically to start from a *Tag's* own value tree, not a bare `DataType`'s member
+   declarations, so it couldn't be reused as-is. Extracted the shared recursive step into
+   `_validate_type_graph_resolves(dt_name, context, data_types_map, seen)` (`rendering.py`) —
+   behavior-preserving for the existing `_validate_tag_types_resolve()` caller, verified by running
+   the full suite after the refactor, not just the new tests — and added
+   `_validate_data_type_resolves(data_type, data_types_map)` on top of it, which walks a `DataType`'s
+   own `.members` instead of a tag's `data_type`. `export_datatype()` (`acd/api.py`) gained a
+   `validate: bool = False` parameter (default `False` at THIS layer, matching `export_routine()`'s
+   own base default — the flip to `True` only happens at the `db_*`/`ProjectDB` layer above it) that
+   calls the new function before rendering.
+
+Covered by new tests in `test/test_project_db.py`: delete methods (removal confirmed, missing-name
+`KeyError`, program-scope isolation for `delete_tag`) and `validate=True`-by-default on
+`db_export_datatype()` (a deliberately-bad member type raises by default, `validate=False` explicitly
+opts back out and succeeds). Full suite re-run after the `rendering.py`/`api.py` refactor with zero
+regressions, confirming `_validate_tag_types_resolve()`'s own existing behavior/tests are unaffected
+by extracting its shared walker.
 
 ## Testing gotchas
 

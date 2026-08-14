@@ -2840,6 +2840,58 @@ literal, empty text is a no-op) plus integration tests at each of the four call 
 including `test_replace_rung_safe_mismatch_takes_priority_over_syntax_error` locking in the
 ordering guarantee).
 
+### RLL edit primitives silently accepted being called on an ST routine — added a type guard, plus real ST-line editing primitives
+
+A downstream agent hit a real, worse-than-a-missing-feature bug: `insert_rung`/`delete_rung`/
+`replace_rung_safe` are RLL-only in both intent and implementation (they read/write `.rungs`/
+`proj_rungs`), but calling any of them against an ST routine didn't error — it silently wrote into
+a `rungs`-shaped slot the routine's own export never reads, while `._st_lines`/`proj_st_lines`
+(what `export_routine()` actually renders as `<STContent>`, and what a real Studio import would
+apply) stayed completely untouched. No exception, transaction commits clean, `get_routine()`
+afterward shows BOTH: the new content sitting in `"rungs"`, the original unchanged content still in
+`"st_lines"`, on a routine whose own `"type"` field plainly says `"ST"`. The agent only caught this
+because it happened to diff `st_lines` before/after on a scratch copy before ever exporting for
+real — without that check, it would have handed over an L5X that looked fine but contained none of
+the intended changes. Two asks, both done:
+
+**Minimum fix — a clear guard, not silent acceptance.** `Routine.insert_rung()`/`delete_rung()`
+(`elements/model.py`), `replace_rung_safe()` (`acd/api.py`), and `ProjectDB.insert_rung()`/
+`delete_rung()`/`replace_rung_safe()` (`project_db.py`, and therefore their `db_*` wrappers) all now
+raise `ValueError` up front — naming the routine, its actual type, and which function to use
+instead — if the routine's own type isn't `"RLL"`. `ProjectDB` needed a new `_routine_type(routine_id)`
+helper (`SELECT type FROM proj_routines WHERE id=?`) since these SQL-backed methods previously had
+no reason to look up a routine's type at all.
+
+**Real fix — proper ST-line editing primitives, mirroring the RLL surface shape exactly**, per the
+agent's own priority order: `Routine.insert_st_line()`/`delete_st_line()` (model.py),
+`replace_st_line_safe()` (`acd/api.py`), and `ProjectDB.insert_st_line()`/`delete_st_line()`/
+`replace_st_line_safe()` → `db_insert_st_line()`/`db_delete_st_line()`/`db_replace_st_line_safe()`
+(`project_db.py`). Same negative-intermediate-value shift technique as the rung versions for the SQL
+layer (`proj_st_lines` already had a `UNIQUE(routine_id, line_index)` index with the identical
+mid-`UPDATE` collision risk — see "Persistent project DB" above). Each of these is ALSO guarded the
+other direction (raises if called on a routine whose type isn't `"ST"`), so a caller gets a clear
+error regardless of which primitive/routine-type mismatch they hit. No RLL syntax check applies to
+ST lines — `_validate_rll_rung_syntax()` is meaningless for ST source and ST syntax validation
+doesn't exist yet (documented as a real, not accidental, scope limit in both the code and the
+`acd/__init__.py` module docstring).
+
+`acd/__init__.py`'s module docstring now marks `db_insert_rung`/`db_delete_rung`/
+`db_replace_rung_safe` "RLL ONLY" explicitly and documents the new `db_insert_st_line`/
+`db_delete_st_line`/`db_replace_st_line_safe` trio right next to them, including the real failure
+this fixes (quoted plainly: "That looked like a successful, committed edit with nothing marking it
+as wrong").
+
+Needed a second test fixture: `CuteLogix.ACD` (the fixture `test_project_db.py`'s existing
+`acd_copy` uses) has zero ST routines (confirmed directly — every routine in it is RLL), so a new
+`st_acd_copy` fixture copies `ACDTestsNonRedundant.ACD` (already used elsewhere for ST content
+tests, see "Structured Text (ST) routine content" above) instead. Covered by type-guard tests at
+every one of the six call sites (three RLL functions called on an ST routine, three ST functions
+called on an RLL routine) plus normal insert/delete/replace-safe behavior tests for the new ST
+primitives, in both `test/test_api.py` and `test/test_project_db.py` — including
+`test_insert_rung_raises_on_st_routine`, which explicitly re-reads `st_lines`/`rungs` afterward to
+confirm the guard didn't just raise but also left BOTH untouched, not only stopped short of the
+original silent-corruption case.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

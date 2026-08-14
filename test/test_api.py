@@ -26,6 +26,7 @@ from acd.api import (
     diff_routine,
     load_acd,
     replace_rung_safe,
+    replace_st_line_safe,
     tag_exists,
     _sync_data_types_map,
 )
@@ -789,6 +790,89 @@ def test_get_tag_value_missing_tag_raises_keyerror():
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
     with pytest.raises(KeyError):
         get_tag_value(project, "NoSuchTag")
+
+
+def _st_routine():
+    project = load_acd(os.path.join("..", "resources", "ACDTestsNonRedundant.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "MainProgram")
+    return project, next(r for r in program.routines if r.type == "ST")
+
+
+def test_routine_insert_rung_raises_on_st_routine():
+    _, st_routine = _st_routine()
+    st_lines_before = list(st_routine._st_lines)
+
+    with pytest.raises(ValueError, match="only applies to an RLL routine"):
+        st_routine.insert_rung(0, "NOP();")
+
+    assert st_routine.rungs == []
+    assert st_routine._st_lines == st_lines_before
+
+
+def test_routine_delete_rung_raises_on_st_routine():
+    _, st_routine = _st_routine()
+    with pytest.raises(ValueError, match="only applies to an RLL routine"):
+        st_routine.delete_rung(0)
+
+
+def test_replace_rung_safe_raises_on_st_routine():
+    _, st_routine = _st_routine()
+    with pytest.raises(ValueError, match="only applies to an RLL routine"):
+        replace_rung_safe(st_routine, 0, "whatever", "NOP();")
+
+
+def test_routine_insert_st_line_shifts_later_lines():
+    _, st_routine = _st_routine()
+    original_lines = list(st_routine._st_lines)
+
+    st_routine.insert_st_line(0, "NEW_LINE := 1;")
+
+    assert st_routine._st_lines[0] == "NEW_LINE := 1;"
+    assert st_routine._st_lines[1:] == original_lines
+    assert len(st_routine._st_lines) == len(original_lines) + 1
+
+    st_routine.delete_st_line(0)
+    assert st_routine._st_lines == original_lines
+
+
+def test_routine_insert_st_line_raises_on_rll_routine():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    with pytest.raises(ValueError, match="only applies to an ST routine"):
+        routine.insert_st_line(0, "NEW_LINE := 1;")
+
+
+def test_routine_delete_st_line_raises_on_rll_routine():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    with pytest.raises(ValueError, match="only applies to an ST routine"):
+        routine.delete_st_line(0)
+
+
+def test_replace_st_line_safe_matching_text():
+    _, st_routine = _st_routine()
+    old_text = st_routine._st_lines[0]
+
+    replace_st_line_safe(st_routine, 0, old_text, "NEW_LINE := 2;")
+
+    assert st_routine._st_lines[0] == "NEW_LINE := 2;"
+
+
+def test_replace_st_line_safe_mismatch_raises_and_does_not_mutate():
+    _, st_routine = _st_routine()
+    original = st_routine._st_lines[0]
+
+    with pytest.raises(ValueError, match="doesn't match the expected text"):
+        replace_st_line_safe(st_routine, 0, "definitely not the real text", "NEW_LINE := 2;")
+
+    assert st_routine._st_lines[0] == original
+
+
+def test_replace_st_line_safe_raises_on_rll_routine():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    routine = get_routine(project, "R033_ASCII_Conv")
+    with pytest.raises(ValueError, match="only applies to an ST routine"):
+        replace_st_line_safe(routine, 0, "whatever", "NEW_LINE := 1;")
 
 
 def test_routine_insert_and_delete_rung_shift_comments_atomically():

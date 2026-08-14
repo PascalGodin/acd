@@ -20,6 +20,7 @@ from acd import (
     db_get_routine,
     db_get_tag_value,
     db_insert_rung,
+    db_insert_st_line,
     db_io_addresses_by_routine,
     db_list_routines,
     db_new_member,
@@ -43,6 +44,18 @@ def acd_copy(tmp_path):
     """
     dst = tmp_path / "CuteLogix.ACD"
     shutil.copy(os.path.join("..", "resources", "CuteLogix.ACD"), dst)
+    return dst
+
+
+@pytest.fixture
+def st_acd_copy(tmp_path):
+    """A private copy of a fixture ACD that actually has an ST routine --
+    CuteLogix.ACD (used by acd_copy above) has none, so ST-specific edit
+    primitives (insert_st_line/delete_st_line/replace_st_line_safe) and the
+    RLL-vs-ST type-guard tests need this instead.
+    """
+    dst = tmp_path / "ACDTestsNonRedundant.ACD"
+    shutil.copy(os.path.join("..", "resources", "ACDTestsNonRedundant.ACD"), dst)
     return dst
 
 
@@ -353,6 +366,12 @@ def _first_routine_via_path(acd_path):
         db.close()
 
 
+def _first_st_routine(db):
+    listed = db.list_routines()
+    st = next(r for r in listed if r["type"] == "ST" and r["line_count"] > 0)
+    return st["program"], st["routine"]
+
+
 def test_insert_rung_shifts_later_rungs(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:
@@ -468,6 +487,158 @@ def test_replace_rung_safe_mismatch_takes_priority_over_syntax_error(acd_copy):
                                   "[MOVE(A,B) FOR(C,D,E) ];", program_name=program_name)
     finally:
         db.close()
+
+
+def test_insert_rung_raises_on_st_routine(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_st_routine(db)
+        st_lines_before = db.get_routine(routine_name, program_name)["st_lines"]
+
+        with pytest.raises(ValueError, match="only applies to an RLL routine"):
+            db.insert_rung(routine_name, 0, "NOP();", program_name=program_name)
+
+        # The real bug this guards against: the call used to silently
+        # write into "rungs" (never read by export_routine() for an ST
+        # routine) while "st_lines" -- the routine's real content -- was
+        # left untouched, looking like a successful, committed edit.
+        routine = db.get_routine(routine_name, program_name)
+        assert routine["rungs"] == []
+        assert routine["st_lines"] == st_lines_before
+    finally:
+        db.close()
+
+
+def test_delete_rung_raises_on_st_routine(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_st_routine(db)
+        with pytest.raises(ValueError, match="only applies to an RLL routine"):
+            db.delete_rung(routine_name, 0, program_name=program_name)
+    finally:
+        db.close()
+
+
+def test_replace_rung_safe_raises_on_st_routine(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_st_routine(db)
+        with pytest.raises(ValueError, match="only applies to an RLL routine"):
+            db.replace_rung_safe(routine_name, 0, "whatever", "NOP();",
+                                  program_name=program_name)
+    finally:
+        db.close()
+
+
+def test_insert_st_line_shifts_later_lines(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_st_routine(db)
+        lines_before = db.get_routine(routine_name, program_name)["st_lines"]
+        original_first = lines_before[0]
+
+        db.insert_st_line(routine_name, 0, "NEW_LINE := 1;", program_name=program_name)
+
+        lines_after = db.get_routine(routine_name, program_name)["st_lines"]
+        assert lines_after[0] == "NEW_LINE := 1;"
+        assert lines_after[1] == original_first
+        assert len(lines_after) == len(lines_before) + 1
+    finally:
+        db.close()
+
+
+def test_delete_st_line_shifts_later_lines_down(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_st_routine(db)
+        lines_before = db.get_routine(routine_name, program_name)["st_lines"]
+        assert len(lines_before) >= 2
+        second_line = lines_before[1]
+
+        db.delete_st_line(routine_name, 0, program_name=program_name)
+
+        lines_after = db.get_routine(routine_name, program_name)["st_lines"]
+        assert lines_after[0] == second_line
+        assert len(lines_after) == len(lines_before) - 1
+    finally:
+        db.close()
+
+
+def test_replace_st_line_safe_applies_matching_edit(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_st_routine(db)
+        original_text = db.get_routine(routine_name, program_name)["st_lines"][0]
+
+        db.replace_st_line_safe(routine_name, 0, original_text, "NEW_LINE := 2;",
+                                 program_name=program_name)
+
+        assert db.get_routine(routine_name, program_name)["st_lines"][0] == "NEW_LINE := 2;"
+    finally:
+        db.close()
+
+
+def test_replace_st_line_safe_raises_on_mismatch(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_st_routine(db)
+        with pytest.raises(ValueError, match="changed since last read"):
+            db.replace_st_line_safe(routine_name, 0, "not the real text",
+                                     "NEW_LINE := 2;", program_name=program_name)
+    finally:
+        db.close()
+
+
+def test_insert_st_line_raises_on_rll_routine(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        with pytest.raises(ValueError, match="only applies to an ST routine"):
+            db.insert_st_line(routine_name, 0, "NEW_LINE := 1;", program_name=program_name)
+    finally:
+        db.close()
+
+
+def test_delete_st_line_raises_on_rll_routine(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        with pytest.raises(ValueError, match="only applies to an ST routine"):
+            db.delete_st_line(routine_name, 0, program_name=program_name)
+    finally:
+        db.close()
+
+
+def test_replace_st_line_safe_raises_on_rll_routine(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        with pytest.raises(ValueError, match="only applies to an ST routine"):
+            db.replace_st_line_safe(routine_name, 0, "whatever", "NEW_LINE := 1;",
+                                     program_name=program_name)
+    finally:
+        db.close()
+
+
+def test_db_insert_st_line_stateless_wrapper(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    program_name, routine_name = _first_st_routine(db)
+    db.close()
+
+    db_insert_st_line(str(st_acd_copy), routine_name, 0, "NEW_LINE := 1;",
+                       program_name=program_name)
+
+    routine = db_get_routine(str(st_acd_copy), routine_name, program_name=program_name)
+    assert routine["st_lines"][0] == "NEW_LINE := 1;"
+
+
+def test_db_insert_rung_raises_on_st_routine(st_acd_copy):
+    db = open_project_db(str(st_acd_copy), verbose=False)
+    program_name, routine_name = _first_st_routine(db)
+    db.close()
+
+    with pytest.raises(ValueError, match="only applies to an RLL routine"):
+        db_insert_rung(str(st_acd_copy), routine_name, 0, "NOP();", program_name=program_name)
 
 
 def test_set_rung_comment_changes_comment_without_touching_text(acd_copy):

@@ -536,7 +536,17 @@ def replace_rung_safe(routine: Routine, index: int, expected_old: str, new_text:
     caught later by a real Studio 5000 import. Runs AFTER the
     expected-text match check, so a mismatch is always reported as a
     mismatch, never masked by a syntax error in `new_text`.
+
+    Raises `ValueError` if `routine.type != "RLL"` -- an ST routine's real
+    source lives in `._st_lines` (see `replace_st_line_safe()`), not
+    `.rungs`; use that instead.
     """
+    if routine.type != "RLL":
+        raise ValueError(
+            f"replace_rung_safe() only applies to an RLL routine (routine "
+            f"{routine.name!r} has type {routine.type!r}) -- an ST routine's source "
+            f"lives in ._st_lines, not .rungs; use replace_st_line_safe() instead."
+        )
     actual = routine.rungs[index]
     if actual != expected_old:
         raise ValueError(
@@ -545,9 +555,38 @@ def replace_rung_safe(routine: Routine, index: int, expected_old: str, new_text:
             f"  expected: {expected_old!r}\n"
             f"  actual:   {actual!r}"
         )
-    if routine.type == "RLL":
-        _validate_rll_rung_syntax(new_text)
+    _validate_rll_rung_syntax(new_text)
     routine.rungs[index] = new_text
+
+
+def replace_st_line_safe(routine: Routine, index: int, expected_old: str, new_text: str) -> None:
+    """Replace `routine._st_lines[index]`, but only if its current text
+    still exactly matches `expected_old` -- the ST counterpart to
+    `replace_rung_safe()`, same optimistic-concurrency rationale.
+
+    Raises ValueError, with both the expected and actual text shown, if
+    they don't match. Does not touch `routine._st_lines` at all in that
+    case.
+
+    Raises `ValueError` if `routine.type != "ST"` -- an RLL routine's real
+    source lives in `.rungs`, not `._st_lines`; use `replace_rung_safe()`
+    instead.
+    """
+    if routine.type != "ST":
+        raise ValueError(
+            f"replace_st_line_safe() only applies to an ST routine (routine "
+            f"{routine.name!r} has type {routine.type!r}) -- an RLL routine's source "
+            f"lives in .rungs, not ._st_lines; use replace_rung_safe() instead."
+        )
+    actual = routine._st_lines[index]
+    if actual != expected_old:
+        raise ValueError(
+            f"Line {index} of routine {routine.name!r} doesn't match the expected text -- "
+            "it may have changed since you last read it.\n"
+            f"  expected: {expected_old!r}\n"
+            f"  actual:   {actual!r}"
+        )
+    routine._st_lines[index] = new_text
 
 
 def diff_lines(old: List[str], new: List[str]) -> List[dict]:

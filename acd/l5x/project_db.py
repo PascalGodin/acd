@@ -805,15 +805,33 @@ class ProjectDB:
         is perfectly valid; negative values can never collide with a real
         (always >= 0) rung_index, so the intermediate state is always safe.
 
-        For an RLL routine, `text` is checked with `_validate_rll_rung_syntax()`
-        (unbalanced brackets, a one-member `"[...]"` branch group) before
-        being inserted -- raises `ValueError` instead of silently accepting
-        rung text that would only be caught later by a real Studio 5000
-        import (see its own docstring for the real failure this catches).
+        `text` is checked with `_validate_rll_rung_syntax()` (unbalanced
+        brackets, a one-member `"[...]"` branch group) before being
+        inserted -- raises `ValueError` instead of silently accepting rung
+        text that would only be caught later by a real Studio 5000 import
+        (see its own docstring for the real failure this catches).
+
+        Raises `ValueError` if the routine's own type isn't `"RLL"` -- an
+        ST routine's real source lives in `proj_st_lines` (see
+        `insert_st_line()`), not `proj_rungs`; a prior version of this
+        method silently accepted the call anyway, writing into a slot
+        `export_routine()` never reads for an ST routine (found via a real
+        report: no exception, transaction commits clean, `get_routine()`
+        afterward shows the new text sitting in `"rungs"` while the
+        routine's real `"st_lines"` -- what actually gets exported/
+        imported -- stayed untouched, looking exactly like a successful
+        edit that silently never took effect).
         """
         routine_id = self._routine_id(routine_name, program_name)
-        if self._routine_type(routine_id) == "RLL":
-            _validate_rll_rung_syntax(text)
+        routine_type = self._routine_type(routine_id)
+        if routine_type != "RLL":
+            raise ValueError(
+                f"insert_rung() only applies to an RLL routine (routine "
+                f"{routine_name!r} has type {routine_type!r}) -- an ST routine's "
+                f"source lives in proj_st_lines, not proj_rungs; use "
+                f"insert_st_line() instead."
+            )
+        _validate_rll_rung_syntax(text)
         cur = self._conn.cursor()
         cur.execute(
             "UPDATE proj_rungs SET rung_index = -(rung_index + 1) "
@@ -838,8 +856,20 @@ class ProjectDB:
                      program_name: Union[str, None] = None) -> None:
         """SQL equivalent of `Routine.delete_rung()` -- same negative-
         intermediate shift technique as `insert_rung()`, for the same
-        reason (shifting down can just as easily collide mid-UPDATE)."""
+        reason (shifting down can just as easily collide mid-UPDATE).
+
+        Raises `ValueError` if the routine's own type isn't `"RLL"` -- see
+        `insert_rung()`'s docstring for why this guard exists.
+        """
         routine_id = self._routine_id(routine_name, program_name)
+        routine_type = self._routine_type(routine_id)
+        if routine_type != "RLL":
+            raise ValueError(
+                f"delete_rung() only applies to an RLL routine (routine "
+                f"{routine_name!r} has type {routine_type!r}) -- an ST routine's "
+                f"source lives in proj_st_lines, not proj_rungs; use "
+                f"delete_st_line() instead."
+            )
         cur = self._conn.cursor()
         cur.execute("DELETE FROM proj_rungs WHERE routine_id=? AND rung_index=?", (routine_id, index))
         cur.execute(
@@ -870,8 +900,20 @@ class ProjectDB:
         own docstring for the real failure this catches: this guard only
         protects against editing the WRONG rung, not against writing
         syntactically-malformed rung text.
+
+        Raises `ValueError` if the routine's own type isn't `"RLL"` -- see
+        `insert_rung()`'s docstring for why this guard exists; use
+        `replace_st_line_safe()` instead for an ST routine.
         """
         routine_id = self._routine_id(routine_name, program_name)
+        routine_type = self._routine_type(routine_id)
+        if routine_type != "RLL":
+            raise ValueError(
+                f"replace_rung_safe() only applies to an RLL routine (routine "
+                f"{routine_name!r} has type {routine_type!r}) -- an ST routine's "
+                f"source lives in proj_st_lines, not proj_rungs; use "
+                f"replace_st_line_safe() instead."
+            )
         cur = self._conn.cursor()
         row = cur.execute(
             "SELECT text FROM proj_rungs WHERE routine_id=? AND rung_index=?", (routine_id, index)
@@ -883,8 +925,7 @@ class ProjectDB:
                 f"Rung {index} has changed since last read.\n"
                 f"Expected: {expected_old!r}\nActual:   {row[0]!r}"
             )
-        if self._routine_type(routine_id) == "RLL":
-            _validate_rll_rung_syntax(new_text)
+        _validate_rll_rung_syntax(new_text)
         cur.execute("UPDATE proj_rungs SET text=? WHERE routine_id=? AND rung_index=?",
                     (new_text, routine_id, index))
         cur.execute("UPDATE proj_meta SET dirty=1")
@@ -909,6 +950,119 @@ class ProjectDB:
             raise KeyError(f"No rung at index {index} in this routine")
         cur.execute("UPDATE proj_rungs SET comment=? WHERE routine_id=? AND rung_index=?",
                     (comment, routine_id, index))
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def insert_st_line(self, routine_name: str, index: int, text: str,
+                        program_name: Union[str, None] = None) -> None:
+        """The ST counterpart to `insert_rung()` -- shifts every line at or
+        after `index` down by one, via the same negative-intermediate-value
+        technique (`(routine_id, line_index)` has the same `UNIQUE`-
+        collision-during-shift risk as rungs' `(routine_id, rung_index)`).
+        No syntax check is applied (unlike `insert_rung()`'s
+        `_validate_rll_rung_syntax()`) -- ST syntax validation doesn't
+        exist yet.
+
+        Raises `ValueError` if the routine's own type isn't `"ST"` -- an
+        RLL routine's real source lives in `proj_rungs` (see
+        `insert_rung()`), not `proj_st_lines`.
+        """
+        routine_id = self._routine_id(routine_name, program_name)
+        routine_type = self._routine_type(routine_id)
+        if routine_type != "ST":
+            raise ValueError(
+                f"insert_st_line() only applies to an ST routine (routine "
+                f"{routine_name!r} has type {routine_type!r}) -- an RLL routine's "
+                f"source lives in proj_rungs, not proj_st_lines; use "
+                f"insert_rung() instead."
+            )
+        cur = self._conn.cursor()
+        cur.execute(
+            "UPDATE proj_st_lines SET line_index = -(line_index + 1) "
+            "WHERE routine_id=? AND line_index >= ?",
+            (routine_id, index),
+        )
+        cur.execute(
+            "UPDATE proj_st_lines SET line_index = -line_index "
+            "WHERE routine_id=? AND line_index < 0",
+            (routine_id,),
+        )
+        cur.execute(
+            "INSERT INTO proj_st_lines (routine_id, line_index, text) VALUES (?, ?, ?)",
+            (routine_id, index, text),
+        )
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def delete_st_line(self, routine_name: str, index: int,
+                        program_name: Union[str, None] = None) -> None:
+        """The ST counterpart to `delete_rung()` -- same negative-
+        intermediate shift technique as `insert_st_line()`.
+
+        Raises `ValueError` if the routine's own type isn't `"ST"` -- see
+        `insert_st_line()`'s docstring for why this guard exists.
+        """
+        routine_id = self._routine_id(routine_name, program_name)
+        routine_type = self._routine_type(routine_id)
+        if routine_type != "ST":
+            raise ValueError(
+                f"delete_st_line() only applies to an ST routine (routine "
+                f"{routine_name!r} has type {routine_type!r}) -- an RLL routine's "
+                f"source lives in proj_rungs, not proj_st_lines; use "
+                f"delete_rung() instead."
+            )
+        cur = self._conn.cursor()
+        cur.execute("DELETE FROM proj_st_lines WHERE routine_id=? AND line_index=?",
+                    (routine_id, index))
+        cur.execute(
+            "UPDATE proj_st_lines SET line_index = -(line_index - 1) "
+            "WHERE routine_id=? AND line_index > ?",
+            (routine_id, index),
+        )
+        cur.execute(
+            "UPDATE proj_st_lines SET line_index = -line_index "
+            "WHERE routine_id=? AND line_index < 0",
+            (routine_id,),
+        )
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def replace_st_line_safe(self, routine_name: str, index: int, expected_old: str,
+                              new_text: str, program_name: Union[str, None] = None) -> None:
+        """SQL equivalent of `replace_st_line_safe()` -- the ST counterpart
+        to `replace_rung_safe()`, same optimistic-concurrency guard: raises
+        `ValueError` (showing expected vs. actual) if the line at `index`
+        no longer matches `expected_old`.
+
+        Raises `ValueError` if the routine's own type isn't `"ST"` -- use
+        `replace_rung_safe()` instead for an RLL routine.
+        """
+        routine_id = self._routine_id(routine_name, program_name)
+        routine_type = self._routine_type(routine_id)
+        if routine_type != "ST":
+            raise ValueError(
+                f"replace_st_line_safe() only applies to an ST routine (routine "
+                f"{routine_name!r} has type {routine_type!r}) -- an RLL routine's "
+                f"source lives in proj_rungs, not proj_st_lines; use "
+                f"replace_rung_safe() instead."
+            )
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT text FROM proj_st_lines WHERE routine_id=? AND line_index=?",
+            (routine_id, index),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No line at index {index} in this routine")
+        if row[0] != expected_old:
+            raise ValueError(
+                f"Line {index} has changed since last read.\n"
+                f"Expected: {expected_old!r}\nActual:   {row[0]!r}"
+            )
+        cur.execute("UPDATE proj_st_lines SET text=? WHERE routine_id=? AND line_index=?",
+                    (new_text, routine_id, index))
         cur.execute("UPDATE proj_meta SET dirty=1")
         if not self._in_transaction:
             self._conn.commit()
@@ -1324,6 +1478,33 @@ def db_set_rung_comment(acd_path, routine_name: str, index: int,
     """Stateless equivalent of `ProjectDB.set_rung_comment()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.set_rung_comment(
         routine_name, index, comment, program_name=program_name,
+    ))
+
+
+def db_insert_st_line(acd_path, routine_name: str, index: int, text: str,
+                       program_name: Union[str, None] = None,
+                       project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.insert_st_line()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.insert_st_line(
+        routine_name, index, text, program_name=program_name,
+    ))
+
+
+def db_delete_st_line(acd_path, routine_name: str, index: int,
+                       program_name: Union[str, None] = None,
+                       project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.delete_st_line()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.delete_st_line(
+        routine_name, index, program_name=program_name,
+    ))
+
+
+def db_replace_st_line_safe(acd_path, routine_name: str, index: int, expected_old: str,
+                             new_text: str, program_name: Union[str, None] = None,
+                             project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.replace_st_line_safe()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.replace_st_line_safe(
+        routine_name, index, expected_old, new_text, program_name=program_name,
     ))
 
 

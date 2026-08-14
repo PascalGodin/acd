@@ -844,9 +844,21 @@ class Routine(L5xElement):
         being inserted -- raises `ValueError` instead of accepting
         obviously-malformed rung text that would only be caught later by a
         real Studio 5000 import.
+
+        Raises `ValueError` if `self.type != "RLL"` -- an ST routine's real
+        source lives in `._st_lines` (see `insert_st_line()`), not `.rungs`;
+        this used to silently accept the call, writing into a slot
+        `export_routine()` never reads for an ST routine, so the "edit"
+        looked successful (no exception) but never actually reached the
+        exported L5X, while the routine's real content stayed untouched.
         """
-        if self.type == "RLL":
-            _validate_rll_rung_syntax(text)
+        if self.type != "RLL":
+            raise ValueError(
+                f"insert_rung() only applies to an RLL routine (routine {self.name!r} "
+                f"has type {self.type!r}) -- an ST routine's source lives in "
+                f"._st_lines, not .rungs; use insert_st_line() instead."
+            )
+        _validate_rll_rung_syntax(text)
         self.rungs.insert(index, text)
         self._rung_ids.insert(index, None)
         self._rung_comments = {
@@ -859,12 +871,53 @@ class Routine(L5xElement):
         """Delete the rung at `index`, dropping its own comment (if any)
         and shifting every later rung's `_rung_comments` entry down by one
         to match -- the same footgun as `insert_rung()`, in reverse.
+
+        Raises `ValueError` if `self.type != "RLL"` -- see `insert_rung()`'s
+        docstring for why this guard exists.
         """
+        if self.type != "RLL":
+            raise ValueError(
+                f"delete_rung() only applies to an RLL routine (routine {self.name!r} "
+                f"has type {self.type!r}) -- an ST routine's source lives in "
+                f"._st_lines, not .rungs; use delete_st_line() instead."
+            )
         del self.rungs[index]
         del self._rung_ids[index]
         self._rung_comments = {
             (i - 1 if i > index else i): c for i, c in self._rung_comments.items() if i != index
         }
+
+    def insert_st_line(self, index: int, text: str) -> None:
+        """Insert a new ST source line at `index`, shifting every existing
+        line at or after that position down by one -- the ST counterpart
+        to `insert_rung()`. Unlike a rung, an ST line has no per-line
+        comment or object-id tracking to keep in sync, so this is a plain
+        list insert, but exists (rather than just `._st_lines.insert(...)`)
+        for symmetry with the RLL surface and its own type guard.
+
+        Raises `ValueError` if `self.type != "ST"`.
+        """
+        if self.type != "ST":
+            raise ValueError(
+                f"insert_st_line() only applies to an ST routine (routine {self.name!r} "
+                f"has type {self.type!r}) -- an RLL routine's source lives in "
+                f".rungs, not ._st_lines; use insert_rung() instead."
+            )
+        self._st_lines.insert(index, text)
+
+    def delete_st_line(self, index: int) -> None:
+        """Delete the ST source line at `index` -- the ST counterpart to
+        `delete_rung()`.
+
+        Raises `ValueError` if `self.type != "ST"`.
+        """
+        if self.type != "ST":
+            raise ValueError(
+                f"delete_st_line() only applies to an ST routine (routine {self.name!r} "
+                f"has type {self.type!r}) -- an RLL routine's source lives in "
+                f".rungs, not ._st_lines; use delete_rung() instead."
+            )
+        del self._st_lines[index]
 
 @dataclass
 class AOI(L5xElement):

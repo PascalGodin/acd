@@ -91,22 +91,42 @@ EDITS -- durable the moment the call returns (see above), each raising
     member to an EXISTING UDT, at `index` (default: appended).
   - `db_insert_rung(acd_path, routine_name, index, text, comment=None,
     program_name=None)` / `db_delete_rung(acd_path, routine_name, index,
-    program_name=None)` -- for an RLL routine, `text` is checked for
-    unbalanced brackets and a one-member `"[...]"` branch group (see
-    `_validate_rll_rung_syntax()`) before being inserted; raises
-    `ValueError` instead of silently accepting rung text a real Studio
-    5000 import would reject.
+    program_name=None)` -- RLL ONLY, raises `ValueError` if the routine's
+    own type isn't `"RLL"` (see `db_insert_st_line`/`db_delete_st_line`
+    below for ST). `text` is also checked for unbalanced brackets and a
+    one-member `"[...]"` branch group (see `_validate_rll_rung_syntax()`)
+    before being inserted; raises `ValueError` instead of silently
+    accepting rung text a real Studio 5000 import would reject.
   - `db_replace_rung_safe(acd_path, routine_name, index, expected_old,
-    new_text, program_name=None)` -- edit an EXISTING rung's text, but
-    only if it still matches `expected_old` (raises with a readable diff
-    otherwise) -- guards against clobbering a rung someone hand-edited in
-    Studio since your last read. This guard is about editing the WRONG
-    rung, not rung grammar -- `new_text` gets the same RLL syntax check
-    as `db_insert_rung()` above, run separately, after the match check.
+    new_text, program_name=None)` -- RLL ONLY (same type guard as above;
+    use `db_replace_st_line_safe` for ST). Edit an EXISTING rung's text,
+    but only if it still matches `expected_old` (raises with a readable
+    diff otherwise) -- guards against clobbering a rung someone
+    hand-edited in Studio since your last read. This guard is about
+    editing the WRONG rung, not rung grammar -- `new_text` gets the same
+    RLL syntax check as `db_insert_rung()` above, run separately, after
+    the match check.
   - `db_set_rung_comment(acd_path, routine_name, index, comment,
     program_name=None)` -- set or clear (`comment=None`) a rung's comment
     WITHOUT touching its text; use this instead of delete_rung+insert_rung
     just to rename a comment.
+  - `db_insert_st_line(acd_path, routine_name, index, text,
+    program_name=None)` / `db_delete_st_line(acd_path, routine_name,
+    index, program_name=None)` / `db_replace_st_line_safe(acd_path,
+    routine_name, index, expected_old, new_text, program_name=None)` --
+    ST ONLY (raises `ValueError` if the routine's own type isn't `"ST"`),
+    same shapes as the RLL `*_rung*` functions above but for an ST
+    routine's `"st_lines"`. Added because the RLL functions above used to
+    accept being called on an ST routine with NO error -- silently writing
+    into `"rungs"` (which `export_routine()` never reads for an ST
+    routine) while the routine's real `"st_lines"` (what actually gets
+    exported/imported) stayed untouched. That looked like a successful,
+    committed edit with nothing marking it as wrong -- caught only because
+    a downstream agent happened to diff `"st_lines"` before/after on a
+    scratch copy before ever exporting for real. `db_insert_st_line`/etc.
+    give ST routines their own real editing primitives instead of a
+    silently-wrong RLL one; NO RLL syntax check applies to ST lines (ST
+    syntax validation doesn't exist yet).
   - `db_delete_tag(acd_path, name, program_name=None)` /
     `db_delete_routine(acd_path, routine_name, program_name=None)` /
     `db_delete_member(acd_path, data_type_name, member_name)` -- remove
@@ -222,6 +242,9 @@ from acd.l5x.project_db import (  # noqa: F401
     db_delete_rung,
     db_replace_rung_safe,
     db_set_rung_comment,
+    db_insert_st_line,
+    db_delete_st_line,
+    db_replace_st_line_safe,
     db_delete_tag,
     db_delete_routine,
     db_delete_member,

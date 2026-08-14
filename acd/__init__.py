@@ -89,6 +89,11 @@ EDITS -- durable the moment the call returns (see above), each raising
   - `db_new_member(acd_path, data_type_name, name, member_data_type,
     dimension=0, radix=None, description=None, index=None)` -- add a
     member to an EXISTING UDT, at `index` (default: appended).
+    `member_data_type="BIT"` allocates a real bit position the way Studio
+    5000 itself does (reusing a free bit in an existing hidden backing
+    member, or creating a new one) -- previously committed with no error
+    but with no `target`/`bit_number` at all, only failing a real Studio
+    "Import Data Type..." on `Target` several steps later.
   - `db_insert_rung(acd_path, routine_name, index, text, comment=None,
     program_name=None)` / `db_delete_rung(acd_path, routine_name, index,
     program_name=None)` -- RLL ONLY, raises `ValueError` if the routine's

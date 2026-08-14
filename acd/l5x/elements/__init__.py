@@ -62,6 +62,7 @@ from .decode import (
 from .model import (
     Member,
     new_member,
+    new_bit_member,
     new_tag,
     DataType,
     Tag,

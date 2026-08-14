@@ -81,11 +81,7 @@ def new_member(name: str, data_type: str, dimension: int = 0,
     (`_PRIMITIVE_RADIX` -- "Decimal" for integer types, "Float" for
     REAL/LREAL) if not given, or "NullType" for a struct-typed member
     (a UDT/AOI name, matching how a real Studio 5000 UDT member typed as
-    another struct is declared). `target`/`bit_number` are always `None` --
-    this only builds a plain member; a BIT-overlay pseudo-member needs a
-    hidden backing field and `_resolve_bit_target`, which only applies to
-    members actually read back from a real ACD record, not one authored
-    fresh in Python.
+    another struct is declared).
 
     `dimension` must be an `int` (0 for a scalar member, matching every
     ACD-decoded Member) -- unlike `radix`/`description`, `None` is NOT a
@@ -100,7 +96,26 @@ def new_member(name: str, data_type: str, dimension: int = 0,
     detail, never emitted in XML (Studio 5000 recomputes a UDT's real
     physical member layout itself on import), so a newly-authored member
     needs no offset of its own.
+
+    Raises `ValueError` for `data_type.upper() == "BIT"` -- a BIT-overlay
+    pseudo-member needs a real `target`/`bit_number` allocated against an
+    existing UDT's own members (a hidden backing field, reused or newly
+    created), which this function has no way to do since it isn't handed
+    the owning `DataType` at all. It used to silently return a member with
+    `target=None`/`bit_number=None` instead -- no exception, no warning --
+    which committed/exported fine and only surfaced as a real Studio 5000
+    "Import Data Type..." failure on `Target` three steps later (found via
+    a real downstream report). Use `new_bit_member(data_type, name, ...)`
+    instead, which allocates a real bit position the way Studio itself
+    does.
     """
+    if data_type.upper() == "BIT":
+        raise ValueError(
+            "new_member(): can't create a BIT-type member this way -- a BIT-overlay "
+            "pseudo-member needs a real bit position allocated against the owning "
+            "DataType's own members (a hidden backing field, reused or newly created). "
+            "Use new_bit_member(data_type, name, description=None) instead."
+        )
     if dimension is None:
         raise ValueError(
             "new_member(): dimension must be an int (0 for a scalar member), not None -- "
@@ -110,6 +125,99 @@ def new_member(name: str, data_type: str, dimension: int = 0,
         radix = _PRIMITIVE_RADIX.get(data_type.upper(), "NullType")
     return Member(
         name, name, data_type, dimension, radix, False, None, None,
+        "Read/Write", _description=description,
+    )
+
+
+# Rockwell packs BIT-overlay members 8-per-byte into a hidden SINT "backing"
+# member -- verified against multiple real UDTs (see CLAUDE.md's "BIT-overlay
+# member Target resolution"). Used by new_bit_member() below to both find a
+# free bit in an existing backing member and to size/name a newly-created one.
+_BIT_BACKING_TYPE = "SINT"
+_BIT_BACKING_NAME_PREFIX = "Z" * 10
+_BIT_BACKING_NAME_TRUNCATE = 10
+
+
+def new_bit_member(data_type: "DataType", name: str,
+                    description: Union[str, None] = None) -> Member:
+    """Construct a new BIT-overlay pseudo-member for `data_type`, allocating
+    a real bit position the way Studio 5000 itself does -- the counterpart
+    to `new_member()` for `data_type="BIT"`, which `new_member()` itself now
+    refuses to build (see its own docstring for the real failure this
+    replaces: a silently-broken member with no `target`/`bit_number` at all,
+    committed/exported with no error, only caught by a real Studio 5000
+    import rejecting the file on `Target`).
+
+    Allocation order, mirroring Rockwell's own observed convention:
+    1. Reuse a free bit in an existing HIDDEN member that already backs at
+       least one other real BIT member on `data_type` (i.e. some other
+       member's own `target` already points at it) and still has room --
+       capacity is the backing member's own primitive size in bits (8 for
+       SINT, the standard Rockwell packing for BIT groups; 16/32/64 for
+       INT/DINT/LINT if a project happens to use a wider backing field).
+       An arbitrary hidden member that ISN'T already backing anything is
+       NEVER repurposed -- there's no way to tell from the object model
+       alone whether it's actually free bit storage or something else
+       entirely, so only a member with a verifiable BIT-backing role is
+       ever treated as reusable.
+    2. If no existing backing member has room, APPENDS a brand-new hidden
+       SINT member to `data_type.members` (mutates it directly, the same
+       way you'd otherwise `data_type.members.insert(...)` a `new_member()`
+       result yourself) and targets bit 0 of it. Named
+       `"Z"*10 + data_type.name[:10] + <next unused sequence number>`,
+       mirroring the exact naming convention observed on real UDTs (e.g.
+       `ZZZZZZZZZZLugWrk9`, `ZZZZZZZZZZBin_Sequen1`/`...10` -- see
+       CLAUDE.md) as closely as possible, though this specific
+       CREATE-a-new-backing-member path has not itself been independently
+       verified against a real Studio 5000 import (the REUSE path needs no
+       invented data at all -- it only points at an already-real member).
+       Since Studio recomputes a UDT's actual physical layout/object IDs
+       from the imported XML regardless (`Member._byte_offset` is never
+       emitted, see `new_member()`), the backing member's NAME is the only
+       real judgment call left here -- mirroring Rockwell's own convention
+       is the closest available guess, not a confirmed requirement.
+
+    Raises `ValueError` if `data_type` already has a member (case-
+    insensitive) named `name`.
+    """
+    if any(m.name.lower() == name.lower() for m in data_type.members):
+        raise ValueError(
+            f"new_bit_member(): DataType {data_type.name!r} already has a member "
+            f"named {name!r}"
+        )
+
+    used_by_backing: Dict[str, set] = {}
+    for m in data_type.members:
+        if m.data_type == "BIT" and m.target is not None and m.bit_number is not None:
+            used_by_backing.setdefault(m.target, set()).add(m.bit_number)
+
+    for m in data_type.members:
+        if not m.hidden or m.name not in used_by_backing:
+            continue
+        prim = _PRIM.get(m.data_type.upper())
+        if prim is None:
+            continue
+        capacity_bits = prim[1] * 8
+        used = used_by_backing[m.name]
+        free_bit = next((b for b in range(capacity_bits) if b not in used), None)
+        if free_bit is not None:
+            return Member(
+                name, name, "BIT", 0, "Decimal", False, m.name, free_bit,
+                "Read/Write", _description=description,
+            )
+
+    existing_names = {m.name.lower() for m in data_type.members}
+    base_name = _BIT_BACKING_NAME_PREFIX + data_type.name[:_BIT_BACKING_NAME_TRUNCATE]
+    i = 0
+    while f"{base_name}{i}".lower() in existing_names:
+        i += 1
+    backing_name = f"{base_name}{i}"
+    data_type.members.append(Member(
+        backing_name, backing_name, _BIT_BACKING_TYPE, 0, "Decimal", True, None, None,
+        "Read/Write",
+    ))
+    return Member(
+        name, name, "BIT", 0, "Decimal", False, backing_name, 0,
         "Read/Write", _description=description,
     )
 

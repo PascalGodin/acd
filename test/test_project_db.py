@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -342,6 +343,93 @@ def test_new_member_missing_data_type_raises_key_error(acd_copy):
     try:
         with pytest.raises(KeyError):
             db.new_member("NO_SUCH_UDT", "X", "DINT")
+    finally:
+        db.close()
+
+
+def test_new_member_bit_type_allocates_backing_field(acd_copy):
+    # Regression test for a real reported bug: db_new_member(dt, name, "BIT")
+    # used to commit with no error but with hidden=0/target=NULL/bit_number=NULL
+    # -- persisted that way even if the in-memory Member had a real
+    # target/bit_number, because the SQL INSERT itself hardcoded those
+    # columns. Verify both the allocation AND that it survives a rehydration
+    # (a fresh to_controller() call, not just the in-memory return value).
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        dt_name = project.controller.data_types[0].name
+
+        db.new_member(dt_name, "PDB_BIT_1", "BIT")
+
+        project2 = db.to_controller()
+        dt2 = next(d for d in project2.controller.data_types if d.name == dt_name)
+        bit_member = next(m for m in dt2.members if m.name == "PDB_BIT_1")
+        assert bit_member.data_type == "BIT"
+        assert bit_member.hidden is False
+        assert bit_member.target is not None
+        assert bit_member.bit_number == 0
+        backing = next(m for m in dt2.members if m.name == bit_member.target)
+        assert backing.hidden is True
+        assert backing.data_type == "SINT"
+    finally:
+        db.close()
+
+
+def test_new_member_bit_type_reuses_free_bit_across_separate_calls(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        dt_name = project.controller.data_types[0].name
+
+        db.new_member(dt_name, "PDB_BIT_A", "BIT")
+        db.new_member(dt_name, "PDB_BIT_B", "BIT")
+
+        project2 = db.to_controller()
+        dt2 = next(d for d in project2.controller.data_types if d.name == dt_name)
+        bit_a = next(m for m in dt2.members if m.name == "PDB_BIT_A")
+        bit_b = next(m for m in dt2.members if m.name == "PDB_BIT_B")
+        assert bit_a.target == bit_b.target
+        assert bit_a.bit_number == 0
+        assert bit_b.bit_number == 1
+        assert sum(1 for m in dt2.members if m.hidden) == 1
+    finally:
+        db.close()
+
+
+def test_new_member_bit_type_creates_second_backing_field_once_full(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        dt_name = project.controller.data_types[0].name
+
+        for i in range(9):
+            db.new_member(dt_name, f"PDB_BIT_{i}", "BIT")
+
+        project2 = db.to_controller()
+        dt2 = next(d for d in project2.controller.data_types if d.name == dt_name)
+        assert sum(1 for m in dt2.members if m.hidden) == 2
+        last = next(m for m in dt2.members if m.name == "PDB_BIT_8")
+        first = next(m for m in dt2.members if m.name == "PDB_BIT_0")
+        assert last.target != first.target
+        assert last.bit_number == 0
+    finally:
+        db.close()
+
+
+def test_db_new_member_bit_type_persists_through_export_datatype(acd_copy, tmp_path):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        dt_name = project.controller.data_types[0].name
+        db.new_member(dt_name, "PDB_BIT_EXPORT", "BIT")
+
+        output_path = tmp_path / "exported_datatype.L5X"
+        db.export_datatype(dt_name, str(output_path))
+        content = output_path.read_text(encoding="utf-8")
+        assert 'Name="PDB_BIT_EXPORT"' in content
+        assert 'DataType="BIT"' in content
+        assert re.search(r'Name="PDB_BIT_EXPORT"[^>]*Target="[^"]+"', content)
+        assert re.search(r'Name="PDB_BIT_EXPORT"[^>]*BitNumber="0"', content)
     finally:
         db.close()
 

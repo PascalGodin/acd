@@ -91,6 +91,7 @@ from acd.l5x.elements import (
     Routine,
     Tag,
     _validate_rll_rung_syntax,
+    new_bit_member as _new_bit_member,
     new_member as _new_member,
     new_tag as _new_tag,
 )
@@ -745,6 +746,25 @@ class ProjectDB:
         if not self._in_transaction:
             self._conn.commit()
 
+    def _load_member_view(self, dt_id: int) -> List[Member]:
+        """A lightweight, in-memory `Member` list for `dt_id` (name, data_type,
+        hidden, target, bit_number only -- enough for `new_bit_member()`'s own
+        allocation logic, not a full rehydration). Used by `new_member()`
+        below to let the pure `new_bit_member()` allocator (which only knows
+        how to work against real `DataType`/`Member` objects) see this UDT's
+        already-existing members without going through a full
+        `to_controller()` rehydration for one field lookup.
+        """
+        rows = self._conn.execute(
+            "SELECT name, data_type_name, hidden, target, bit_number "
+            "FROM proj_members WHERE data_type_id=? ORDER BY seq",
+            (dt_id,),
+        ).fetchall()
+        return [
+            Member(n, n, dtn, 0, "Decimal", bool(h), t, bn, "Read/Write")
+            for (n, dtn, h, t, bn) in rows
+        ]
+
     def new_member(self, data_type_name: str, name: str, member_data_type: str,
                     dimension: int = 0, radix: Union[str, None] = None,
                     description: Union[str, None] = None,
@@ -754,9 +774,20 @@ class ProjectDB:
         `dt.members.insert(i, new_member(...))`. Reuses `new_member()` for
         its radix-default/field-shape logic. Raises `KeyError` if
         `data_type_name` doesn't exist.
+
+        For `member_data_type="BIT"`, allocates a real bit position the same
+        way `new_bit_member()` does (see its own docstring) -- reusing a free
+        bit in an existing hidden backing member if one has room, or
+        inserting a brand-new hidden backing member first (appended at the
+        current end of this UDT's member list) if none does. Fixes a real
+        reported bug: this method used to hardcode `hidden=0, target=NULL,
+        bit_number=NULL` in its own INSERT regardless of what kind of member
+        was actually being added -- so even a caller that separately worked
+        around `new_member()`'s old silent BIT/target=None gap got the
+        allocation silently discarded again at THIS layer, with the same
+        symptom (commits cleanly, no exception, only a real Studio 5000
+        import rejects it on `Target`).
         """
-        member = _new_member(name, member_data_type, dimension=dimension,
-                              radix=radix, description=description)
         cur = self._conn.cursor()
         row = cur.execute(
             "SELECT id FROM proj_data_types WHERE name=? COLLATE NOCASE", (data_type_name,)
@@ -764,6 +795,31 @@ class ProjectDB:
         if row is None:
             raise KeyError(f"No DataType named {data_type_name!r}")
         dt_id = row[0]
+
+        if member_data_type.upper() == "BIT":
+            existing_members = self._load_member_view(dt_id)
+            # DataType(..., existing_members) does NOT copy the list -- dt_view.members
+            # IS existing_members, so "len(dt_view.members) > len(existing_members)"
+            # would always be False (comparing a list to itself). Capture the count as
+            # a plain int BEFORE the call instead.
+            count_before = len(existing_members)
+            dt_view = DataType(data_type_name, data_type_name, "", "", existing_members)
+            member = _new_bit_member(dt_view, name, description=description)
+            new_backing = dt_view.members[-1] if len(dt_view.members) > count_before else None
+            if new_backing is not None:
+                backing_seq = cur.execute(
+                    "SELECT COUNT(*) FROM proj_members WHERE data_type_id=?", (dt_id,)
+                ).fetchone()[0]
+                cur.execute(
+                    "INSERT INTO proj_members (data_type_id, seq, name, data_type_name, "
+                    "dimension, radix, hidden, target, bit_number, external_access, description) "
+                    "VALUES (?, ?, ?, ?, 0, 'Decimal', 1, NULL, NULL, 'Read/Write', NULL)",
+                    (dt_id, backing_seq, new_backing.name, new_backing.data_type),
+                )
+        else:
+            member = _new_member(name, member_data_type, dimension=dimension,
+                                  radix=radix, description=description)
+
         count = cur.execute(
             "SELECT COUNT(*) FROM proj_members WHERE data_type_id=?", (dt_id,)
         ).fetchone()[0]
@@ -781,9 +837,10 @@ class ProjectDB:
         cur.execute(
             "INSERT INTO proj_members (data_type_id, seq, name, data_type_name, dimension, "
             "radix, hidden, target, bit_number, external_access, description) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
             (dt_id, insert_at, member.name, member.data_type, member.dimension,
-             member.radix, member.external_access, member._description),
+             member.radix, member.target, member.bit_number,
+             member.external_access, member._description),
         )
         member_id = cur.lastrowid
         cur.execute("UPDATE proj_meta SET dirty=1")

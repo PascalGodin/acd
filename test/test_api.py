@@ -30,7 +30,15 @@ from acd.api import (
     tag_exists,
     _sync_data_types_map,
 )
-from acd.l5x.elements import DataType, Tag, new_member, new_tag, _validate_rll_rung_syntax
+from acd.l5x.elements import (
+    DataType,
+    Member,
+    Tag,
+    new_bit_member,
+    new_member,
+    new_tag,
+    _validate_rll_rung_syntax,
+)
 
 
 def test_import_from_file():
@@ -451,6 +459,80 @@ def test_new_member_rejects_none_dimension():
     # in export rendering. Raise immediately instead, at the actual mistake.
     with pytest.raises(ValueError, match="dimension"):
         new_member("Foo", "DINT", dimension=None)
+
+
+def test_new_member_rejects_bit_type():
+    # Regression test for a real reported bug: new_member(name, "BIT")
+    # used to silently return a member with target=None/bit_number=None --
+    # no exception -- which committed/exported fine and only failed a real
+    # Studio 5000 "Import Data Type..." on Target three steps later. Now
+    # raises immediately and points at new_bit_member() instead.
+    with pytest.raises(ValueError, match="new_bit_member"):
+        new_member("Foo", "BIT")
+
+
+def test_new_bit_member_creates_backing_field_when_none_exists():
+    dt = DataType("MyUdt", "MyUdt", "", "User", [
+        new_member("Field1", "DINT"),
+    ])
+    member = new_bit_member(dt, "Flag1")
+    dt.members.append(member)
+
+    assert member.data_type == "BIT"
+    assert member.hidden is False
+    assert member.target is not None
+    assert member.bit_number == 0
+    backing = next(m for m in dt.members if m.name == member.target)
+    assert backing.hidden is True
+    assert backing.data_type == "SINT"
+
+
+def test_new_bit_member_reuses_free_bit_in_existing_backing_field():
+    dt = DataType("MyUdt", "MyUdt", "", "User", [])
+    first = new_bit_member(dt, "Flag1")
+    dt.members.append(first)
+
+    second = new_bit_member(dt, "Flag2")
+
+    assert second.target == first.target
+    assert second.bit_number == 1
+    # No second backing field created -- still just the one.
+    assert sum(1 for m in dt.members if m.hidden) == 1
+
+
+def test_new_bit_member_creates_new_backing_field_once_full():
+    dt = DataType("MyUdt", "MyUdt", "", "User", [])
+    for i in range(8):
+        m = new_bit_member(dt, f"Flag{i}")
+        dt.members.append(m)
+    first_backing_name = next(m.name for m in dt.members if m.hidden)
+
+    ninth = new_bit_member(dt, "Flag8")
+    dt.members.append(ninth)
+
+    assert ninth.target != first_backing_name
+    assert ninth.bit_number == 0
+    assert sum(1 for m in dt.members if m.hidden) == 2
+
+
+def test_new_bit_member_ignores_hidden_member_not_already_backing_a_bit():
+    # A hidden member that ISN'T already backing any real BIT member must
+    # never be repurposed -- there's no way to tell from the object model
+    # alone whether it's genuinely free bit storage or something else.
+    dt = DataType("MyUdt", "MyUdt", "", "User", [
+        Member("SomeHidden", "SomeHidden", "SINT", 0, "Decimal", True, None, None, "Read/Write"),
+    ])
+    member = new_bit_member(dt, "Flag1")
+
+    assert member.target != "SomeHidden"
+
+
+def test_new_bit_member_rejects_duplicate_name():
+    dt = DataType("MyUdt", "MyUdt", "", "User", [
+        new_member("Existing", "DINT"),
+    ])
+    with pytest.raises(ValueError, match="already has a member"):
+        new_bit_member(dt, "Existing")
 
 
 def test_new_tag_primitive_defaults_radix_by_data_type():

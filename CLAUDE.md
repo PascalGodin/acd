@@ -2892,6 +2892,107 @@ primitives, in both `test/test_api.py` and `test/test_project_db.py` — includi
 confirm the guard didn't just raise but also left BOTH untouched, not only stopped short of the
 original silent-corruption case.
 
+### `new_member(name, "BIT")` silently produced an unimportable member — added real bit allocation
+
+A downstream agent hit a real reported bug, same shape as several others in this file: `db_new_member
+(dt_name, name, "BIT", ...)` committed with no error, but the new member never got a `bit_number` or
+a backing hidden field assigned — `target: None`, `bit_number: None` — while every pre-existing BIT
+member on the same UDT had both (Rockwell packs BIT-overlay members 8-per-byte into a hidden SINT
+backing field, already documented in "BIT-overlay member Target resolution" above). Studio 5000's own
+"Import Data Type..." then failed on `Target`, since the exported XML had nothing valid to point the
+new member at. Nothing signalled this at creation time; it only surfaced three steps later as a real
+Studio import rejection, after the agent compared the new member against its siblings to notice the
+missing allocation. The agent explicitly declined to hand-patch the bit allocation itself ("that's
+exactly the kind of thing that risks getting Rockwell's packing convention subtly wrong") and asked
+for real allocation: reuse a free bit in an existing hidden backing member if one has room, or create
+a new backing member if none does.
+
+**Root cause, two layers deep — the SQL layer would have silently discarded a correct allocation even
+if the Python-level constructor already produced one.** `new_member()` (`elements/model.py`) was
+already documented as deliberately leaving `target`/`bit_number` both `None` for `data_type="BIT"` --
+"a BIT-overlay pseudo-member needs a hidden backing field... which only applies to members actually
+read back from a real ACD record, not one authored fresh in Python." That was true but the DOCUMENTED
+gap was itself the bug: no exception, no warning, a plausible-looking `Member` object that happily
+committed and exported. Separately, and worse, `ProjectDB.new_member()`'s own SQL `INSERT` hardcoded
+`hidden=0, target=NULL, bit_number=NULL` literally in the statement regardless of what the in-memory
+`Member` object actually held — so even a caller that worked around the first gap by hand-constructing
+a correct `Member` would have had the allocation silently thrown away again at THIS layer, with the
+identical symptom (commits cleanly, only a real Studio import catches it).
+
+**Fix, both layers:**
+- `new_member()` now RAISES `ValueError` for `data_type.upper() == "BIT"`, naming the correct
+  replacement — fail fast at the point of the mistake, matching this file's own established
+  convention (e.g. the `dimension=None` guard elsewhere in this same function), rather than silently
+  producing a member that looks fine and isn't.
+- New `new_bit_member(data_type, name, description=None) -> Member` (`elements/model.py`) allocates a
+  real bit position the way Studio itself does: scans `data_type.members` for an existing HIDDEN
+  member that already backs >= 1 other real BIT member (i.e. some other member's own `target` already
+  points at it) with room left (capacity = that member's own primitive size in bits — 8 for the
+  standard SINT backing field, computed generically via `_PRIM` in case a project ever uses a wider
+  one), and reuses the lowest free bit. If none has room, appends a brand-new hidden SINT member to
+  `data_type.members` (mutated directly, same pattern as `new_member()`'s own documented "insert the
+  result yourself" convention) named `"Z"*10 + data_type.name[:10] + <next unused sequence number>` —
+  mirroring the exact naming convention already observed and documented on real UDTs elsewhere in this
+  file (`ZZZZZZZZZZLugWrk9`, `ZZZZZZZZZZBin_Sequen1`/`...10`) as closely as possible. Deliberately
+  never repurposes a hidden member that ISN'T already backing a real BIT member — there's no way to
+  tell from the object model alone whether an arbitrary hidden field is genuinely free bit storage or
+  something else entirely, so only a member with a verifiable BIT-backing role is ever treated as
+  reusable. Also raises `ValueError` on a case-insensitive duplicate member name, which `new_member()`
+  itself still doesn't check (out of scope for this fix — this function has the DataType in scope to
+  check cheaply, `new_member()` never has).
+- `ProjectDB.new_member()` (`project_db.py`) rewritten to actually use this: for `member_data_type=
+  "BIT"`, builds a lightweight in-memory `Member` list from `proj_members` (a new `_load_member_view()`
+  helper — not a full `to_controller()` rehydration, just enough for the allocator to see this UDT's
+  own existing members), wraps it in a throwaway `DataType`, calls `new_bit_member()`, and — if a new
+  backing member was created — inserts that as its own new `proj_members` row (appended at the current
+  end) BEFORE the requested member's own insert-at-`index` logic runs. The final `INSERT` for the
+  requested member itself no longer hardcodes `hidden=0, target=NULL, bit_number=NULL` — it now uses
+  the real `member.target`/`member.bit_number` (still hardcoding `hidden=0`, correctly, since the
+  member being inserted here is never itself the hidden one).
+
+**A real bug found and fixed while verifying this end-to-end, not just via unit tests**: the first
+implementation compared `len(dt_view.members) > len(existing_members)` to detect whether
+`new_bit_member()` had appended a new backing field — but `DataType(..., existing_members)` does NOT
+copy the list; `dt_view.members` and `existing_members` are the SAME object, so that comparison was
+always comparing a list's length to itself (always `False`). This silently meant the newly-created
+backing member's own row was NEVER inserted into `proj_members` at all — confirmed directly: a second
+`db_new_member(..., "BIT")` call on a fresh UDT (no existing BIT members) reused `bit_number=0` again
+instead of `1`, because the backing member the first call claimed to create didn't actually exist in
+the database to be found on reload. Caught by an actual end-to-end sanity script (open a real DB,
+create two BIT members, rehydrate, inspect), not by the unit tests for `new_bit_member()` itself
+(which construct their `DataType`/`Member` objects directly in Python and never touch this SQL
+bridging code at all) — another instance of this file's own repeated lesson that a fix "verified" only
+at the pure-function level isn't verified at the layer a real caller actually uses. Fixed by capturing
+`count_before = len(existing_members)` as a plain int BEFORE calling `new_bit_member()`, then comparing
+against `len(dt_view.members)` (same object, but now compared against a frozen count) afterward.
+
+**Verified end-to-end** (script, not just pytest): `db.new_member()` called once creates a real hidden
+`SINT` backing member (`hidden=True`) plus the BIT member correctly targeting bit 0 of it; a second
+call on the same UDT reuses the same backing field at bit 1; nine successive calls correctly fill bits
+0–7 of the first backing field then create and use a second one at bit 0; `export_datatype()` on the
+resulting UDT renders the expected `<Member ... DataType="BIT" ... Target="..." BitNumber="..." />`
+alongside its own `Hidden="true"` backing `<Member>`. Not independently verified against a REAL Studio
+5000 import for this specific fix (unlike several other entries in this file) — the shape mirrors
+`export_datatype()`'s already-verified rendering path exactly (see "`export_datatype()` — create/modify
+a UDT" above), and the CREATE-a-new-backing-member naming convention is explicitly documented as a
+best-effort mirror of Rockwell's own observed convention, not a confirmed requirement (Studio
+recomputes a UDT's real physical layout/object IDs from the imported XML regardless — the backing
+member's name is the only real judgment call left, per `Member._byte_offset` never being emitted at
+all, already established elsewhere in this file).
+
+Covered by pure-function tests in `test/test_api.py` (`test_new_member_rejects_bit_type`,
+`test_new_bit_member_creates_backing_field_when_none_exists`,
+`test_new_bit_member_reuses_free_bit_in_existing_backing_field`,
+`test_new_bit_member_creates_new_backing_field_once_full`,
+`test_new_bit_member_ignores_hidden_member_not_already_backing_a_bit`,
+`test_new_bit_member_rejects_duplicate_name`) and DB-layer integration tests in
+`test/test_project_db.py` (`test_new_member_bit_type_allocates_backing_field`,
+`test_new_member_bit_type_reuses_free_bit_across_separate_calls`,
+`test_new_member_bit_type_creates_second_backing_field_once_full`,
+`test_db_new_member_bit_type_persists_through_export_datatype` — the one that would have caught the
+`len(dt_view.members) > len(existing_members)` bug above had it existed first, a reminder to write the
+integration test before declaring a fix like this done, not just the unit test).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

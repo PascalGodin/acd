@@ -714,8 +714,14 @@ class ProjectDB:
                          program_name: Union[str, None] = None) -> None:
         """Set (replacing any existing) the comment at `path` on tag
         `name` -- `path=""` is the tag's own whole-tag description, same
-        convention as `Tag._comments`. Raises `KeyError` if no tag named
-        `name` exists in scope.
+        convention as `Tag._comments`: `path` is the FULL tag-qualified
+        address, tag name included, e.g. `set_tag_comment("MyTag",
+        "MyTag.Member[4].5", "...")`, not just `"Member[4].5"` -- matches
+        exactly what `find_tag_references()`/`Tag._comments` themselves use.
+        `text=""` clears the comment at that path (an empty-text entry is
+        filtered out at export time by `_build_comments_xml`, so it never
+        renders); it does not raise or store a visible empty comment.
+        Raises `KeyError` if no tag named `name` exists in scope.
         """
         program_id = self._program_id(program_name)
         cur = self._conn.cursor()
@@ -856,6 +862,28 @@ class ProjectDB:
             )
         cur.execute("UPDATE proj_rungs SET text=? WHERE routine_id=? AND rung_index=?",
                     (new_text, routine_id, index))
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def set_rung_comment(self, routine_name: str, index: int, comment: Union[str, None],
+                          program_name: Union[str, None] = None) -> None:
+        """Set or clear a rung's comment WITHOUT touching its text --
+        `comment=None` clears it. Added because the only prior way to
+        rename a rung's comment was `delete_rung()` + `insert_rung()` with
+        the same text retyped by hand, which also throws away
+        `replace_rung_safe()`'s optimistic-concurrency guard. Raises
+        `KeyError` if no rung exists at `index` in this routine.
+        """
+        routine_id = self._routine_id(routine_name, program_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM proj_rungs WHERE routine_id=? AND rung_index=?", (routine_id, index)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No rung at index {index} in this routine")
+        cur.execute("UPDATE proj_rungs SET comment=? WHERE routine_id=? AND rung_index=?",
+                    (comment, routine_id, index))
         cur.execute("UPDATE proj_meta SET dirty=1")
         if not self._in_transaction:
             self._conn.commit()
@@ -1113,6 +1141,14 @@ class ProjectDB:
         pass the rung text you get back to `replace_rung_safe()` if you're
         about to edit it. Raises `KeyError`/`ValueError` the same way
         `get_routine()` (acd.api) does for a missing/ambiguous name.
+
+        `"rung_comments"` is `Dict[int, str]` -- keyed by the INTEGER rung
+        index (same index space as `"rungs"`), not a stringified index and
+        not JSON-style string keys. A rung with no comment has no entry at
+        all (use `.get(i)`, which returns `None`, rather than assuming
+        every index 0..len(rungs) is present). `comments.get(str(i))` will
+        silently return `None` for every rung -- no exception, just quietly
+        wrong/empty data.
         """
         routine = _get_routine(self.to_controller(), routine_name, program_name)
         return {
@@ -1249,6 +1285,15 @@ def db_replace_rung_safe(acd_path, routine_name: str, index: int, expected_old: 
     """Stateless equivalent of `ProjectDB.replace_rung_safe()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.replace_rung_safe(
         routine_name, index, expected_old, new_text, program_name=program_name,
+    ))
+
+
+def db_set_rung_comment(acd_path, routine_name: str, index: int,
+                         comment: Union[str, None], program_name: Union[str, None] = None,
+                         project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.set_rung_comment()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.set_rung_comment(
+        routine_name, index, comment, program_name=program_name,
     ))
 
 

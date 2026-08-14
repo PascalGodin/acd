@@ -2705,6 +2705,67 @@ opts back out and succeeds). Full suite re-run after the `rendering.py`/`api.py`
 regressions, confirming `_validate_tag_types_resolve()`'s own existing behavior/tests are unaffected
 by extracting its shared walker.
 
+### Fourth real-usage feedback: undocumented conventions, not code bugs — all three self-inflicted by a caller having to test empirically to learn something the docstring should have said
+
+Same downstream agent, asked directly "any friction using the new tool" rather than waiting for
+something to break. All three items were things that *worked exactly as coded* but cost the agent a
+real debugging/testing round to discover, because the convention wasn't stated anywhere it would be
+read before calling the function — the same class of gap already called out in "The recurring lesson"
+under "Persistent project DB" above, just for docstrings instead of API surface shape:
+
+1. **`db_get_routine()["rung_comments"]` is `Dict[int, str]`, not string-keyed.** The agent
+   reasonably guessed `comments.get(str(i))` (a common JSON-API convention) and got `None` for
+   every single rung — no exception, quietly empty data; only caught because a separate
+   `json.dumps()` of the same dict happened to show the values were really there. This is exactly
+   the "returns success with wrong/empty data" failure mode this whole file's methodology section
+   keeps warning about, just triggered by documentation instead of a decode bug. Fixed by stating
+   the key type and the wrong-guess failure mode explicitly in both `ProjectDB.get_routine()`'s and
+   the module-level `acd/__init__.py` docstring's description of `db_get_routine()` — not just the
+   type, the *consequence* of guessing wrong, since "it's an int" alone doesn't warn against the
+   specific silent-`None` trap a string-keying guess falls into.
+2. **No way to rename a rung's comment without touching its text.** `replace_rung_safe()` takes
+   `new_text` but no comment param; the only workaround was `delete_rung()` + `insert_rung()` with
+   the same text retyped by hand — which also throws away `replace_rung_safe()`'s optimistic-
+   concurrency guard (the agent had to re-type the expected-old text from memory instead of a real
+   compare-and-swap). Added `ProjectDB.set_rung_comment(routine_name, index, comment,
+   program_name=None)` / `db_set_rung_comment(...)` (`comment=None` clears it) — a direct
+   `UPDATE proj_rungs SET comment=? WHERE ...`, no text touched, no shift arithmetic needed since
+   the rung doesn't move.
+3. **`db_set_tag_comment()`'s `path` convention had no example**, and empty-string behavior was
+   unverified without a scratch-copy test. The one-liner said `path=""` is the whole-tag
+   description and otherwise "same convention as `Tag._comments`" — but discovering `path` must be
+   the FULL tag-qualified address (`"MyTag.Member[4].5"`, tag name included, not just
+   `"Member[4].5"`) required reading a real `_comments` dump first. **This also turned out to be a real,
+   separate latent bug, not just missing docs**: the PRE-EXISTING test for this function
+   (`test_set_tag_comment_element_path`) itself passed a bare suffix (`"[0]"`, no tag name prefix)
+   and only asserted the entry landed in `tag._comments` — never that it actually rendered. Checking
+   `_build_comments_xml`'s own filter (`if not ref.startswith(tag_name): continue`,
+   `rendering.py`) confirms a path missing the tag-name prefix is stored without error but silently
+   dropped at export time — the exact same "succeeds with quietly wrong/missing data" shape as item
+   1, just embodied in this repo's own test suite rather than caught by it. Fixed the test to use
+   the correct full-path convention (and additionally assert on the rendered XML, not just the raw
+   list), added `test_set_tag_comment_without_tag_name_prefix_is_silently_dropped_at_render` to lock
+   in the footgun itself as a named regression rather than leave it implicit, and confirmed
+   `text=""` clears a comment (filtered by the same `not text` check in `_build_comments_xml`, not a
+   distinct code path) with `test_set_tag_comment_empty_text_clears_it`. Docstrings for
+   `ProjectDB.set_tag_comment()` and the `acd/__init__.py` module-level description now state the
+   full-path requirement with a concrete example and the `text=""`-clears behavior directly, rather
+   than pointing at `Tag._comments`'s own convention and requiring a caller to go find it.
+
+Nothing here was "the tool did the wrong thing" per the agent's own framing — confirming the pattern
+already established by the third feedback round (see "Confirmed normal, not a gap" elsewhere in this
+file): real friction can be 100% a documentation/discoverability gap, and the fix is still worth
+making with the same rigor as a code fix, including a regression test where an existing test's own
+blind spot (item 3) let a real "silently drops data" behavior go unverified for one function since
+before this round.
+
+Covered by new tests in `test/test_project_db.py`: `test_set_rung_comment_changes_comment_without_touching_text`,
+`test_set_rung_comment_none_clears_it`, `test_set_rung_comment_raises_on_missing_rung`,
+`test_db_set_rung_comment_stateless_wrapper`, `test_db_get_routine_rung_comments_keyed_by_int_not_str`,
+`test_set_tag_comment_without_tag_name_prefix_is_silently_dropped_at_render`,
+`test_set_tag_comment_empty_text_clears_it` — full suite re-run clean (220 passed, 2 skipped, up from
+213 passed before this round).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests
@@ -2713,7 +2774,8 @@ by extracting its shared walker.
 - Some AB module DataType names contain `:` (e.g. `CHANNEL_DI_TIMESTAMP:O:0`), which is invalid
   in Windows paths — anything that turns a comp name into a filename/directory (see
   `DumpCompsRecords` in `elements.py`) needs to sanitize it first.
-- The full suite (`pytest` from repo root) should show `77 passed, 2 skipped, 0 failed`. If you
-  see `FileNotFoundError`s or `PermissionError`s across many unrelated test files, first check
-  you're not missing the `conftest.py` chdir behavior or that a previous test crashed and left
-  a locked SQLite file/build artifact behind.
+- The full suite (`pytest` from repo root) should show all tests passing with 2 skipped, 0 failed
+  (220 passed as of this writing — the exact count grows over time, don't treat a higher number as
+  a problem). If you see `FileNotFoundError`s or `PermissionError`s across many unrelated test
+  files, first check you're not missing the `conftest.py` chdir behavior or that a previous test
+  crashed and left a locked SQLite file/build artifact behind.

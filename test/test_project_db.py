@@ -24,6 +24,7 @@ from acd import (
     db_list_routines,
     db_new_member,
     db_new_tag,
+    db_set_rung_comment,
     db_tag_exists,
     db_transaction,
     open_project_db,
@@ -243,10 +244,47 @@ def test_set_tag_comment_element_path(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:
         db.new_tag("PDB_COMMENT_TAG", "DINT")
-        db.set_tag_comment("PDB_COMMENT_TAG", "[0]", "element zero comment")
+        db.set_tag_comment("PDB_COMMENT_TAG", "PDB_COMMENT_TAG[0]", "element zero comment")
         project = db.to_controller()
         tag = next(t for t in project.controller.tags if t.name == "PDB_COMMENT_TAG")
+        assert ("PDB_COMMENT_TAG[0]", "element zero comment") in tag._comments
+        # path must carry the tag-name prefix, per _build_comments_xml's own
+        # `if not ref.startswith(tag_name): continue` filter -- confirm it
+        # actually renders, not just that it's stored in the raw list.
+        assert 'Operand="[0]"' in tag.to_xml()
+    finally:
+        db.close()
+
+
+def test_set_tag_comment_without_tag_name_prefix_is_silently_dropped_at_render(acd_copy):
+    """Documents the exact footgun a downstream agent hit: `path` must be
+    the FULL tag-qualified address (tag name included), same convention as
+    `Tag._comments`/`_build_comments_xml`'s own `ref.startswith(tag_name)`
+    check -- passing just the suffix (e.g. "[0]") stores fine (no error)
+    but is silently filtered out of the rendered XML.
+    """
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_tag("PDB_COMMENT_TAG2", "DINT")
+        db.set_tag_comment("PDB_COMMENT_TAG2", "[0]", "element zero comment")
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "PDB_COMMENT_TAG2")
         assert ("[0]", "element zero comment") in tag._comments
+        assert "<Comments>" not in tag.to_xml()
+    finally:
+        db.close()
+
+
+def test_set_tag_comment_empty_text_clears_it(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_tag("PDB_COMMENT_TAG3", "DINT")
+        db.set_tag_comment("PDB_COMMENT_TAG3", "PDB_COMMENT_TAG3[0]", "will be cleared")
+        db.set_tag_comment("PDB_COMMENT_TAG3", "PDB_COMMENT_TAG3[0]", "")
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "PDB_COMMENT_TAG3")
+        assert "<Comments>" not in tag.to_xml()
     finally:
         db.close()
 
@@ -380,6 +418,70 @@ def test_replace_rung_safe_applies_matching_edit(acd_copy):
         assert routine2.rungs[0] == "NOP();"
     finally:
         db.close()
+
+
+def test_set_rung_comment_changes_comment_without_touching_text(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        db.insert_rung(routine_name, 0, "NOP();", comment="original",
+                        program_name=program_name)
+
+        db.set_rung_comment(routine_name, 0, "renamed", program_name=program_name)
+
+        routine = get_routine(db.to_controller(), routine_name, program_name)
+        assert routine.rungs[0] == "NOP();"
+        assert routine._rung_comments[0] == "renamed"
+    finally:
+        db.close()
+
+
+def test_set_rung_comment_none_clears_it(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        db.insert_rung(routine_name, 0, "NOP();", comment="original",
+                        program_name=program_name)
+
+        db.set_rung_comment(routine_name, 0, None, program_name=program_name)
+
+        routine = get_routine(db.to_controller(), routine_name, program_name)
+        assert 0 not in routine._rung_comments
+    finally:
+        db.close()
+
+
+def test_set_rung_comment_raises_on_missing_rung(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        program_name, routine_name = _first_routine(db)
+        with pytest.raises(KeyError):
+            db.set_rung_comment(routine_name, 999999, "x", program_name=program_name)
+    finally:
+        db.close()
+
+
+def test_db_set_rung_comment_stateless_wrapper(acd_copy):
+    program_name, routine_name = _first_routine_via_path(acd_copy)
+    db_insert_rung(str(acd_copy), routine_name, 0, "NOP();", comment="original",
+                    program_name=program_name)
+
+    db_set_rung_comment(str(acd_copy), routine_name, 0, "renamed", program_name=program_name)
+
+    result = db_get_routine(str(acd_copy), routine_name, program_name)
+    assert result["rung_comments"][0] == "renamed"
+
+
+def test_db_get_routine_rung_comments_keyed_by_int_not_str(acd_copy):
+    program_name, routine_name = _first_routine_via_path(acd_copy)
+    db_insert_rung(str(acd_copy), routine_name, 0, "NOP();", comment="hi",
+                    program_name=program_name)
+
+    result = db_get_routine(str(acd_copy), routine_name, program_name)
+
+    assert result["rung_comments"].get(0) == "hi"
+    assert result["rung_comments"].get("0") is None
+    assert all(isinstance(k, int) for k in result["rung_comments"])
 
 
 def test_export_routine_includes_db_created_tag(acd_copy, tmp_path):

@@ -52,7 +52,11 @@ step, so a call never returns more than actually asked for:
     routine's current rungs/comments (or ST lines) plus its description.
     A routine name is only unique WITHIN a program (many projects have a
     "Main" in several programs) -- raises `ValueError` if ambiguous and no
-    `program_name` was given, rather than silently picking one.
+    `program_name` was given, rather than silently picking one. Its
+    `"rung_comments"` is `Dict[int, str]` keyed by the INTEGER rung index
+    (same index space as `"rungs"`) -- NOT stringified keys;
+    `comments.get(str(i))` silently returns `None` for every rung instead
+    of erroring, so use the int index directly.
   - `db_list_tags(acd_path, program_name=None)` -- name/data_type/
     dimensions/description for tags in one scope, WITHOUT the decoded
     value (can be large on its own for a UDT array tag) -- then
@@ -77,7 +81,11 @@ EDITS -- durable the moment the call returns (see above), each raising
   - `db_edit_tag(acd_path, name, program_name=None, description=None,
     value=None)` -- only the fields actually passed are changed.
   - `db_set_tag_comment(acd_path, name, path, text, program_name=None)`
-    -- `path=""` is the tag's own whole-tag description.
+    -- `path=""` is the tag's own whole-tag description; otherwise `path`
+    is the FULL tag-qualified address, tag name included (e.g.
+    `"MyTag.Member[4].5"`, not `"Member[4].5"`). `text=""` clears the
+    comment at that path (it's filtered out at export time, never raises
+    or renders an empty comment).
   - `db_new_member(acd_path, data_type_name, name, member_data_type,
     dimension=0, radix=None, description=None, index=None)` -- add a
     member to an EXISTING UDT, at `index` (default: appended).
@@ -89,6 +97,10 @@ EDITS -- durable the moment the call returns (see above), each raising
     only if it still matches `expected_old` (raises with a readable diff
     otherwise) -- guards against clobbering a rung someone hand-edited in
     Studio since your last read.
+  - `db_set_rung_comment(acd_path, routine_name, index, comment,
+    program_name=None)` -- set or clear (`comment=None`) a rung's comment
+    WITHOUT touching its text; use this instead of delete_rung+insert_rung
+    just to rename a comment.
   - `db_delete_tag(acd_path, name, program_name=None)` /
     `db_delete_routine(acd_path, routine_name, program_name=None)` /
     `db_delete_member(acd_path, data_type_name, member_name)` -- remove
@@ -199,6 +211,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_insert_rung,
     db_delete_rung,
     db_replace_rung_safe,
+    db_set_rung_comment,
     db_delete_tag,
     db_delete_routine,
     db_delete_member,

@@ -16,110 +16,12 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-import subprocess
-import platform
-
 from setuptools import setup, find_packages
-from setuptools.command.install import install as _install
 
 from pathlib import Path
 
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
-
-
-class install(_install):
-    def run(self):
-        print("--------------------------------------------------------------------")
-        print("Detecting Operating System")
-        operating_system = platform.system()
-        if operating_system == "Windows":
-            print("Windows Detected, using the kaitai-struct-compiler.bat")
-            kaitai_compiler_executable = "kaitai-struct-compiler.bat"
-        else:
-            print("Linux or Mac Detected, using the ksc executable")
-            kaitai_compiler_executable = "ksc"       
-        print("--------------------------------------------------------------------")
-        print("Compiling Dat/Day.ksy")
-        subprocess.run(
-            [
-                kaitai_compiler_executable,
-                "-t",
-                "python",
-                "--outdir",
-                "acd/generated/",
-                "--python-package",
-                "acd.generated",
-                "resources/templates/Dat/Dat.ksy",
-            ]
-        )
-        print("Compiling Comps/FAFA_Comps.ksy")
-        subprocess.run(
-            [
-                kaitai_compiler_executable,
-                "-t",
-                "python",
-                "--outdir",
-                "acd/generated/comps/",
-                "--python-package",
-                "acd.generated.comps",
-                "resources/templates/Comps/FAFA_Comps.ksy",
-            ]
-        )
-        print("Compiling SbRegion/FAFA_SbRegion.ksy")
-        subprocess.run(
-            [
-                kaitai_compiler_executable,
-                "-t",
-                "python",
-                "--outdir",
-                "acd/generated/sbregion/",
-                "--python-package",
-                "acd.generated.sbregion",
-                "resources/templates/SbRegion/FAFA_SbRegion.ksy",
-            ]
-        )
-        print("Compiling Comps/FDFD_Comps.ksy")
-        subprocess.run(
-            [
-                kaitai_compiler_executable,
-                "-t",
-                "python",
-                "--outdir",
-                "acd/generated/comps/",
-                "--python-package",
-                "acd.generated.comps",
-                "resources/templates/Comps/FDFD_Comps.ksy",
-            ]
-        )
-        print("Compiling Comments/FAFA_Comments.ksy")
-        subprocess.run(
-            [
-                kaitai_compiler_executable,
-                "-t",
-                "python",
-                "--outdir",
-                "acd/generated/comments/",
-                "--python-package",
-                "acd.generated.comments",
-                "resources/templates/Comments/FAFA_Comments.ksy",
-            ]
-        )
-        print("Compiling Comps/RxGeneric.ksy")
-        subprocess.run(
-            [
-                kaitai_compiler_executable,
-                "-t",
-                "python",
-                "--outdir",
-                "acd/generated/comps/",
-                "--python-package",
-                "acd.generated.comps",
-                "resources/templates/Comps/RxGeneric.ksy",
-            ]
-        )
-        _install.run(self)
-        print("--------------------------------------------------------------------")
 
 
 setup(
@@ -159,5 +61,4 @@ setup(
             "coverage",
         ]
     },
-    cmdclass={"install": install},
 )

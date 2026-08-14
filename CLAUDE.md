@@ -41,6 +41,22 @@ pytest                    # runs from repo root; test/conftest.py chdir's into t
   in test files are relative to `test/`, e.g. `"../resources/CuteLogix.ACD"` — this works from
   any invocation directory because of the `conftest.py` autouse fixture).
 - Formatting: `black` (via pre-commit, see `.pre-commit-config.yaml`).
+- `pip install .`/`pip install git+<url>` (non-editable) now work — previously `setup.py` had a
+  custom `install` command that unconditionally tried to invoke the external Kaitai Struct
+  compiler (`kaitai-struct-compiler.bat`/`ksc`, a separate Java-based tool, not a Python
+  dependency) to regenerate `acd/generated/`, which hard-failed (`WinError 2`/`FileNotFoundError`)
+  on any machine without that compiler on PATH — confirmed by actually testing `pip install .` in
+  a throwaway venv, not assumed. `acd/generated/`'s output is already committed to git and never
+  needed regenerating for a normal install; only `pip install -e .` (which goes through a
+  different setuptools code path) ever worked, which is why this went unnoticed — every existing
+  install (this repo's own dev setup, the downstream agent's) happened to use `-e`. Regenerating
+  after changing a `.ksy` template is now a separate, explicit maintainer step: `python
+  scripts/regenerate_kaitai.py` (see README's "Developing" section). Verified after the fix: a
+  real non-editable `pip install .` in a fresh venv succeeds and `db_to_controller()` loads the
+  real `CuteLogix.ACD` fixture correctly; the editable install path (`pip install -e .`) is
+  unaffected. Found while investigating what a "lightweight, no-admin-rights" acd-tools setup for
+  a non-technical user (delegating to an AI coding agent that runs `pip install` itself) would
+  actually require — this was the real, confirmed blocker, not a hypothetical one.
 
 ## Architecture
 

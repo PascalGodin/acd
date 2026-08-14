@@ -558,7 +558,19 @@ pytest
 
 ### Developing
 
-Sections of the code are generated from kaitai template (.ksy) files in the resources/templates folder. These are generated during the install phase. The python scripts which are generated are located in the acd/generated folder.
+Sections of the code are generated from kaitai template (.ksy) files in the resources/templates
+folder. The generated python scripts are checked into `acd/generated/` -- a normal `pip install`
+does NOT regenerate them (this used to happen automatically during install, which meant `pip
+install .`/`pip install` from a git URL failed on any machine without the external Kaitai Struct
+compiler on PATH, even though the already-committed generated output didn't need rebuilding at
+all). If you've changed a `.ksy` template, regenerate manually:
+
+```bash
+python scripts/regenerate_kaitai.py
+```
+
+Requires the [Kaitai Struct compiler](https://kaitai.io/#download)
+(`kaitai-struct-compiler.bat`/`ksc`) on PATH -- a separate external tool, not a Python dependency.
 
 ### Contributing
 

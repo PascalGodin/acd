@@ -7,9 +7,13 @@ import time
 import pytest
 
 from acd import (
+    db_delete_member,
+    db_delete_routine,
+    db_delete_tag,
     db_diff_io_addresses,
     db_diff_project,
     db_diff_routine,
+    db_export_datatype,
     db_export_routine,
     db_find_tag_references,
     db_get_project_summary,
@@ -17,6 +21,7 @@ from acd import (
     db_get_tag_value,
     db_insert_rung,
     db_io_addresses_by_routine,
+    db_list_routines,
     db_new_member,
     db_new_tag,
     db_tag_exists,
@@ -652,3 +657,87 @@ def test_transaction_sees_its_own_uncommitted_writes(acd_copy):
     with db_transaction(str(acd_copy)) as db:
         db.new_tag("TXN_VISIBLE_MID_BLOCK", "DINT")
         assert db.tag_exists("TXN_VISIBLE_MID_BLOCK") is True
+
+
+# ---- delete_tag / delete_routine / delete_member ----
+
+def test_delete_tag_removes_it(acd_copy):
+    db_new_tag(str(acd_copy), "DEL_TAG_TEST", "DINT")
+    assert db_tag_exists(str(acd_copy), "DEL_TAG_TEST") is True
+
+    db_delete_tag(str(acd_copy), "DEL_TAG_TEST")
+
+    assert db_tag_exists(str(acd_copy), "DEL_TAG_TEST") is False
+
+
+def test_delete_tag_missing_raises_key_error(acd_copy):
+    with pytest.raises(KeyError):
+        db_delete_tag(str(acd_copy), "NO_SUCH_TAG_XYZ")
+
+
+def test_delete_tag_respects_program_scope(acd_copy):
+    program_name, _ = _first_routine_via_path(acd_copy)
+    db_new_tag(str(acd_copy), "DEL_SCOPED_TAG", "DINT", program_name=program_name)
+
+    with pytest.raises(KeyError):
+        db_delete_tag(str(acd_copy), "DEL_SCOPED_TAG")  # wrong scope (controller)
+
+    db_delete_tag(str(acd_copy), "DEL_SCOPED_TAG", program_name=program_name)
+    assert db_tag_exists(str(acd_copy), "DEL_SCOPED_TAG", program_name=program_name) is False
+
+
+def test_delete_routine_removes_it_and_its_rungs(acd_copy):
+    program_name, routine_name = _first_routine_via_path(acd_copy)
+
+    db_delete_routine(str(acd_copy), routine_name, program_name=program_name)
+
+    listed = [
+        r for r in db_list_routines(str(acd_copy), program_name=program_name)
+        if r["routine"] == routine_name
+    ]
+    assert listed == []
+    with pytest.raises(KeyError):
+        db_get_routine(str(acd_copy), routine_name, program_name=program_name)
+
+
+def test_delete_member_removes_it(acd_copy):
+    summary = db_get_project_summary(str(acd_copy))
+    dt_name = summary["data_types"][0]
+    db_new_member(str(acd_copy), dt_name, "DEL_MEMBER_TEST", "DINT")
+
+    db_delete_member(str(acd_copy), dt_name, "DEL_MEMBER_TEST")
+
+    project = open_project_db(str(acd_copy))
+    try:
+        dt = next(d for d in project.to_controller().controller.data_types if d.name == dt_name)
+        assert not any(m.name == "DEL_MEMBER_TEST" for m in dt.members)
+    finally:
+        project.close()
+
+
+def test_delete_member_missing_raises_key_error(acd_copy):
+    summary = db_get_project_summary(str(acd_copy))
+    dt_name = summary["data_types"][0]
+    with pytest.raises(KeyError):
+        db_delete_member(str(acd_copy), dt_name, "NO_SUCH_MEMBER_XYZ")
+
+
+# ---- validate defaults to True on db_export_routine/db_export_datatype ----
+
+def test_db_export_datatype_validate_defaults_true_and_raises_on_bad_member(acd_copy, tmp_path):
+    summary = db_get_project_summary(str(acd_copy))
+    dt_name = summary["data_types"][0]
+    db_new_member(str(acd_copy), dt_name, "BAD_TYPE_MEMBER", "NoSuchTypeXYZ")
+
+    with pytest.raises(ValueError):
+        db_export_datatype(str(acd_copy), dt_name, str(tmp_path / "out.L5X"))
+
+
+def test_db_export_datatype_validate_false_skips_the_check(acd_copy, tmp_path):
+    summary = db_get_project_summary(str(acd_copy))
+    dt_name = summary["data_types"][0]
+    db_new_member(str(acd_copy), dt_name, "BAD_TYPE_MEMBER2", "NoSuchTypeXYZ")
+
+    # Should NOT raise -- validate explicitly disabled.
+    db_export_datatype(str(acd_copy), dt_name, str(tmp_path / "out2.L5X"), validate=False)
+    assert (tmp_path / "out2.L5X").exists()

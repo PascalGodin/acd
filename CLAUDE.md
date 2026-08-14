@@ -2628,6 +2628,67 @@ tests. Full suite unaffected by this change outside the new tests (every edit me
 for a caller not using `.transaction()` is identical to before — commit still happens, just
 conditionally rather than unconditionally).
 
+### Third real-usage feedback: no way to delete anything, and `validate=False` was the wrong default
+
+Two more items from the same downstream agent, both grounded in a real thing that happened this
+session, not hypotheticals:
+
+1. **No `db_delete_tag`/`db_delete_routine`/`db_delete_member`.** Hit directly: a routine
+   (`S06_Bin_Criteria_Check` in the real project) got redesigned away — its logic moved inline into
+   another routine's RLL — leaving it and six now-unused tags as orphaned dead code, with no way to
+   remove them from the persistent DB short of a manual Studio deletion. The agent correctly split
+   this into two separate halves, and only one of them is actually buildable right now:
+   - **Deleting something in the real `.ACD`/Studio project** — almost certainly needs a manual
+     Studio action regardless of what this library does. Studio's native "Import Routine"/"Import
+     Data Type..." mechanism (the only durable write path this library has, see "ACD write-back"
+     above) can only add/update entities present in the partial L5X; it has no delete semantics for
+     something simply left out. No attempt was made to invent an L5X-based delete trick to work
+     around this — this project's own repeated "don't guess a fix without real data" lesson applies
+     directly here, and there's no real Studio behavior to test such a trick against without actual
+     access to try it.
+   - **Removing the entry from the persistent DB's own bookkeeping** — squarely buildable, and
+     valuable on its own even without the first half: without it, an abandoned tag/routine/member
+     keeps showing up in `db_list_tags()`/`db_list_routines()`/`db_get_project_summary()` forever,
+     with nothing distinguishing "still relevant" from "dead, forgot to clean up." Added
+     `delete_tag()`/`delete_routine()`/`delete_member()` on `ProjectDB` (each a straightforward
+     `DELETE` from the relevant `proj_*` table plus its child rows — `proj_tag_comments` for a tag,
+     `proj_rungs`/`proj_st_lines` for a routine — marking `proj_meta.dirty=1` the same way every
+     other edit method does) and the matching `db_delete_tag`/`db_delete_routine`/`db_delete_member`
+     stateless wrappers. Both docstrings state the real-`.ACD` limitation explicitly, right up front,
+     rather than letting a caller assume "delete" means "gone from Studio too."
+2. **`validate=False` as the default on `export_routine()`/`export_datatype()` was the wrong
+   asymmetry for the `db_*`/`ProjectDB` layer specifically.** The check is one extra graph-walk pass,
+   and it catches exactly the bug class (declared-type-vs-rendered-value mismatch, silently rendered
+   as a bare zero instead of raising) that took two separate rounds of live-Studio-rejection
+   debugging to fully run down earlier this same session (see "Initial-value decoding offset bugs"
+   and the AOI-instance-value gaps elsewhere in this file for the general pattern) — a real, not
+   hypothetical, cost of leaving it off by default. Flipped `ProjectDB.export_routine()`/
+   `db_export_routine()` and `ProjectDB.export_datatype()`/`db_export_datatype()` to `validate=True`
+   by default, with an explicit `validate=False` opt-out — **scoped to this layer only**, not the
+   underlying `acd.api.export_routine()`/`export_datatype()`, whose own defaults stay `False`
+   unchanged (no reason to risk an unrelated behavior change to callers of the lower-level functions
+   this session never touched).
+
+   This exposed a real, pre-existing gap: `export_datatype()` had **no `validate` parameter at all**
+   — only `export_routine()` did. `_validate_tag_types_resolve()`'s own recursive type-graph walker
+   was written specifically to start from a *Tag's* own value tree, not a bare `DataType`'s member
+   declarations, so it couldn't be reused as-is. Extracted the shared recursive step into
+   `_validate_type_graph_resolves(dt_name, context, data_types_map, seen)` (`rendering.py`) —
+   behavior-preserving for the existing `_validate_tag_types_resolve()` caller, verified by running
+   the full suite after the refactor, not just the new tests — and added
+   `_validate_data_type_resolves(data_type, data_types_map)` on top of it, which walks a `DataType`'s
+   own `.members` instead of a tag's `data_type`. `export_datatype()` (`acd/api.py`) gained a
+   `validate: bool = False` parameter (default `False` at THIS layer, matching `export_routine()`'s
+   own base default — the flip to `True` only happens at the `db_*`/`ProjectDB` layer above it) that
+   calls the new function before rendering.
+
+Covered by new tests in `test/test_project_db.py`: delete methods (removal confirmed, missing-name
+`KeyError`, program-scope isolation for `delete_tag`) and `validate=True`-by-default on
+`db_export_datatype()` (a deliberately-bad member type raises by default, `validate=False` explicitly
+opts back out and succeeds). Full suite re-run after the `rendering.py`/`api.py` refactor with zero
+regressions, confirming `_validate_tag_types_resolve()`'s own existing behavior/tests are unaffected
+by extracting its shared walker.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

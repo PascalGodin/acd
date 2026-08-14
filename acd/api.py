@@ -33,6 +33,7 @@ from acd.l5x.elements import (
     _escape_xml_attr,
     _multiline_xml_text,
     _validate_tag_types_resolve,
+    _validate_data_type_resolves,
     new_member,
 )
 
@@ -1326,7 +1327,8 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     Path(output_path).write_text(xml, encoding="utf-8")
 
 
-def export_datatype(project: RSLogix5000Content, data_type: DataType, output_path, owner: str = None) -> None:
+def export_datatype(project: RSLogix5000Content, data_type: DataType, output_path,
+                     owner: str = None, validate: bool = False) -> None:
     """Export a single DataType (UDT) as a standalone, partial L5X file, for
     Studio 5000's native "Import Data Type..." command (right-click the
     Data Types folder) -- the same "native-import escape hatch" strategy
@@ -1374,9 +1376,17 @@ def export_datatype(project: RSLogix5000Content, data_type: DataType, output_pat
             `project.controller.data_types`.
         output_path: Destination .L5X file path.
         owner: Optional "Owner" attribute value, as in export_routine().
+        validate: Before writing, verify every struct-typed name reachable
+            from `data_type`'s own member declarations actually resolves
+            (`_validate_data_type_resolves()`) -- the `export_datatype()`
+            counterpart to `export_routine(..., validate=True)`; catches a
+            member typed with an unresolved/misspelled struct name up
+            front instead of silently rendering it as a bare scalar. Off
+            by default.
 
     Raises:
-        ValueError: if `data_type` isn't in `project.controller.data_types`.
+        ValueError: if `data_type` isn't in `project.controller.data_types`,
+            or (if `validate=True`) if a member's type doesn't resolve.
 
     Example:
         project = load_acd("MyController.ACD")
@@ -1397,6 +1407,9 @@ def export_datatype(project: RSLogix5000Content, data_type: DataType, output_pat
         )
 
     _sync_data_types_map(project)
+
+    if validate:
+        _validate_data_type_resolves(data_type, project.controller._data_types_map)
 
     controller_name = project.controller.name
     export_date = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")

@@ -31,6 +31,7 @@ from .rendering import (
     _decorated_real_literal,
     _zero_value_for_member,
     _validate_tag_types_resolve,
+    _validate_data_type_resolves,
     _member_decorated_xml,
     _array_member_xml,
     _struct_members_xml,

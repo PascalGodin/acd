@@ -89,6 +89,18 @@ EDITS -- durable the moment the call returns (see above), each raising
     only if it still matches `expected_old` (raises with a readable diff
     otherwise) -- guards against clobbering a rung someone hand-edited in
     Studio since your last read.
+  - `db_delete_tag(acd_path, name, program_name=None)` /
+    `db_delete_routine(acd_path, routine_name, program_name=None)` /
+    `db_delete_member(acd_path, data_type_name, member_name)` -- remove
+    dead code (e.g. a tag/routine/member left behind after a redesign)
+    from this project's DB bookkeeping. Does NOT delete anything in the
+    real `.ACD`/Studio project -- Studio's native Import Routine/Import
+    Data Type mechanism has no delete semantics (it can only add/update
+    entities present in the partial L5X, never remove ones that aren't
+    mentioned), so removing something from the real project still needs a
+    manual Studio action regardless. This only stops an abandoned entry
+    from cluttering `db_list_tags()`/`db_list_routines()`/
+    `db_get_project_summary()` forever with nothing marking it as dead.
 
 MULTI-STEP EDITS THAT MUST SUCCEED OR FAIL TOGETHER -- each `db_*` call
 above commits the instant it returns; a script doing several of them in a
@@ -111,18 +123,23 @@ the top-level `db_*` functions (`db_new_tag(...)`) -- each of those opens
 its own separate connection and would deadlock trying to acquire the same
 project lock this transaction is already holding.
 
-EXPORTING TO REAL STUDIO 5000 -- the only durable write path (see above):
+EXPORTING TO REAL STUDIO 5000 -- the only durable write path (see above).
+`validate` defaults to `True` on BOTH functions below -- the check is one
+extra graph-walk pass, and the failure mode it catches (a struct-typed
+name that doesn't resolve, silently rendered as a bare zero instead of a
+real nested structure) is silent corruption, not a loud error, which is
+the wrong kind of thing to leave opt-in. Pass `validate=False` explicitly
+if you're confident it's unnecessary and want to skip the pass:
   - `db_export_routine(acd_path, routine_name, output_path,
-    program_name=None, owner=None, validate=False)` -- a standalone
+    program_name=None, owner=None, validate=True)` -- a standalone
     partial L5X for Studio's "Import Routine" feature, covering both rung
-    edits and any tag this routine's logic references. `validate=True`
-    verifies every struct-typed name reachable from a referenced tag's own
-    DataType tree actually resolves before writing, instead of silently
-    rendering a bare zero where a nested structure belongs.
-  - `db_export_datatype(acd_path, data_type_name, output_path,
-    owner=None)` -- a standalone partial L5X for Studio's "Import Data
+    edits and any tag this routine's logic references. Validates every
+    struct-typed name reachable from a referenced tag's own DataType tree.
+  - `db_export_datatype(acd_path, data_type_name, output_path, owner=None,
+    validate=True)` -- a standalone partial L5X for Studio's "Import Data
     Type..." feature, for creating/modifying a UDT (e.g. inserting a
-    member via `db_new_member()` first).
+    member via `db_new_member()` first). Validates every struct-typed
+    member of `data_type_name` itself.
 
 COMPARING TWO PROJECTS/SAVES/ROUTINES -- READ THIS BEFORE WRITING YOUR OWN
 COMPARISON CODE. Do NOT fetch two routines via `db_get_routine()` and
@@ -182,6 +199,9 @@ from acd.l5x.project_db import (  # noqa: F401
     db_insert_rung,
     db_delete_rung,
     db_replace_rung_safe,
+    db_delete_tag,
+    db_delete_routine,
+    db_delete_member,
     db_export_routine,
     db_export_datatype,
     db_list_tags,

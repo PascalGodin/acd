@@ -860,6 +860,76 @@ class ProjectDB:
         if not self._in_transaction:
             self._conn.commit()
 
+    def delete_tag(self, name: str, program_name: Union[str, None] = None) -> None:
+        """Remove a tag from this project's DB -- e.g. cleaning up dead
+        code after a redesign moved its logic elsewhere.
+
+        Does NOT delete anything in the real `.ACD`/Studio project --
+        Studio's native "Import Routine"/"Import Data Type..." mechanism
+        has no delete semantics (it can only add/update entities present
+        in the partial L5X, never remove ones that simply aren't
+        mentioned), so removing something from the real project still
+        needs a manual Studio action regardless of what this library does.
+        This only prevents an abandoned tag from cluttering
+        `db_list_tags()`/`db_get_project_summary()` forever with nothing
+        distinguishing "still relevant" from "dead, forgot to clean up."
+
+        Raises `KeyError` if no tag named `name` exists in scope.
+        """
+        program_id = self._program_id(program_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM proj_tags WHERE program_id=? AND name=? COLLATE NOCASE",
+            (program_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No tag named {name!r} in this scope")
+        tag_id = row[0]
+        cur.execute("DELETE FROM proj_tag_comments WHERE tag_id=?", (tag_id,))
+        cur.execute("DELETE FROM proj_tags WHERE id=?", (tag_id,))
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def delete_routine(self, routine_name: str, program_name: Union[str, None] = None) -> None:
+        """Remove a routine (and all its rungs/ST lines) from this
+        project's DB. Same real-`.ACD` caveat as `delete_tag()` -- this
+        only cleans up the persistent DB's own bookkeeping, not the real
+        Studio project. Raises `KeyError`/`ValueError` the same way
+        `get_routine()` does for a missing/ambiguous name.
+        """
+        routine_id = self._routine_id(routine_name, program_name)
+        cur = self._conn.cursor()
+        cur.execute("DELETE FROM proj_rungs WHERE routine_id=?", (routine_id,))
+        cur.execute("DELETE FROM proj_st_lines WHERE routine_id=?", (routine_id,))
+        cur.execute("DELETE FROM proj_routines WHERE id=?", (routine_id,))
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def delete_member(self, data_type_name: str, member_name: str) -> None:
+        """Remove a member from an existing UDT. Same real-`.ACD` caveat
+        as `delete_tag()`. Raises `KeyError` if the DataType or the member
+        doesn't exist.
+        """
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM proj_data_types WHERE name=? COLLATE NOCASE", (data_type_name,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No DataType named {data_type_name!r}")
+        dt_id = row[0]
+        row = cur.execute(
+            "SELECT id FROM proj_members WHERE data_type_id=? AND name=? COLLATE NOCASE",
+            (dt_id, member_name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No member named {member_name!r} in DataType {data_type_name!r}")
+        cur.execute("DELETE FROM proj_members WHERE id=?", (row[0],))
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
     # ---- rehydration ----
 
     def _load_data_types(self, data_types_map: Dict[str, DataType]) -> List[DataType]:
@@ -988,17 +1058,31 @@ class ProjectDB:
     # ---- export bridge ----
 
     def export_routine(self, routine_name: str, output_path, program_name: Union[str, None] = None,
-                        owner: Union[str, None] = None, validate: bool = False) -> None:
+                        owner: Union[str, None] = None, validate: bool = True) -> None:
         """`to_controller()` + `get_routine()` + the existing, unmodified
-        `export_routine()` in one call."""
+        `export_routine()` in one call.
+
+        `validate` defaults to `True` here (opposite of the underlying
+        `export_routine()`'s own `validate=False` default) -- the check is
+        one extra graph-walk pass, and the failure mode it prevents
+        (declared-type-vs-rendered-value mismatch, silently rendered as a
+        bare zero) is silent corruption, not a loud error, which is the
+        wrong kind of thing to leave opt-in. Found via a real report: two
+        separate rounds of live-Studio-rejection debugging in one session
+        both traced back to exactly this. Pass `validate=False` explicitly
+        to skip the check if you're confident it's unnecessary.
+        """
         project = self.to_controller()
         routine = _get_routine(project, routine_name, program_name)
         _export_routine(project, routine, output_path, owner=owner, validate=validate)
 
     def export_datatype(self, data_type_name: str, output_path,
-                         owner: Union[str, None] = None) -> None:
+                         owner: Union[str, None] = None, validate: bool = True) -> None:
         """`to_controller()` + DataType lookup + the existing, unmodified
-        `export_datatype()` in one call."""
+        `export_datatype()` in one call. `validate` defaults to `True` here
+        for the same reason as `export_routine()` above -- see its
+        docstring.
+        """
         project = self.to_controller()
         dt = next(
             (d for d in project.controller.data_types if d.name.upper() == data_type_name.upper()),
@@ -1006,7 +1090,7 @@ class ProjectDB:
         )
         if dt is None:
             raise KeyError(f"No DataType named {data_type_name!r}")
-        _export_datatype(project, dt, output_path, owner=owner)
+        _export_datatype(project, dt, output_path, owner=owner, validate=validate)
 
     # ---- read-only convenience (thin wrappers over acd.api, against a fresh rehydration) ----
 
@@ -1168,21 +1252,43 @@ def db_replace_rung_safe(acd_path, routine_name: str, index: int, expected_old: 
     ))
 
 
+def db_delete_tag(acd_path, name: str, program_name: Union[str, None] = None,
+                   project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.delete_tag()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.delete_tag(name, program_name))
+
+
+def db_delete_routine(acd_path, routine_name: str, program_name: Union[str, None] = None,
+                       project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.delete_routine()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose,
+         lambda db: db.delete_routine(routine_name, program_name))
+
+
+def db_delete_member(acd_path, data_type_name: str, member_name: str,
+                      project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.delete_member()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose,
+         lambda db: db.delete_member(data_type_name, member_name))
+
+
 def db_export_routine(acd_path, routine_name: str, output_path,
                        program_name: Union[str, None] = None, owner: Union[str, None] = None,
-                       validate: bool = False, project_dir=None, verbose: bool = False) -> None:
-    """Stateless equivalent of `ProjectDB.export_routine()` -- see its docstring."""
+                       validate: bool = True, project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.export_routine()` -- see its docstring
+    (including why `validate` defaults to `True` here)."""
     _run(acd_path, project_dir, verbose, lambda db: db.export_routine(
         routine_name, output_path, program_name=program_name, owner=owner, validate=validate,
     ))
 
 
 def db_export_datatype(acd_path, data_type_name: str, output_path,
-                        owner: Union[str, None] = None, project_dir=None,
-                        verbose: bool = False) -> None:
-    """Stateless equivalent of `ProjectDB.export_datatype()` -- see its docstring."""
+                        owner: Union[str, None] = None, validate: bool = True,
+                        project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.export_datatype()` -- see its docstring
+    (including why `validate` defaults to `True` here)."""
     _run(acd_path, project_dir, verbose, lambda db: db.export_datatype(
-        data_type_name, output_path, owner=owner,
+        data_type_name, output_path, owner=owner, validate=validate,
     ))
 
 

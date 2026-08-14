@@ -299,6 +299,44 @@ def _zero_value_for_member(member: "Member", data_types_map: Dict[str, "DataType
         return [_scalar_zero() for _ in range(member.dimension)]
     return _scalar_zero()
 
+def _validate_type_graph_resolves(dt_name: str, context: str,
+                                   data_types_map: Dict[str, "DataType"], seen: set) -> None:
+    """Shared recursive walker behind `_validate_tag_types_resolve()` (starts
+    from a Tag's own `data_type`) and `_validate_data_type_resolves()`
+    (starts from a bare DataType's own members, no tag involved) -- see
+    either caller's docstring for why this check exists. `seen` is the
+    caller's own set, so repeated calls from a loop share one dedup set
+    across the whole run rather than re-walking an already-confirmed type.
+
+    Raises ValueError on the first unresolved type found.
+    """
+    key = dt_name.upper()
+    if (
+        key in _PRIMITIVE_DECORATED_ZERO
+        or key in _BUILTIN_STRUCT_MEMBERS
+        or key in _SKIP_DECORATED
+        or key in seen
+        or _is_string_family_type(dt_name, data_types_map)
+    ):
+        return
+    dt_obj = data_types_map.get(key)
+    if dt_obj is None:
+        raise ValueError(
+            f"{context}: type {dt_name!r} does not resolve to a known "
+            "primitive, string-family type, built-in Logix struct, or an "
+            "entry in data_types_map -- most likely a stale/incomplete "
+            "data_types_map (see _sync_data_types_map()) rather than a "
+            "genuinely unknown type. Exporting anyway would silently "
+            "render this member as a bare zero instead of its real "
+            "nested structure."
+        )
+    seen.add(key)
+    for member in dt_obj.members:
+        if member.data_type:
+            _validate_type_graph_resolves(member.data_type, f"{context}.{member.name}",
+                                           data_types_map, seen)
+
+
 def _validate_tag_types_resolve(tags: List["Tag"], data_types_map: Dict[str, "DataType"]) -> None:
     """Verify every struct-typed name reachable from `tags`' own DataType
     trees resolves to a real entry in `data_types_map` -- a primitive, a
@@ -323,36 +361,28 @@ def _validate_tag_types_resolve(tags: List["Tag"], data_types_map: Dict[str, "Da
     Raises ValueError on the first unresolved type found.
     """
     seen: set = set()
-
-    def _check(dt_name: str, context: str) -> None:
-        key = dt_name.upper()
-        if (
-            key in _PRIMITIVE_DECORATED_ZERO
-            or key in _BUILTIN_STRUCT_MEMBERS
-            or key in _SKIP_DECORATED
-            or key in seen
-            or _is_string_family_type(dt_name, data_types_map)
-        ):
-            return
-        dt_obj = data_types_map.get(key)
-        if dt_obj is None:
-            raise ValueError(
-                f"{context}: type {dt_name!r} does not resolve to a known "
-                "primitive, string-family type, built-in Logix struct, or an "
-                "entry in data_types_map -- most likely a stale/incomplete "
-                "data_types_map (see _sync_data_types_map()) rather than a "
-                "genuinely unknown type. Exporting anyway would silently "
-                "render this member as a bare zero instead of its real "
-                "nested structure."
-            )
-        seen.add(key)
-        for member in dt_obj.members:
-            if member.data_type:
-                _check(member.data_type, f"{context}.{member.name}")
-
     for tag in tags:
         if tag.data_type:
-            _check(tag.data_type, f"Tag {tag.name!r}")
+            _validate_type_graph_resolves(tag.data_type, f"Tag {tag.name!r}", data_types_map, seen)
+
+
+def _validate_data_type_resolves(data_type: "DataType", data_types_map: Dict[str, "DataType"]) -> None:
+    """The `export_datatype()` counterpart to `_validate_tag_types_resolve()`
+    -- checks a bare DataType's OWN member declarations resolve, with no
+    tag/value involved (unlike the tag version, which checks a value tree
+    reachable from a tag). Same rationale: a member typed with an
+    unresolved struct name doesn't raise on its own during rendering, it
+    silently falls into a zero-value fallback -- for `export_datatype()`
+    that means a member the real UDT can't actually represent gets
+    exported as a bare scalar instead of raising up front.
+
+    Raises ValueError on the first unresolved type found.
+    """
+    seen: set = set()
+    for member in data_type.members:
+        if member.data_type:
+            _validate_type_graph_resolves(member.data_type, f"DataType {data_type.name!r}.{member.name}",
+                                           data_types_map, seen)
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
                            data_types_map: Dict[str, "DataType"]) -> str:

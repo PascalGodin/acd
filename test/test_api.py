@@ -35,6 +35,7 @@ from acd.l5x.elements import (
     Member,
     Tag,
     new_bit_member,
+    new_datatype,
     new_member,
     new_routine,
     new_tag,
@@ -534,6 +535,24 @@ def test_new_bit_member_rejects_duplicate_name():
     ])
     with pytest.raises(ValueError, match="already has a member"):
         new_bit_member(dt, "Existing")
+
+
+def test_new_datatype_is_empty_user_type():
+    dt = new_datatype("MyUdt", description="a test type")
+    assert dt.name == "MyUdt"
+    assert dt.family == "NoFamily"
+    assert dt.cls == "User"
+    assert dt.members == []
+    assert dt._description == "a test type"
+
+
+def test_new_datatype_result_can_be_populated_with_new_member():
+    dt = new_datatype("MyUdt")
+    dt.members.append(new_member("Field1", "DINT"))
+    bit_member = new_bit_member(dt, "Flag1")
+    dt.members.append(bit_member)
+
+    assert [m.name for m in dt.members] == ["Field1", bit_member.target, "Flag1"]
 
 
 def test_new_routine_rll():

@@ -296,6 +296,28 @@ class DataType(L5xElement):
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
+def new_datatype(name: str, description: Union[str, None] = None) -> DataType:
+    """Construct a new, empty UDT `DataType` for insertion into
+    `project.controller.data_types` -- e.g. to originate a brand-new type
+    before populating it with `new_member()`/`new_bit_member()`.
+
+    `family`/`cls` are always `"NoFamily"`/`"User"` -- the conventional
+    values for a plain, user-created type (matching `DataTypeBuilder`'s own
+    fallback for a real ACD-decoded type, and every hand-constructed
+    `DataType` already used elsewhere in this codebase's own tests). There
+    is no override parameter: `"StringFamily"` only applies to a
+    string-family type, which isn't what this constructs, and `cls` values
+    other than `"User"` (`"ProductDefined"`, `"IO"`) only ever apply to
+    module-defined/built-in types, never a type a caller creates by hand.
+
+    Starts with `.members` empty -- append the result of `new_member()`/
+    `new_bit_member()` to populate it, the same way you already would for
+    an existing UDT (see CLAUDE.md's "`export_datatype()` -- create/modify
+    a UDT").
+    """
+    return DataType(name, name, "NoFamily", "User", [], _description=description)
+
+
 # Maps primitive DataType names to their L5K zero-default value string.
 # UDT, STRING, ALARM_DIGITAL, MESSAGE, and array types are intentionally omitted —
 # they require complex structured L5K encoding that is not yet implemented.

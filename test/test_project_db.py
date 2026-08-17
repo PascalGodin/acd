@@ -24,6 +24,7 @@ from acd import (
     db_insert_st_line,
     db_io_addresses_by_routine,
     db_list_routines,
+    db_new_datatype,
     db_new_member,
     db_new_routine,
     db_new_tag,
@@ -386,6 +387,61 @@ def test_set_tag_comment_empty_text_clears_it(acd_copy):
         assert "<Comments>" not in tag.to_xml()
     finally:
         db.close()
+
+
+def test_new_datatype_creates_empty_udt(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_NEW_UDT", description="a test type")
+
+        project = db.to_controller()
+        dt = next(d for d in project.controller.data_types if d.name == "PDB_NEW_UDT")
+        assert dt.family == "NoFamily"
+        assert dt.cls == "User"
+        assert dt.members == []
+        assert dt._description == "a test type"
+    finally:
+        db.close()
+
+
+def test_new_datatype_can_be_populated_with_new_member(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_NEW_UDT")
+        db.new_member("PDB_NEW_UDT", "Field1", "DINT")
+        db.new_member("PDB_NEW_UDT", "Flag1", "BIT")
+
+        project = db.to_controller()
+        dt = next(d for d in project.controller.data_types if d.name == "PDB_NEW_UDT")
+        names = [m.name for m in dt.members]
+        assert "Field1" in names
+        assert "Flag1" in names
+        bit_member = next(m for m in dt.members if m.name == "Flag1")
+        assert bit_member.target is not None
+        assert bit_member.bit_number == 0
+    finally:
+        db.close()
+
+
+def test_new_datatype_duplicate_name_raises(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_NEW_UDT")
+        with pytest.raises(sqlite3.IntegrityError):
+            db.new_datatype("PDB_NEW_UDT")
+    finally:
+        db.close()
+
+
+def test_db_new_datatype_stateless_wrapper_and_export(acd_copy, tmp_path):
+    db_new_datatype(str(acd_copy), "PDB_NEW_UDT", description="a test type")
+    db_new_member(str(acd_copy), "PDB_NEW_UDT", "Field1", "DINT")
+
+    output_path = tmp_path / "new_datatype.L5X"
+    db_export_datatype(str(acd_copy), "PDB_NEW_UDT", str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'Name="PDB_NEW_UDT"' in content
+    assert 'Name="Field1"' in content
 
 
 def test_new_member_appends_by_default(acd_copy):

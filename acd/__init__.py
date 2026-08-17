@@ -86,6 +86,9 @@ EDITS -- durable the moment the call returns (see above), each raising
     `"MyTag.Member[4].5"`, not `"Member[4].5"`). `text=""` clears the
     comment at that path (it's filtered out at export time, never raises
     or renders an empty comment).
+  - `db_new_datatype(acd_path, name, description=None)` -- create a new,
+    empty UDT. Use `db_new_member()` afterward to populate it, the same
+    way you already would for an existing UDT.
   - `db_new_member(acd_path, data_type_name, name, member_data_type,
     dimension=0, radix=None, description=None, index=None)` -- add a
     member to an EXISTING UDT, at `index` (default: appended).
@@ -248,6 +251,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_new_tag,
     db_edit_tag,
     db_set_tag_comment,
+    db_new_datatype,
     db_new_member,
     db_new_routine,
     db_insert_rung,

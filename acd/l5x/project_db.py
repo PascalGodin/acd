@@ -92,6 +92,7 @@ from acd.l5x.elements import (
     Tag,
     _validate_rll_rung_syntax,
     new_bit_member as _new_bit_member,
+    new_datatype as _new_datatype,
     new_member as _new_member,
     new_routine as _new_routine,
     new_tag as _new_tag,
@@ -813,6 +814,31 @@ class ProjectDB:
         cur.execute("UPDATE proj_meta SET dirty=1")
         if not self._in_transaction:
             self._conn.commit()
+
+    def new_datatype(self, name: str, description: Union[str, None] = None) -> int:
+        """Create a new, empty UDT in this project's DB -- the SQL
+        equivalent of appending `new_datatype(...)`
+        (`acd/l5x/elements/model.py`) to `project.controller.data_types`.
+        Use `new_member()`/`db_new_member()` afterward to populate it, the
+        same way you already would for an existing UDT.
+
+        Raises `sqlite3.IntegrityError` if a DataType with this name
+        already exists -- name uniqueness is GLOBAL/project-wide here,
+        unlike tags/routines (which are scoped per program) -- see
+        CLAUDE.md's "A real .ACD can contain two DataTypes with the same
+        name".
+        """
+        dt = _new_datatype(name, description=description)
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO proj_data_types (name, family, cls, description) VALUES (?, ?, ?, ?)",
+            (dt.name, dt.family, dt.cls, dt._description),
+        )
+        dt_id = cur.lastrowid
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+        return dt_id
 
     def _load_member_view(self, dt_id: int) -> List[Member]:
         """A lightweight, in-memory `Member` list for `dt_id` (name, data_type,
@@ -1593,6 +1619,14 @@ def db_set_tag_comment(acd_path, name: str, path: str, text: str,
     """Stateless equivalent of `ProjectDB.set_tag_comment()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.set_tag_comment(
         name, path, text, program_name=program_name,
+    ))
+
+
+def db_new_datatype(acd_path, name: str, description: Union[str, None] = None,
+                     project_dir=None, verbose: bool = False) -> int:
+    """Stateless equivalent of `ProjectDB.new_datatype()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose, lambda db: db.new_datatype(
+        name, description=description,
     ))
 
 

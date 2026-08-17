@@ -3215,6 +3215,39 @@ constructor) and `test_new_routine_rll_can_be_populated_and_read_back`/
 create-routine → insert-rung → `export_routine()` pipeline end-to-end, confirming the new routine's
 name and rung content both actually reach the rendered L5X, not just the DB).
 
+## `new_datatype()`/`db_new_datatype()` — the same creation-side gap, for UDTs this time
+
+Same class of gap as `new_routine()`/`db_new_routine()` above, flagged by the same downstream agent
+immediately after that one landed: `db_new_member()` requires the UDT to already exist (`KeyError`
+otherwise), and there was no `db_*` way to originate a brand-new one at all — only
+`db_export_datatype()` existed, for exporting an already-existing type. Not a blocker this time (the
+agent used standalone tags instead of a bundled parameter struct as a clean workaround, a pattern
+already used elsewhere in the same project) but flagged as real, since the next case might not have
+as clean a workaround available.
+
+Added `new_datatype(name, description=None) -> DataType` (`elements/model.py`, mirroring
+`new_tag()`/`new_member()`/`new_routine()`'s shape) and `ProjectDB.new_datatype()`/
+`db_new_datatype()` (`project_db.py`, the SQL-backed equivalent — `INSERT INTO proj_data_types`).
+`family`/`cls` are always `"NoFamily"`/`"User"` — the conventional values for a plain, user-created
+type (matching `DataTypeBuilder.build()`'s own fallback for a real ACD-decoded type, and every
+hand-constructed `DataType` already used elsewhere in this codebase's own tests) — with no override
+parameter, since `"StringFamily"`/`"ProductDefined"`/`"IO"` only ever apply to a string-family type
+or a module-defined/built-in type, never something a caller constructs by hand. Starts with
+`.members` empty; `new_member()`/`new_bit_member()` (or `db_new_member()`) populate it afterward the
+same way they already do for an existing UDT — no new wiring needed on that side, confirmed via a
+`new_datatype()` → `new_member()`/`new_bit_member()` round trip covering both a plain member and a
+BIT member (allocating a real backing field, per "`new_member(name, "BIT")` silently produced an
+unimportable member" above) directly on the freshly-created type.
+
+Covered by `test_new_datatype_is_empty_user_type`/
+`test_new_datatype_result_can_be_populated_with_new_member` (`test/test_api.py`, the pure
+constructor) and `test_new_datatype_creates_empty_udt`/
+`test_new_datatype_can_be_populated_with_new_member`/`test_new_datatype_duplicate_name_raises`/
+`test_db_new_datatype_stateless_wrapper_and_export` (`test/test_project_db.py` — the last one
+exercises the full create-datatype → new_member → `export_datatype()` pipeline end-to-end, same
+"confirm it actually reaches the rendered L5X, not just the DB" discipline as `new_routine()`'s own
+equivalent test above).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

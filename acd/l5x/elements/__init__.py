@@ -65,6 +65,7 @@ from .model import (
     new_bit_member,
     new_tag,
     DataType,
+    new_datatype,
     Tag,
     LocalTag,
     Parameter,

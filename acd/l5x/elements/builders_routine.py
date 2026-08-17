@@ -190,6 +190,16 @@ def routine_type_enum(idx: int) -> str:
 
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
+    # Known parent_id of the routine being built, when the caller already has
+    # it (e.g. from its own "WHERE parent_id=RxRoutineCollection_id" query) --
+    # see build()'s own docstring for why this matters: object_id alone is
+    # NOT always unique in a real Comps.Dat, and without this, build()'s own
+    # "WHERE object_id=..." re-query can silently pick up a completely
+    # unrelated colliding object instead of the real routine. None (the
+    # default) preserves the old object_id-only lookup for any caller that
+    # doesn't have a parent_id in hand.
+    _parent_id: Union[int, None] = None
+
     def build(self) -> Union[Routine, None]:
         """Build a Routine, or None if this comps record is a deleted/placeholder
         object rather than a real routine.
@@ -206,12 +216,42 @@ class RoutineBuilder(L5xElementBuilder):
         parsing artifact. Returning None here (and filtering it out at both
         call sites) matches Studio 5000's own behavior of omitting these
         entirely rather than emitting a phantom <Routine Type=""/>.
+
+        A SEPARATE, real bug found via a downstream report: `object_id` is not
+        always unique in Comps.Dat (see CLAUDE.md's "object_id is not always
+        unique" and "A second root-level object can share the controller's
+        own record_type") -- a real project had a brand-new, genuinely live
+        routine (record_type=256, a normal RLL routine, correctly parented
+        under its Program's own RxRoutineCollection) share its object_id with
+        a completely unrelated object under a different parent (record_type=0,
+        a garbage-looking single-control-character name, an unrelated ~12KB
+        record). The OLD "WHERE object_id=..." query below returned BOTH rows
+        and blindly used whichever SQLite happened to return first -- when
+        that was the unrelated object, its own bytes got fed to RxGeneric in
+        its place, this routine resolved to a bogus/incidental routine_type,
+        and the REAL routine silently vanished (returned None here, invisible
+        to every caller -- db_list_routines(), db_get_routine(), even the
+        legacy in-memory loader -- with no error anywhere). Fixed by also
+        filtering on `_parent_id` when the caller has it (both real call
+        sites do, from their own already-scoped query) -- this doesn't fully
+        eliminate the theoretical risk `object_id` non-uniqueness poses
+        elsewhere (see that section's own "residual, theoretical risk"
+        caveat), but it does fix this specific, now-confirmed-real case.
         """
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
-            + str(self._object_id)
-        )
+        if self._parent_id is not None:
+            self._cur.execute(
+                "SELECT comp_name, object_id, parent_id, record FROM comps "
+                "WHERE object_id=? AND parent_id=?",
+                (self._object_id, self._parent_id),
+            )
+        else:
+            self._cur.execute(
+                "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
+                + str(self._object_id)
+            )
         results = self._cur.fetchall()
+        if not results:
+            return None
 
         try:
             r = RxGeneric.from_bytes(results[0][3])
@@ -702,7 +742,7 @@ class AoiBuilder(L5xElementBuilder):
             )
             for (child_oid,) in self._cur.fetchall():
                 try:
-                    routine = RoutineBuilder(self._cur, child_oid).build()
+                    routine = RoutineBuilder(self._cur, child_oid, routine_coll_oid).build()
                 except Exception:
                     routine = None
                 if routine is not None:

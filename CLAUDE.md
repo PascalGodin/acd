@@ -508,6 +508,14 @@ this manifesting as an actual bug has been found (the whole-project export for t
 completes and looks correct) — revisit only if a concrete case turns up, per this project's own
 "don't guess a fix without real data" rule.
 
+**UPDATE — this residual risk was confirmed as a real, concrete bug, not just theoretical.** See
+"`RoutineBuilder` picked the wrong row on a colliding `object_id`" below: a real project had a
+genuinely live routine share its `object_id` with an unrelated object, and `RoutineBuilder.build()`'s
+own `object_id`-only re-query was exactly this class of exposure, silently dropping the real routine
+entirely. Fixed there specifically (the one confirmed case); the other `object_id`-only lookups this
+paragraph warns about are still unaudited — revisit each on its own if a concrete case turns up,
+rather than assuming this one fix closes the risk everywhere it could theoretically appear.
+
 ## A second root-level object can share the controller's own `record_type`
 
 Same project, next re-save from Studio 5000 (after further edits, same general "one real object
@@ -549,6 +557,56 @@ buffer), and a single task that still can't decode is skipped with a warning rat
 `ControllerBuilder.build()` entirely. Adapted from an open, unmerged PR against `hutcheb/acd`;
 existing test suite (which only exercises files that already parse cleanly) is unaffected by
 design — this only changes behavior on records/files that previously would have raised.
+
+**A real downstream report found the bare "skipped N unparseable record(s) of M" summary itself was
+a problem, not just cosmetic.** A single record in a real project's `Comps.Dat` failed with a raw
+`EndOfStreamError('requested 2 bytes, but only 0 bytes available')` — caught by the same bare
+`except Exception` this section describes, logged only as a count. The record turned out to almost
+certainly be a genuine, recently-authored routine's own definition: invisible to `db_list_routines()`,
+`db_get_routine()` (a clean `KeyError`, indistinguishable from "this routine was never created"), and
+even the legacy in-memory `load_acd()` loader — no error anywhere told the caller a real object had
+gone missing, and the skipped-record count (a flat, unchanging "1") looked identical whether it was
+one genuinely dropped real object or ordinary multi-record padding/noise, with nothing to tell the
+two apart.
+
+**Root-caused as far as possible without the real file, deliberately NOT hand-patched further.**
+Both `FafaComps`/`FdfdComps` (`acd/generated/comps/`, dispatched by `CompsRecord.parse()` for
+`identifier` `64250`/`65021`) read a FIXED-size header first (144/155 bytes — always safe, since it's
+already-buffered), then a VARIABLE-length `record_buffer` sized from a length value baked into the
+record's own payload (`FafaComps`) or passed in from the outer container's own `len_record`
+(`FdfdComps`) — either one can legitimately disagree with how many bytes the record's raw payload
+actually contains, and `FdfdComps` in particular is already flagged elsewhere in this file as a
+"structurally different, not fully understood" record shape (see "Comps: skipped N unparseable
+record(s)" below). Chasing the exact byte-level cause further without the real failing bytes in hand
+would be exactly the "guess a fix without real data" mistake this file repeatedly warns against — the
+Kaitai-generated parsers are also not something to hand-patch directly (see README's "Developing"
+section on `.ksy` regeneration).
+
+**Fix, scoped to what's safely knowable without the real file: rich, generic diagnostics.**
+`_parse_records()` now tracks each failure's record INDEX and the REAL exception (not just a tally),
+plus — read generically off the outer Kaitai `Record` wrapper shared by all four `.Dat` files, not
+anything Comps-specific — its `identifier`/`len_record` when available. Every failure gets its own
+`log.debug()` line (visible under `verbose=True`), and the summary `log.warning()` itself now inlines
+the same detail directly (record index, identifier, len_record, real exception) whenever there are
+`_MAX_INLINE_FAILURE_DETAILS` (5) or fewer failures — the common, most actionable case (one or two
+genuinely dropped real objects) no longer requires separately re-enabling `verbose=True` just to learn
+which record and why. A file with MORE failures than that (more likely genuine firmware-version format
+noise, per this section's own opening paragraph) keeps the plain count in the WARNING and points at
+`verbose=True` for the full per-record detail, rather than dumping a long, unhelpful list into every
+default-quiet load.
+
+Covered by `test_parse_records_warning_inlines_index_and_exception_for_a_single_failure`,
+`test_parse_records_debug_detail_hidden_unless_verbose`,
+`test_parse_records_many_failures_summary_omits_inline_detail`, and
+`test_parse_records_per_record_detail_visible_under_verbose` (`test/test_database.py`) — all against a
+fake `DbExtract`/`Record` (no real `.Dat` file needed to exercise the failure path itself). The
+verbose-mode test found its own real test-isolation pitfall worth noting: `configure_logging(True)` is
+intentionally a no-op (verbose just means "don't touch the sink"), which is fine in a real process but
+left a PRIOR test's `configure_logging(False)` sink — bound to that test's own already-closed `capsys`
+stream — still registered, raising "I/O operation on closed file" instead of ever reaching the
+assertion. Not a library bug (a real process never swaps `sys.stderr` out from under a running sink the
+way pytest's `capsys` does between tests) — fixed by having that one test manage its own loguru sink
+directly rather than relying on `configure_logging(True)`'s deliberate no-op.
 
 ## Region Map format change (V38.02) — every routine's rungs/rung_ids came back empty
 
@@ -3058,6 +3116,65 @@ constructed via direct `_materialize()` calls against a synthetic in-memory SQLi
 object into the object graph BEFORE materialization, not something reachable through any normal edit
 API (every `db_*` edit method already enforces unique names going forward — this is specifically about
 what the SOURCE `.ACD` can already legally contain on the very first rebuild).
+
+## `RoutineBuilder` picked the wrong row on a colliding `object_id` — a real routine silently vanished
+
+Follow-up investigation to the Comps.Dat diagnostics fix above, on the exact same real project and
+the exact same reported symptom (a specific, recently-authored routine invisible to every read path,
+with Studio 5000 itself confirming the routine genuinely exists). The improved diagnostics correctly
+identified the truncated-record failure (see above) — but with real file access in hand this time
+(the user provided the actual project directory), the truncated record's own `object_id`/`parent_id`
+were cross-checked against the rest of the successfully-parsed `comps` table and matched NOTHING —
+no children, no matching parent, no `RegnLink.Dat`/`SbRegion.Dat` references anywhere. **That record
+was a dead end, not the missing routine.** The missing routine's own comps record, once searched for
+directly by name, was found to parse completely cleanly on its own — proving the two problems were
+unrelated despite the matching symptom, a genuinely important negative result worth stating plainly:
+confirming a hypothesis "fits" isn't the same as confirming it explains the actual mechanism.
+
+**Real root cause, found by tracing the routine's own object_id all the way through the builder
+pipeline**: `object_id` genuinely collided with an unrelated object elsewhere in the same
+`Comps.Dat` — a real, now-CONFIRMED instance of the risk flagged (but left theoretical) in "A genuine
+3-way collision crashed the whole load" above. The real, live routine (correctly parented under its
+Program's own `RxRoutineCollection`, a completely ordinary `record_type=256` RLL routine) shared its
+numeric `object_id` with an unrelated object under a DIFFERENT parent (a garbage-looking single-
+control-character name, a large opaque record, `record_type=0`, no children, no references anywhere
+else in the project — almost certainly some inert internal Comps.Dat artifact, not a meaningful
+object of any kind).
+
+`RoutineBuilder.build()`'s own first step re-queries `comps` by `object_id` ALONE (`SELECT ... WHERE
+object_id=?`, discarding the parent_id its own caller already knew from a more specific query) and
+blindly takes `results[0]` — with two rows now matching, SQLite returned the UNRELATED row first.
+That row's own (garbage) bytes got fed to `RxGeneric` in the real routine's place; `RxGeneric` either
+raises or resolves to a nonsense `routine_type`, and — via the *existing*, already-correct
+"`routine_type_enum(0) == 'TypeLess'` means deleted/placeholder, return `None`" filter documented in
+this same function (see its own docstring) — the real, live routine was silently treated as if it
+didn't exist. No exception, no warning: `ProgramBuilder`'s own routine-collecting loop just quietly
+appended nothing for it, indistinguishable from "this routine was correctly filtered as a genuine
+placeholder."
+
+**Fix**: `RoutineBuilder` gained an optional `_parent_id` field (defaults to `None`, preserving the
+old object_id-only lookup for any caller that doesn't have a parent_id in hand); when set, `build()`'s
+own re-query filters on `(object_id, parent_id)` instead of `object_id` alone. Both real call sites
+(`ProgramBuilder.build()`'s routine-collection loop and `AoiBuilder.build()`'s AOI-logic-routine
+loop) already independently know the correct `RxRoutineCollection` object_id from their OWN query
+that found the child in the first place — they were simply discarding it before now. Both updated to
+pass it through.
+
+**Verified against the real project**: the previously-invisible routine now appears correctly — 16
+routines in its Program instead of 15, real RLL content (43 rungs, sensible ladder logic referencing
+real project tags), `db_get_routine()`/`db_list_routines()` both now find it. Also confirmed the fix
+doesn't accidentally paper over the ALREADY-correct `TypeLess` filtering: a synthetic reproduction
+(`test_routine_builder_disambiguates_colliding_object_id_by_parent`, `test/test_database.py`, using
+a real routine from the small `CuteLogix.ACD` fixture plus an injected colliding row under a
+different parent) confirms the collision is genuinely ambiguous at the `object_id`-only level (2 rows
+match), that the parent-scoped lookup finds the real routine correctly despite it, AND that querying
+with the COLLIDING object's own (wrong) parent_id correctly returns `None` rather than something
+bogus — proving `_parent_id` is a real disambiguation, not a no-op.
+
+**Not chased further**: this fixes the one confirmed case (`RoutineBuilder`). Per the updated
+"Residual, theoretical risk" note above, the same `object_id`-only-lookup pattern exists in other
+builders too — left alone until a concrete case turns up in one of them specifically, rather than
+speculatively rewriting every such lookup on the strength of this one confirmed instance.
 
 ## Testing gotchas
 

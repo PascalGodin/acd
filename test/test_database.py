@@ -1,6 +1,8 @@
 import struct
+import sys
 
 import pytest
+from loguru import logger as loguru_logger
 
 from acd.database.dbextract import DbExtract
 from acd.l5x.elements import ControllerBuilder, ModuleBuilder, RoutineBuilder
@@ -9,7 +11,11 @@ from acd.l5x.export_l5x import (
     _dedupe_comps_records,
     _iter_region_map_entries_v38,
     _iter_region_map_entries_v_pre38,
+    _MAX_INLINE_FAILURE_DETAILS,
+    _parse_records,
+    configure_logging,
 )
+from acd.l5x import export_l5x as export_l5x_module
 from acd.zip.unzip import Unzip
 
 from loguru import logger as log
@@ -274,6 +280,59 @@ def test_module_builder_skips_hex_named_connection():
     assert module._connections == [("Standard", "20000", "Input")]
 
 
+def test_routine_builder_disambiguates_colliding_object_id_by_parent():
+    # Regression test for a real, downstream-reported bug: object_id is not
+    # always unique in Comps.Dat (see CLAUDE.md's "object_id is not always
+    # unique"). A real project had a genuinely live, normally-parented RLL
+    # routine share its object_id with a completely unrelated object under a
+    # different parent. RoutineBuilder.build()'s own "WHERE object_id=..."
+    # re-query returned BOTH rows and blindly used fetchall()[0] -- when
+    # SQLite happened to return the unrelated row first, its bytes got fed to
+    # RxGeneric in the real routine's place, and the real routine vanished
+    # (build() returned None) with no error anywhere.
+    unzip = Unzip("../resources/CuteLogix.ACD").write_files("build")
+    exp = ExportL5x("../resources/CuteLogix.ACD", "build")
+    cur = exp._cur
+
+    real_routine_id = 2802757537   # "B001_Main", a real RLL routine
+    real_parent_id = 1543291182    # its real RxRoutineCollection
+
+    # An unrelated object sharing the SAME object_id under a DIFFERENT
+    # parent -- garbage bytes too short for RxGeneric to parse, mirroring
+    # the real case (an unrelated ~12KB record whose bytes, read in the
+    # real routine's place, made RxGeneric resolve to a bogus routine_type).
+    # Inserted with a lower rowid than the real routine so a naive
+    # "WHERE object_id=..." query (no ORDER BY) returns it FIRST, matching
+    # the real, observed row order.
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (real_routine_id, 11, "\x0b", 9, 0, b"\x00" * 8),
+    )
+    exp._db.commit()
+
+    # Confirm the collision itself is real: an object_id-only query is now
+    # genuinely ambiguous (2 rows) -- this is what made the OLD "WHERE
+    # object_id=..." + fetchall()[0] query unsafe (whichever row SQLite
+    # happens to return first, which isn't something to rely on and wasn't
+    # reliably reproducible in this test either -- the real bug was found
+    # against a real project's own physical row order, not forced here).
+    ambiguous = cur.execute(
+        "SELECT parent_id FROM comps WHERE object_id=?", (real_routine_id,)
+    ).fetchall()
+    assert len(ambiguous) == 2
+
+    # With the parent_id disambiguation, the real routine is found correctly
+    # regardless of the collision or row order.
+    fixed = RoutineBuilder(cur, real_routine_id, real_parent_id).build()
+    assert fixed is not None
+    assert fixed.name == "B001_Main"
+    assert fixed.type == "RLL"
+
+    # And the colliding object's own (wrong) parent correctly returns
+    # nothing -- proving the filter is a real disambiguation, not a no-op.
+    assert RoutineBuilder(cur, real_routine_id, 11).build() is None
+
+
 def _region_map_entry(parent_id, unknown, seq_no, object_id) -> bytes:
     # Same 16-byte field order on BOTH sides of the V38 boundary -- only the
     # header size (and therefore the entries' starting offset) differs. See
@@ -452,3 +511,132 @@ def test_routine_builder_appends_recovered_rung_when_no_chain_neighbor_is_presen
     assert routine is not None
     expected = [oid for oid in original_order if oid != missing_rung] + [missing_rung]
     assert routine._rung_ids == expected
+
+
+class _FakeRecord:
+    def __init__(self, identifier, len_record):
+        self.identifier = identifier
+        self.len_record = len_record
+
+
+class _FakeRecords:
+    def __init__(self, records):
+        self.record = records
+
+
+class _FakeDat:
+    def __init__(self, records):
+        self.records = _FakeRecords(records)
+
+
+def _patch_fake_dat(monkeypatch, records):
+    class _FakeDbExtract:
+        def __init__(self, path):
+            self._path = path
+
+        def read(self):
+            return _FakeDat(records)
+
+    monkeypatch.setattr(export_l5x_module, "DbExtract", _FakeDbExtract)
+    monkeypatch.setattr(export_l5x_module.os.path, "exists", lambda p: True)
+
+
+def test_parse_records_warning_inlines_index_and_exception_for_a_single_failure(monkeypatch, capsys):
+    # Regression test for a real report: a single genuinely-dropped real
+    # object (a routine's own Comps.Dat record) was indistinguishable from
+    # routine multi-record padding/noise -- the warning only ever said
+    # "skipped 1 unparseable record(s) of N", with no record index and no
+    # real exception, anywhere, even under verbose=True.
+    configure_logging(False)
+    records = [
+        _FakeRecord(64250, 100),
+        _FakeRecord(64250, 50),
+        _FakeRecord(64250, 200),
+    ]
+    _patch_fake_dat(monkeypatch, records)
+
+    def parse_one(record):
+        if record.len_record == 50:
+            raise ValueError("requested 2 bytes, but only 0 bytes available")
+        return (record.len_record,)
+
+    result = _parse_records("fake.Dat", parse_one, "FakeLabel")
+    captured = capsys.readouterr()
+
+    assert result == [(100,), (200,)]
+    assert "skipped 1 unparseable record(s) of 3" in captured.err
+    assert "record 1" in captured.err
+    assert "identifier=64250" in captured.err
+    assert "len_record=50" in captured.err
+    assert "requested 2 bytes, but only 0 bytes available" in captured.err
+
+
+def test_parse_records_debug_detail_hidden_unless_verbose(monkeypatch, capsys):
+    configure_logging(False)
+    records = [_FakeRecord(64250, 50)]
+    _patch_fake_dat(monkeypatch, records)
+
+    def parse_one(record):
+        raise ValueError("boom")
+
+    _parse_records("fake.Dat", parse_one, "FakeLabel")
+    captured = capsys.readouterr()
+
+    # The summary WARNING line (<= _MAX_INLINE_FAILURE_DETAILS failures)
+    # already carries the detail even in quiet mode -- but a per-record
+    # DEBUG line should not appear twice/redundantly gate on verbose in a
+    # way that breaks quiet mode's own WARNING-level guarantee.
+    assert "skipped 1 unparseable record(s) of 1" in captured.err
+    assert captured.err.count("boom") == 1
+
+
+def test_parse_records_many_failures_summary_omits_inline_detail(monkeypatch, capsys):
+    configure_logging(False)
+    records = [_FakeRecord(64250, i) for i in range(_MAX_INLINE_FAILURE_DETAILS + 1)]
+    _patch_fake_dat(monkeypatch, records)
+
+    def parse_one(record):
+        raise ValueError("boom")
+
+    _parse_records("fake.Dat", parse_one, "FakeLabel")
+    captured = capsys.readouterr()
+
+    assert (
+        f"skipped {_MAX_INLINE_FAILURE_DETAILS + 1} unparseable record(s) of "
+        f"{_MAX_INLINE_FAILURE_DETAILS + 1}" in captured.err
+    )
+    assert "re-run with verbose=True" in captured.err
+    # The per-record detail must not be dumped into the WARNING for a large
+    # failure count -- that's exactly the noisy case this threshold exists
+    # to avoid inlining.
+    assert "record 0 " not in captured.err
+
+
+def test_parse_records_per_record_detail_visible_under_verbose(monkeypatch, capsys):
+    # configure_logging(True) is intentionally a no-op (verbose=True just
+    # means "don't touch the sink") -- fine for a real process, but a prior
+    # test's configure_logging(False) can leave an explicit sink bound to
+    # THAT test's own (now-closed) capsys stream still registered, which
+    # verbose=True's no-op wouldn't fix. Manage the sink directly here so
+    # this test reliably observes DEBUG output regardless of run order,
+    # same effect a real verbose=True caller gets in a real process (where
+    # sys.stderr is never swapped out from under the sink like capsys does).
+    loguru_logger.remove()
+    loguru_logger.add(sys.stderr, level="DEBUG")
+    try:
+        configure_logging(True)
+        records = [_FakeRecord(64250, i) for i in range(_MAX_INLINE_FAILURE_DETAILS + 1)]
+        _patch_fake_dat(monkeypatch, records)
+
+        def parse_one(record):
+            raise ValueError("boom")
+
+        _parse_records("fake.Dat", parse_one, "FakeLabel")
+        captured = capsys.readouterr()
+
+        # Every failure gets its own DEBUG line, visible under verbose=True,
+        # even when there are too many to inline into the summary WARNING.
+        for i in range(_MAX_INLINE_FAILURE_DETAILS + 1):
+            assert f"record {i} " in captured.err
+    finally:
+        configure_logging(False)

@@ -57,6 +57,18 @@ def _dedupe_comps_records(tuples: List[tuple]) -> Dict[tuple, tuple]:
     return comps_by_id
 
 
+# A summary WARNING inlines the concrete (index, exception) detail for each
+# failure only up to this many -- see _parse_records()'s own docstring for
+# why: for the common case (one or two genuinely dropped real objects) this
+# is the single most actionable signal this function can produce, without
+# forcing a caller to separately re-run with verbose=True to learn WHICH
+# record failed and why. A file with many more failures than this is more
+# likely genuine firmware-version format noise (see the V33+ note below),
+# where a long inline list would just be clutter -- those still get the full
+# per-record detail at DEBUG level, just not inlined into the WARNING itself.
+_MAX_INLINE_FAILURE_DETAILS = 5
+
+
 def _parse_records(dat_path: str, parse_one, label: str) -> List[tuple]:
     """Parse every record of a .Dat file, skipping records that fail.
 
@@ -65,7 +77,24 @@ def _parse_records(dat_path: str, parse_one, label: str) -> List[tuple]:
     import over one bad record makes the library unusable on those files.
     Failures are counted and reported as a single warning instead. A missing
     or wholly unreadable .Dat file degrades to an empty table the same way.
-    Returns the list of successfully parsed non-None tuples."""
+    Returns the list of successfully parsed non-None tuples.
+
+    Each failure's real exception is captured, not just tallied -- found via
+    a real report where a single dropped record turned out to be a genuine,
+    recently-authored routine (invisible to every read path: db_list_routines(),
+    db_get_routine(), even the legacy in-memory loader, all silently one
+    object short with no error anywhere), and the caller had no way to tell
+    that apart from routine multi-record padding/noise without re-deriving
+    the record index and exception by hand. Every failure is logged
+    individually at DEBUG level (record index plus, when the underlying
+    Kaitai `Record` wrapper exposes them, its own `identifier`/`len_record`
+    fields -- available uniformly across every `.Dat` file this function is
+    used for, unlike anything specific to one record shape) -- visible under
+    `verbose=True`. The summary WARNING itself also inlines the same detail
+    when there are only a few failures (see `_MAX_INLINE_FAILURE_DETAILS`),
+    so the common "one real object silently missing" case doesn't require
+    flipping on verbose mode just to find out which record and why.
+    """
     if not os.path.exists(dat_path):
         log.warning(f"{label}: file not found at {dat_path} - skipping")
         return []
@@ -75,17 +104,32 @@ def _parse_records(dat_path: str, parse_one, label: str) -> List[tuple]:
         log.warning(f"{label}: unreadable database file ({e!r}) - skipping")
         return []
     out: List[tuple] = []
-    failed = 0
-    for record in records:
+    failures: List[str] = []
+    for i, record in enumerate(records):
         try:
             t = parse_one(record)
-        except Exception:
-            failed += 1
+        except Exception as e:
+            identifier = getattr(record, "identifier", None)
+            len_record = getattr(record, "len_record", None)
+            detail = (
+                f"record {i} (identifier={identifier!r}, len_record={len_record!r}): {e!r}"
+            )
+            failures.append(detail)
+            log.debug(f"{label}: {detail}")
             continue
         if t is not None:
             out.append(t)
-    if failed:
-        log.warning(f"{label}: skipped {failed} unparseable record(s) of {len(records)}")
+    if failures:
+        if len(failures) <= _MAX_INLINE_FAILURE_DETAILS:
+            log.warning(
+                f"{label}: skipped {len(failures)} unparseable record(s) of {len(records)} -- "
+                + "; ".join(failures)
+            )
+        else:
+            log.warning(
+                f"{label}: skipped {len(failures)} unparseable record(s) of {len(records)} "
+                f"(re-run with verbose=True to see each one)"
+            )
     return out
 
 

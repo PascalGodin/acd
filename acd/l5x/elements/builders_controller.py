@@ -97,7 +97,7 @@ class ProgramBuilder(L5xElementBuilder):
             )
             routine_results = self._cur.fetchall()
             for child in routine_results:
-                routine = RoutineBuilder(self._cur, child[1]).build()
+                routine = RoutineBuilder(self._cur, child[1], collection_id).build()
                 if routine is not None:
                     routines.append(routine)
 

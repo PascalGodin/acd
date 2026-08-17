@@ -93,6 +93,7 @@ from acd.l5x.elements import (
     _validate_rll_rung_syntax,
     new_bit_member as _new_bit_member,
     new_member as _new_member,
+    new_routine as _new_routine,
     new_tag as _new_tag,
 )
 from acd.l5x.export_l5x import configure_logging, ExportL5x
@@ -915,6 +916,43 @@ class ProjectDB:
             self._conn.commit()
         return member_id
 
+    def new_routine(self, routine_name: str, routine_type: str, program_name: str,
+                     description: Union[str, None] = None) -> int:
+        """Create a new, empty routine ("RLL" or "ST") in an existing
+        program -- the SQL equivalent of appending `new_routine(...)`
+        (`acd/l5x/elements/model.py`) to `Program.routines`. Use
+        `insert_rung()` (RLL) or `insert_st_line()` (ST) afterward to
+        populate it -- both raise a clear error if used against the wrong
+        routine type, so no separate guard is needed here.
+
+        Unlike `new_tag()` (where `program_name=None` means controller
+        scope), `program_name` is REQUIRED here -- a routine always belongs
+        to exactly one Program in Rockwell's own object model; there is no
+        controller-scope routine concept to default to. Raises `ValueError`
+        if `program_name` is `None` or `routine_type` isn't `"RLL"`/`"ST"`,
+        `KeyError` if `program_name` doesn't match any program,
+        `sqlite3.IntegrityError` if a routine with this name already exists
+        in that program.
+        """
+        if program_name is None:
+            raise ValueError(
+                "new_routine(): program_name is required -- a routine always belongs "
+                "to exactly one Program (unlike a tag, there's no controller-scope "
+                "routine to default to)."
+            )
+        routine = _new_routine(routine_name, routine_type, description=description)
+        program_id = self._program_id(program_name)
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO proj_routines (program_id, name, type, description) VALUES (?, ?, ?, ?)",
+            (program_id, routine.name, routine.type, routine._description),
+        )
+        routine_id = cur.lastrowid
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+        return routine_id
+
     def insert_rung(self, routine_name: str, index: int, text: str,
                      comment: Union[str, None] = None,
                      program_name: Union[str, None] = None) -> None:
@@ -1566,6 +1604,15 @@ def db_new_member(acd_path, data_type_name: str, name: str, member_data_type: st
     return _run(acd_path, project_dir, verbose, lambda db: db.new_member(
         data_type_name, name, member_data_type, dimension=dimension, radix=radix,
         description=description, index=index,
+    ))
+
+
+def db_new_routine(acd_path, routine_name: str, routine_type: str, program_name: str,
+                    description: Union[str, None] = None,
+                    project_dir=None, verbose: bool = False) -> int:
+    """Stateless equivalent of `ProjectDB.new_routine()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose, lambda db: db.new_routine(
+        routine_name, routine_type, program_name, description=description,
     ))
 
 

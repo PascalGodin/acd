@@ -3176,6 +3176,45 @@ bogus — proving `_parent_id` is a real disambiguation, not a no-op.
 builders too — left alone until a concrete case turns up in one of them specifically, rather than
 speculatively rewriting every such lookup on the strength of this one confirmed instance.
 
+## `new_routine()`/`db_new_routine()` — creating a brand-new routine was a gap in the `db_*` API
+
+A downstream agent flagged a real gap, found while trying to add a new routine to an existing
+program: `db_insert_rung()`/`db_insert_st_line()`/`db_replace_rung_safe()`/
+`db_replace_st_line_safe()` all require the routine to already exist (they shift rows within an
+already-existing sequence) — nothing created the routine record itself. `db_delete_routine()`
+existed on the deletion side with no creation-side counterpart at all.
+
+Added `new_routine(name, routine_type, description=None) -> Routine` (`elements/model.py`, mirroring
+`new_tag()`/`new_member()`'s shape: a plain constructor for a caller to append to `Program.routines`
+themselves) and `ProjectDB.new_routine()`/`db_new_routine()` (`project_db.py`, the SQL-backed
+equivalent — `INSERT INTO proj_routines`). Both validate `routine_type` is exactly `"RLL"` or `"ST"`
+(case-sensitive, matching every ACD-decoded Routine's own `.type`), raising `ValueError` for anything
+else (FBD/SFC content isn't supported by this library at all, see "Known limitations") rather than
+silently accepting a routine type nothing downstream could ever populate or export. The new routine
+starts empty (`.rungs`/`._st_lines` both `[]`) — `insert_rung()`/`insert_st_line()` (already
+type-guarded per "RLL rung edit primitives silently accepted being called on ST routines" above)
+populate it afterward, no separate wiring needed.
+
+**One deliberate deviation from the request's own suggested shape**: the agent's proposed signature
+had `program_name=None` (mirroring `db_new_tag()`, where `None` means controller scope). A routine
+has no controller-scope equivalent at all in Rockwell's own object model — it always belongs to
+exactly one Program (or, for an AOI's own logic routines, an AOI — not reachable via `db_*` at all,
+same v1 scope limit as everything else AOI-related in this subsystem). `program_name` is REQUIRED on
+both `ProjectDB.new_routine()`/`db_new_routine()` (raises `ValueError` naming why, including if
+`None` is passed explicitly, not just omitted) rather than silently accepting a `None` that has no
+sensible meaning to default to.
+
+Covered by `test_new_routine_rll`/`test_new_routine_st`/`test_new_routine_rejects_invalid_type`/
+`test_new_routine_result_can_be_populated_with_insert_rung`/
+`test_new_routine_result_can_be_populated_with_insert_st_line` (`test/test_api.py`, the pure
+constructor) and `test_new_routine_rll_can_be_populated_and_read_back`/
+`test_new_routine_st_can_be_populated_and_read_back`/`test_new_routine_requires_program_name`/
+`test_new_routine_rejects_invalid_type`/`test_new_routine_missing_program_raises_key_error`/
+`test_new_routine_duplicate_name_raises`/`test_db_new_routine_stateless_wrapper_and_export`
+(`test/test_project_db.py`, the SQL-backed layer — the last one exercises the full
+create-routine → insert-rung → `export_routine()` pipeline end-to-end, confirming the new routine's
+name and rung content both actually reach the rendered L5X, not just the DB).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

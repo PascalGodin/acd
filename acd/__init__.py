@@ -94,6 +94,12 @@ EDITS -- durable the moment the call returns (see above), each raising
     member, or creating a new one) -- previously committed with no error
     but with no `target`/`bit_number` at all, only failing a real Studio
     "Import Data Type..." on `Target` several steps later.
+  - `db_new_routine(acd_path, routine_name, routine_type, program_name,
+    description=None)` -- create a new, empty routine (`routine_type`
+    `"RLL"` or `"ST"`) in an EXISTING program. Unlike `db_new_tag()`,
+    `program_name` is REQUIRED (no controller-scope routine concept to
+    default to). Use `db_insert_rung()`/`db_insert_st_line()` afterward to
+    populate it.
   - `db_insert_rung(acd_path, routine_name, index, text, comment=None,
     program_name=None)` / `db_delete_rung(acd_path, routine_name, index,
     program_name=None)` -- RLL ONLY, raises `ValueError` if the routine's
@@ -243,6 +249,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_edit_tag,
     db_set_tag_comment,
     db_new_member,
+    db_new_routine,
     db_insert_rung,
     db_delete_rung,
     db_replace_rung_safe,

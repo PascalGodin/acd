@@ -70,6 +70,7 @@ from .model import (
     Parameter,
     Module,
     Routine,
+    new_routine,
     AOI,
     Program,
     ScheduledProgram,

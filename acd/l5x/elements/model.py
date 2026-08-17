@@ -1027,6 +1027,33 @@ class Routine(L5xElement):
             )
         del self._st_lines[index]
 
+
+def new_routine(name: str, routine_type: str, description: Union[str, None] = None) -> "Routine":
+    """Construct a new, empty `Routine` ("RLL" or "ST") for insertion into an
+    existing Program's `.routines` list -- e.g. to introduce a brand-new
+    routine before populating it with `insert_rung()`/`insert_st_line()`.
+
+    `routine_type` must be exactly `"RLL"` or `"ST"` (case-sensitive, matching
+    every ACD-decoded Routine's own `.type`) -- raises `ValueError` for
+    anything else, rather than silently accepting a routine type this
+    library can't actually populate or export (FBD/SFC routine content isn't
+    supported at all, see CLAUDE.md's "Known limitations").
+
+    The new routine starts with both `.rungs` and `._st_lines` empty -- use
+    `insert_rung()` (RLL) or `insert_st_line()` (ST) to add content; both
+    already raise a clear error if called against the wrong routine type
+    (see CLAUDE.md's "RLL rung edit primitives silently accepted being
+    called on ST routines"), so there's no separate guard needed here beyond
+    picking a valid `routine_type` up front.
+    """
+    if routine_type not in ("RLL", "ST"):
+        raise ValueError(
+            f"new_routine(): routine_type must be 'RLL' or 'ST', not {routine_type!r} -- "
+            "FBD/SFC routine content isn't supported by this library at all."
+        )
+    return Routine(name, name, routine_type, [], _description=description)
+
+
 @dataclass
 class AOI(L5xElement):
     name: str

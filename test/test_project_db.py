@@ -25,6 +25,7 @@ from acd import (
     db_io_addresses_by_routine,
     db_list_routines,
     db_new_member,
+    db_new_routine,
     db_new_tag,
     db_set_rung_comment,
     db_tag_exists,
@@ -516,6 +517,100 @@ def test_db_new_member_bit_type_persists_through_export_datatype(acd_copy, tmp_p
         assert re.search(r'Name="PDB_BIT_EXPORT"[^>]*BitNumber="0"', content)
     finally:
         db.close()
+
+
+def test_new_routine_rll_can_be_populated_and_read_back(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        program_name = project.controller.programs[0].name
+
+        db.new_routine("PDB_NEW_ROUTINE", "RLL", program_name, description="a test routine")
+        db.insert_rung("PDB_NEW_ROUTINE", 0, "NOP();", program_name=program_name)
+
+        routine = db.get_routine("PDB_NEW_ROUTINE", program_name)
+        assert routine["type"] == "RLL"
+        assert routine["description"] == "a test routine"
+        assert routine["rungs"] == ["NOP();"]
+
+        listed = db.list_routines(program_name)
+        assert any(r["routine"] == "PDB_NEW_ROUTINE" for r in listed)
+    finally:
+        db.close()
+
+
+def test_new_routine_st_can_be_populated_and_read_back(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        program_name = project.controller.programs[0].name
+
+        db.new_routine("PDB_NEW_ST_ROUTINE", "ST", program_name)
+        db.insert_st_line("PDB_NEW_ST_ROUTINE", 0, "X := 1;", program_name=program_name)
+
+        routine = db.get_routine("PDB_NEW_ST_ROUTINE", program_name)
+        assert routine["type"] == "ST"
+        assert routine["st_lines"] == ["X := 1;"]
+    finally:
+        db.close()
+
+
+def test_new_routine_requires_program_name(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(ValueError, match="program_name is required"):
+            db.new_routine("PDB_NEW_ROUTINE", "RLL", None)
+    finally:
+        db.close()
+
+
+def test_new_routine_rejects_invalid_type(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        program_name = project.controller.programs[0].name
+        with pytest.raises(ValueError, match="must be 'RLL' or 'ST'"):
+            db.new_routine("PDB_NEW_ROUTINE", "SFC", program_name)
+    finally:
+        db.close()
+
+
+def test_new_routine_missing_program_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.new_routine("PDB_NEW_ROUTINE", "RLL", "NO_SUCH_PROGRAM")
+    finally:
+        db.close()
+
+
+def test_new_routine_duplicate_name_raises(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        program_name = project.controller.programs[0].name
+        db.new_routine("PDB_NEW_ROUTINE", "RLL", program_name)
+        with pytest.raises(sqlite3.IntegrityError):
+            db.new_routine("PDB_NEW_ROUTINE", "RLL", program_name)
+    finally:
+        db.close()
+
+
+def test_db_new_routine_stateless_wrapper_and_export(acd_copy, tmp_path):
+    db = open_project_db(str(acd_copy), verbose=False)
+    project = db.to_controller()
+    program_name = project.controller.programs[0].name
+    db.close()
+
+    db_new_routine(str(acd_copy), "PDB_NEW_ROUTINE", "RLL", program_name)
+    db_insert_rung(str(acd_copy), "PDB_NEW_ROUTINE", 0,
+                    "XIC(Always_Off)OTE(Always_Off);", program_name=program_name)
+
+    output_path = tmp_path / "new_routine.L5X"
+    db_export_routine(str(acd_copy), "PDB_NEW_ROUTINE", str(output_path), program_name=program_name)
+    content = output_path.read_text(encoding="utf-8")
+    assert 'Name="PDB_NEW_ROUTINE"' in content
+    assert "OTE(Always_Off)" in content
 
 
 def _first_routine(db):

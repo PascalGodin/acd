@@ -36,6 +36,7 @@ from acd.l5x.elements import (
     Tag,
     new_bit_member,
     new_member,
+    new_routine,
     new_tag,
     _validate_rll_rung_syntax,
 )
@@ -533,6 +534,40 @@ def test_new_bit_member_rejects_duplicate_name():
     ])
     with pytest.raises(ValueError, match="already has a member"):
         new_bit_member(dt, "Existing")
+
+
+def test_new_routine_rll():
+    routine = new_routine("MyRoutine", "RLL", description="a test routine")
+    assert routine.name == "MyRoutine"
+    assert routine.type == "RLL"
+    assert routine.rungs == []
+    assert routine._st_lines == []
+    assert routine._description == "a test routine"
+
+
+def test_new_routine_st():
+    routine = new_routine("MySTRoutine", "ST")
+    assert routine.type == "ST"
+    assert routine.rungs == []
+    assert routine._st_lines == []
+    assert routine._description is None
+
+
+def test_new_routine_rejects_invalid_type():
+    with pytest.raises(ValueError, match="must be 'RLL' or 'ST'"):
+        new_routine("MyRoutine", "SFC")
+
+
+def test_new_routine_result_can_be_populated_with_insert_rung():
+    routine = new_routine("MyRoutine", "RLL")
+    routine.insert_rung(0, "NOP();")
+    assert routine.rungs == ["NOP();"]
+
+
+def test_new_routine_result_can_be_populated_with_insert_st_line():
+    routine = new_routine("MyRoutine", "ST")
+    routine.insert_st_line(0, "X := 1;")
+    assert routine._st_lines == ["X := 1;"]
 
 
 def test_new_tag_primitive_defaults_radix_by_data_type():

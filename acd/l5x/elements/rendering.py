@@ -384,6 +384,25 @@ def _validate_data_type_resolves(data_type: "DataType", data_types_map: Dict[str
             _validate_type_graph_resolves(member.data_type, f"DataType {data_type.name!r}.{member.name}",
                                            data_types_map, seen)
 
+
+def _validate_aoi_parameters_resolve(aoi: "AOI", data_types_map: Dict[str, "DataType"]) -> None:
+    """The `export_aoi()` counterpart to `_validate_data_type_resolves()` --
+    checks an AOI's own `.parameters` declarations resolve. Deliberately
+    does NOT walk `.local_tags` -- this whole AOI-support feature has no
+    constructor support for creating LocalTags at all (out of scope, see
+    CLAUDE.md's AOI support section), so there's nothing this validate pass
+    would ever catch there that a caller could have caused through this
+    library's own API.
+
+    Raises ValueError on the first unresolved type found.
+    """
+    seen: set = set()
+    for param in aoi.parameters:
+        if param.data_type:
+            _validate_type_graph_resolves(param.data_type, f"AOI {aoi.name!r} parameter {param.name!r}",
+                                           data_types_map, seen)
+
+
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
                            data_types_map: Dict[str, "DataType"]) -> str:
     """Return the Decorated XML fragment for a single UDT member.

@@ -11,6 +11,7 @@ from acd.api import (
     ExtractAcdDatabase,
     DumpCompsRecordsToFile,
     diff_lines,
+    export_aoi,
     export_datatype,
     export_routine,
     find_io_addresses,
@@ -34,6 +35,8 @@ from acd.l5x.elements import (
     DataType,
     Member,
     Tag,
+    new_aoi,
+    new_aoi_parameter,
     new_bit_member,
     new_datatype,
     new_member,
@@ -587,6 +590,173 @@ def test_new_routine_result_can_be_populated_with_insert_st_line():
     routine = new_routine("MyRoutine", "ST")
     routine.insert_st_line(0, "X := 1;")
     assert routine._st_lines == ["X := 1;"]
+
+
+def test_new_aoi_is_empty():
+    aoi = new_aoi("MyAOI", description="a test AOI")
+    assert aoi.name == "MyAOI"
+    assert aoi.parameters == []
+    assert aoi.local_tags == []
+    assert aoi.routines == []
+    assert aoi._description == "a test AOI"
+    assert aoi.execute_prescan == "false"
+    assert aoi.execute_postscan == "false"
+    assert aoi.execute_enable_in_false == "false"
+
+
+def test_new_aoi_dates_use_real_iso8601_format():
+    # Regression test: verified against a real Rockwell-authored AOI export
+    # (AOI_SNTP_QUERY) that CreatedDate/EditedDate use ISO-8601 with
+    # milliseconds and a "Z" suffix (e.g. "2014-04-02T15:31:19.017Z") --
+    # NOT the "%a %b %d %H:%M:%S %Y" format this function originally used
+    # (copied from export_date's own convention, which is unrelated).
+    import re
+    aoi = new_aoi("MyAOI")
+    pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"
+    assert re.match(pattern, aoi.created_date)
+    assert re.match(pattern, aoi.edited_date)
+
+
+def test_new_aoi_parameter_input_defaults():
+    p = new_aoi_parameter("In1", "DINT", usage="Input")
+    assert p.name == "In1"
+    assert p.tag_type == "Base"
+    assert p.usage == "Input"
+    assert p.radix == "Decimal"
+    assert p.external_access == "Read/Write"
+    assert p.constant is None
+    assert p.required == "true"
+    assert p.visible == "true"
+    assert p.dimensions is None
+
+
+def test_new_aoi_parameter_inout_omits_external_access():
+    p = new_aoi_parameter("InOut1", "REAL", usage="InOut")
+    assert p.usage == "InOut"
+    assert p.external_access is None
+    assert p.constant == "false"
+
+
+def test_new_aoi_parameter_udt_type_omits_radix():
+    p = new_aoi_parameter("Struct1", "SomeUdt", usage="Input")
+    assert p.radix is None
+
+
+def test_new_aoi_parameter_dimension():
+    p = new_aoi_parameter("Arr1", "DINT", usage="Output", dimension=10)
+    assert p.dimensions == "10"
+
+
+def test_new_aoi_parameter_rejects_invalid_usage():
+    with pytest.raises(ValueError, match="must be 'Input', 'Output', or 'InOut'"):
+        new_aoi_parameter("Bad", "DINT", usage="Local")
+
+
+def test_new_aoi_can_be_populated_with_parameters_and_routine():
+    aoi = new_aoi("MyAOI")
+    aoi.parameters.append(new_aoi_parameter("In1", "DINT", usage="Input"))
+    aoi.parameters.append(new_aoi_parameter("Out1", "DINT", usage="Output"))
+    routine = new_routine("Logic", "RLL")
+    routine.insert_rung(0, "MOV(In1,Out1);")
+    aoi.routines.append(routine)
+
+    assert [p.name for p in aoi.parameters] == ["In1", "Out1"]
+    assert aoi.routines[0].rungs == ["MOV(In1,Out1);"]
+
+
+def test_export_aoi_produces_well_formed_target_xml(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI", description="a test AOI")
+    aoi.parameters.append(new_aoi_parameter("In1", "DINT", usage="Input"))
+    aoi.parameters.append(new_aoi_parameter("Out1", "DINT", usage="Output"))
+    routine = new_routine("Logic", "RLL")
+    routine.insert_rung(0, "MOV(In1,Out1);")
+    aoi.routines.append(routine)
+    project.controller.aois.append(aoi)
+
+    output_path = tmp_path / "aoi_export.L5X"
+    export_aoi(project, aoi, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+
+    minidom.parse(str(output_path))  # raises if not well-formed
+    assert 'TargetType="AddOnInstructionDefinition"' in content
+    assert 'TargetName="MyAOI"' in content
+    assert 'AddOnInstructionDefinition Use="Target" Name="MyAOI"' in content
+    assert "MOV(In1,Out1)" in content
+
+
+def test_export_aoi_wrapper_includes_target_revision_and_last_edited(tmp_path):
+    # Regression test: verified against a real Rockwell-authored AOI export
+    # -- the wrapper's <RSLogix5000Content> carries TargetRevision/
+    # TargetLastEdited (redundant with the AOI element's own Revision/
+    # EditedDate attributes, but ALSO present at the wrapper level), which
+    # this wrapper didn't render at all before that comparison.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    project.controller.aois.append(aoi)
+
+    output_path = tmp_path / "aoi_export.L5X"
+    export_aoi(project, aoi, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+
+    assert f'TargetRevision="{aoi.revision}"' in content
+    assert f'TargetLastEdited="{aoi.edited_date}"' in content
+
+
+def test_export_aoi_includes_dependencies_block_for_target_with_udt_parameter(tmp_path):
+    # Regression test: verified against a real Rockwell-authored AOI export
+    # -- every <AddOnInstructionDefinition> (target AND context) carries its
+    # own <Dependencies> block, which this wrapper didn't render at all
+    # before that comparison.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    udt_name = project.controller.data_types[0].name
+    aoi = new_aoi("MyAOI")
+    aoi.parameters.append(new_aoi_parameter("Struct1", udt_name, usage="Input"))
+    project.controller.aois.append(aoi)
+
+    output_path = tmp_path / "aoi_export.L5X"
+    export_aoi(project, aoi, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+
+    minidom.parse(str(output_path))  # still well-formed
+    assert "<Dependencies>" in content
+    assert f'<Dependency Type="DataType" Name="{udt_name}"/>' in content
+    # The Dependencies block belongs to the TARGET AOI -- right before its
+    # own closing tag, same position as the real Rockwell export.
+    dep_idx = content.index("<Dependencies>")
+    close_idx = content.index("</AddOnInstructionDefinition>")
+    assert dep_idx < close_idx
+    assert content.index("</Dependencies>") < close_idx
+
+
+def test_export_aoi_no_dependencies_block_when_nothing_referenced(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    aoi.parameters.append(new_aoi_parameter("In1", "DINT", usage="Input"))
+    project.controller.aois.append(aoi)
+
+    output_path = tmp_path / "aoi_export.L5X"
+    export_aoi(project, aoi, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+
+    assert "<Dependencies>" not in content
+
+
+def test_export_aoi_raises_if_not_in_project():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("NotAttached")
+    with pytest.raises(ValueError, match="not found in project.controller.aois"):
+        export_aoi(project, aoi, "build/should_not_be_written.L5X")
+
+
+def test_export_aoi_validate_rejects_unresolved_parameter_type():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    aoi.parameters.append(new_aoi_parameter("Bad", "NoSuchUdtType", usage="Input"))
+    project.controller.aois.append(aoi)
+
+    with pytest.raises(ValueError, match="does not resolve"):
+        export_aoi(project, aoi, "build/should_not_be_written.L5X", validate=True)
 
 
 def test_new_tag_primitive_defaults_radix_by_data_type():

@@ -1,4 +1,5 @@
 # Auto-split from the former acd/l5x/elements.py -- see CLAUDE.md's structural-cleanup notes.
+import datetime
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
@@ -699,6 +700,51 @@ class Parameter(L5xElement):
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
+
+def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
+                       dimension: Union[int, None] = None,
+                       description: Union[str, None] = None) -> Parameter:
+    """Construct a new public `Parameter` for insertion into an AOI's own
+    `.parameters` list -- e.g. to add an Input/Output/InOut to a brand-new
+    AOI (see `new_aoi()`) before calling `export_aoi()`.
+
+    `usage` must be `"Input"`, `"Output"`, or `"InOut"`. `radix` is derived
+    from `data_type` the same way `new_tag()` does (`None` for a UDT/AOI-
+    typed parameter, matching every ACD-decoded struct-typed `Parameter`).
+    `external_access`/`constant` follow the same real convention documented
+    on the `Parameter` dataclass itself: Input/Output gets
+    `external_access="Read/Write"`/`constant=None`; InOut gets
+    `external_access=None`/`constant="false"` (the non-MESSAGE-type case --
+    a MESSAGE-typed InOut parameter, which omits `Constant` too, isn't
+    handled specially here, since nothing in this constructor targets that
+    narrow case). `required`/`visible` both default to `"true"`, matching a
+    freshly-created parameter's typical Studio defaults before anyone
+    unchecks either box.
+
+    `dimension`, if given (an `int` > 0), becomes the parameter's array
+    size; `None`/`0` means scalar, matching `Tag.dimensions`' own
+    convention (not `Member.dimension`'s -- there is no `0`-means-scalar
+    ambiguity to guard against here since this only ever produces a plain
+    int-or-None, never a raw stored field).
+    """
+    if usage not in ("Input", "Output", "InOut"):
+        raise ValueError(
+            f"new_aoi_parameter(): usage must be 'Input', 'Output', or 'InOut', not {usage!r}"
+        )
+    radix = _PRIMITIVE_RADIX.get(data_type.upper())
+    if usage == "InOut":
+        external_access = None
+        constant = "false"
+    else:
+        external_access = "Read/Write"
+        constant = None
+    dimensions = str(dimension) if dimension else None
+    return Parameter(
+        name, name, "Base", data_type, usage, radix, "true", "true",
+        external_access, constant, dimensions, _description=description,
+    )
+
+
 @dataclass
 class Module(L5xElement):
     """Represents a Logix hardware module (<Module> in L5X)."""
@@ -1111,6 +1157,66 @@ class AOI(L5xElement):
             note = _multiline_xml_text(self._revision_note)
             inject += f'<RevisionNote>\n<![CDATA[{note}]]>\n</RevisionNote>'
         return base[:idx + 1] + inject + base[idx + 1:]
+
+
+def new_aoi(name: str, description: Union[str, None] = None) -> AOI:
+    """Construct a new, empty `AOI` for insertion into
+    `project.controller.aois` -- e.g. to originate a brand-new Add-On
+    Instruction before populating it with `new_aoi_parameter()` and a logic
+    routine (`new_routine()`/`Routine.insert_rung()`, or `db_new_routine(...,
+    aoi_name=...)`/`db_insert_rung()` at the `db_*` layer).
+
+    Fixed, non-configurable values for everything this constructor doesn't
+    expose a parameter for (`revision="1.0"`, `revision_extension`/`vendor`
+    both `None`, `execute_prescan`/`execute_postscan`/
+    `execute_enable_in_false` all `"false"` -- NOTE: a real, Rockwell-authored
+    AOI (`AOI_SNTP_QUERY`, verified against its own real L5X export AND the
+    real ACD it lives in) has `ExecutePrescan="true"`, so `"false"` is not a
+    universal default, just this constructor's own fixed choice, unrelated
+    to the separate decode-side bug noted below; `created_by`/`edited_by`
+    both `""`, `created_date`/`edited_date` both the current time in the
+    REAL ISO-8601-with-milliseconds format Rockwell itself uses
+    (`"2014-04-02T15:31:19.017Z"`) -- verified directly against that same
+    real AOI's own L5X export (a `"%a %b %d %H:%M:%S %Y"`-style date, this
+    function's own first attempt before that verification, does NOT match) --
+    these are all deliberately out of scope for this constructor (a real
+    caller can still edit the returned object's own fields directly before
+    exporting, same as any other dataclass here). `software_revision` is a
+    generic placeholder ("33.00"), NOT derived from any real project -- this
+    is a pure, context-free constructor the same shape as `new_tag()`/
+    `new_member()`/`new_routine()`, with no project object in scope to pull
+    a real value from.
+
+    Starts with `.parameters`/`.local_tags`/`.routines` all empty. `.local_tags`
+    specifically has no constructor support at all yet (out of scope per the
+    original request this was built for) -- append `LocalTag(...)` objects
+    directly if needed. Also NOT included: the `EnableIn`/`EnableOut` system-
+    defined parameters every real Studio-authored AOI carries automatically
+    (confirmed present on every `<AddOnInstructionDefinition>` in that same
+    real AOI's export, both the target and its own context dependencies) --
+    add them yourself with `new_aoi_parameter()` if you need a structurally
+    complete AOI (`Required="false"`/`Visible="false"`/
+    `ExternalAccess="Read Only"`, neither of which `new_aoi_parameter()`
+    currently supports either -- construct a `Parameter` by hand for these
+    two if it matters for your case).
+
+    NOT independently verified against a real Studio 5000 "Import Add-On
+    Instruction" -- unlike `export_routine()`/`export_datatype()`, which
+    each went through multiple real-import rounds before their own wrapper
+    shapes were trusted, `export_aoi()`'s wrapper (see `acd/api.py`) is
+    built by direct symmetry with those two ALREADY-verified wrappers, plus
+    a structural (not real-import) comparison against one real Rockwell AOI
+    export. Treat this whole feature as structurally plausible, not
+    confirmed, until someone actually tries a real import.
+    """
+    now_dt = datetime.datetime.utcnow()
+    now = now_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now_dt.microsecond // 1000:03d}Z"
+    return AOI(
+        name, name, "1.0", None, None, "false", "false", "false",
+        now, "", now, "", "33.00", [], [], [],
+        _description=description,
+    )
+
 
 @dataclass
 class Program(L5xElement):

@@ -3248,6 +3248,185 @@ exercises the full create-datatype → new_member → `export_datatype()` pipeli
 "confirm it actually reaches the rendered L5X, not just the DB" discipline as `new_routine()`'s own
 equivalent test above).
 
+## AOI creation support — `new_aoi()`/`new_aoi_parameter()`/`export_aoi()`, `db_new_aoi()`/`db_new_aoi_parameter()`/`db_export_aoi()`
+
+A downstream agent flagged the same class of gap as `new_datatype()`/`db_new_datatype()` above, one
+level up: `db_new_member()` needs an existing UDT, `db_new_routine()` needs an existing Program (or
+now, an AOI) — but there was no way to originate an AOI itself at all. Explicitly trimmed down and
+flagged LOW PRIORITY by the agent, with LocalTags, `ExecutePrescan`/`ExecutePostscan`/
+`ExecuteEnableInFalse`, and general read-back all explicitly scoped OUT as non-blocking — the real
+ask was narrow: create an AOI, add parameters, add its logic routine, export it.
+
+**This is a materially bigger lift than `new_routine()`/`new_datatype()` were, for one specific
+reason: those two extended an ALREADY-VERIFIED export mechanism (`export_routine()`/
+`export_datatype()`) to a new creation path.** There was no `export_aoi()` at any layer before this
+— it had to be built from scratch, by direct symmetry with the two already-verified wrappers rather
+than from its own real-import evidence. That distinction is carried through everywhere below,
+including in the code's own docstrings — this is the least-verified corner of the whole `db_*`
+surface, more so than `export_datatype()` was when it first shipped (see its own history above).
+
+**New pure constructors** (`elements/model.py`, mirroring `new_tag()`/`new_member()`/`new_routine()`'s
+shape): `new_aoi(name, description=None) -> AOI` (fixed, non-configurable defaults for everything out
+of scope — `revision="1.0"`, `revision_extension`/`vendor` both `None`, all three execute flags
+`"false"`, `created_by`/`edited_by` both `""`, `created_date`/`edited_date` the current time,
+`software_revision` a generic `"33.00"` placeholder not derived from any real project since this is a
+pure, context-free constructor with no project in scope) and `new_aoi_parameter(name, data_type,
+usage="Input", dimension=None, description=None) -> Parameter` (`usage` must be `"Input"`/`"Output"`/
+`"InOut"`; `radix`/`external_access`/`constant` derived from `data_type`/`usage` per the real
+convention already documented on the `Parameter` dataclass itself — `external_access=None`/
+`constant="false"` for InOut, `external_access="Read/Write"`/`constant=None` otherwise; `required`/
+`visible` both default `"true"`).
+
+**New `export_aoi(project, aoi, output_path, owner=None, validate=False)`** (`acd/api.py`) — the
+missing wrapper. Built by reusing `_resolve_type_closure()` (already handles an AOI's own parameters/
+local_tags as dependency-resolution roots, per its own docstring) and the same `Use="Target"`-
+injection pattern already verified for `<Routine>`/`<DataType>`, wrapped in
+`<AddOnInstructionDefinitions Use="Context">` — the SAME wrapper/placement already independently
+verified for an AOI as a `export_routine()` CONTEXT dependency. The combination — an AOI as the
+TARGET itself, fully rendered inline with its own Parameters/Routines — has never been tried against
+a real Studio 5000 import. New `_validate_aoi_parameters_resolve()` (`rendering.py`, third sibling to
+`_validate_tag_types_resolve()`/`_validate_data_type_resolves()`, sharing the same
+`_validate_type_graph_resolves()` walker) backs `validate=True`, checking `.parameters` only (not
+`.local_tags` — nothing in this feature can create one, so nothing this check would catch there was
+ever caused through this library's own API).
+
+**`ProjectDB`/`db_*` layer** (`project_db.py`) — the part with a real, deliberate architectural
+choice worth explaining:
+
+- **Schema**: new `proj_aois`/`proj_aoi_parameters` tables. `proj_routines` gained a nullable
+  `aoi_id` column alongside the now-also-nullable `program_id`, with a `CHECK ((program_id IS NULL)
+  != (aoi_id IS NULL))` enforcing exactly one owner. Uniqueness is TWO separate PARTIAL indexes
+  (`... WHERE program_id IS NOT NULL` / `... WHERE aoi_id IS NOT NULL`), not one combined
+  `UNIQUE(program_id, aoi_id, name)` — a combined index would never actually catch a same-AOI
+  name collision, since SQLite treats every NULL as distinct from every other NULL and the
+  always-NULL `program_id` column (for an AOI-owned routine) would make every row look unique
+  regardless of `aoi_id`/name matching. This is the exact same pitfall `proj_programs`' own `id=0`
+  sentinel row (for controller-scope tags) was already built to avoid — documented in this module's
+  own "Design points" — just solved differently here (a partial index instead of a sentinel row,
+  since there's no natural "AOI scope" analog to controller scope to reserve one for).
+- **`proj_aois` holds ONLY brand-new AOIs, NEVER a real project's own pre-existing ones** — a
+  deliberate scope boundary, not an oversight, and the one place this feature diverges from every
+  other `proj_*` table's "materializes the whole real project" convention. Reason: a real AOI's own
+  LocalTags aren't persisted anywhere in this schema at all (out of scope per the original request).
+  If `_materialize()` walked `project.controller.aois` into `proj_aois` the way it already does for
+  every DataType/Tag/Routine/Program, rehydrating a real AOI through this table would silently DROP
+  its real LocalTags on every single `to_controller()` call — corrupting real project data for
+  something nobody asked to edit. Verified this risk is real and the fix actually prevents it: `
+  test_new_aoi_never_touches_real_pre_existing_aoi` (`test/test_project_db.py`, against the
+  `ACDTestsWithAOI.ACD` fixture's own real AOI) confirms a real AOI's `LocalTags` count is IDENTICAL
+  before and after creating an unrelated new AOI via `db_new_aoi()`.
+  - Consequence: `to_controller()` now does `controller.aois = controller.aois + self._load_aois()`
+    — APPENDS `proj_aois` content onto the real, freshly-`ControllerBuilder`-decoded list, never
+    replaces it (unlike `.data_types`/`.tags`/`.programs`, which ARE fully replaced from `proj_*`).
+  - Consequence: `db_new_aoi_parameter()`/`db_new_routine(..., aoi_name=...)` only ever resolve
+    against `proj_aois` — they raise `KeyError` for a real project's own pre-existing AOI name, even
+    though `db_export_aoi()` can still export one of those directly (untouched, or after mutating it
+    via `db_to_controller()` — that path was never broken, since it doesn't go through `proj_aois`
+    at all).
+- **`_routine_id()`'s existing "search everywhere" fallback (`program_name=None`) now also searches
+  AOI-owned routines** via an added `LEFT JOIN proj_aois`, rather than giving every routine method
+  (`insert_rung`, `delete_rung`, `replace_rung_safe`, `set_rung_comment`, `insert_st_line`,
+  `delete_st_line`, `replace_st_line_safe`, `delete_routine`, `export_routine`, `get_routine`) its
+  own new `aoi_name=` parameter — all of them transparently gained AOI-routine support for free
+  through this one shared helper. Trade-off, stated plainly: there is still no `aoi_name=`
+  disambiguation parameter on any of them (unlike `program_name=`) — if a routine name collides
+  between two AOIs, or an AOI and a program, the error names every scope the match was found in, but
+  the caller's only recourse is renaming one of them. Judged an acceptable gap for a routine name
+  that's usually distinctive in practice, not worth a signature change across eight methods for a
+  v1, explicitly-low-priority feature.
+- `new_routine()`/`db_new_routine()` signatures changed: `program_name` is no longer a required
+  positional with no default — it's now `Union[str, None] = None`, and EXACTLY ONE of
+  `program_name`/`aoi_name` must be given (raises `ValueError` naming both if neither or both are).
+  Backward compatible for existing positional callers (`db_new_routine(path, name, type,
+  "MyProgram")` still works unchanged) — only a caller passing `program_name=None` explicitly (same
+  as omitting it) sees a reworded error message, since "no scope given at all" is now indistinguishable
+  from "you meant to pass one and typo'd `None`".
+
+Covered by `test_new_aoi_is_empty`/`test_new_aoi_parameter_input_defaults`/
+`test_new_aoi_parameter_inout_omits_external_access`/`test_new_aoi_parameter_udt_type_omits_radix`/
+`test_new_aoi_parameter_dimension`/`test_new_aoi_parameter_rejects_invalid_usage`/
+`test_new_aoi_can_be_populated_with_parameters_and_routine`/
+`test_export_aoi_produces_well_formed_target_xml`/`test_export_aoi_raises_if_not_in_project`/
+`test_export_aoi_validate_rejects_unresolved_parameter_type` (`test/test_api.py`, the pure layer) and
+`test_new_aoi_creates_empty_aoi`/`test_new_aoi_can_be_populated_with_parameters_and_routine`/
+`test_new_aoi_parameter_missing_aoi_raises_key_error`/`test_new_aoi_duplicate_name_raises`/
+`test_new_routine_requires_exactly_one_of_program_or_aoi`/
+`test_new_aoi_never_touches_real_pre_existing_aoi`/`test_db_new_aoi_stateless_wrappers_and_export`
+(`test/test_project_db.py`, the SQL-backed layer, the last one again exercising the full
+create → populate → export pipeline end-to-end against the rendered L5X, not just the DB).
+
+### Real-ground-truth verification round — a genuine Rockwell AOI export, plus a real project that has it
+
+The user supplied a real, Rockwell-authored AOI L5X export (`AOI_SNTP_QUERY`, a fairly complex sample
+instruction with 20 parameters, 13 local tags, 2 routines, and its own DataType/AOI dependencies) —
+AND mentioned the exact same AOI exists, unmodified, in a real project already used elsewhere in this
+file's history. This allowed BOTH a structural comparison of the wrapper shape (the export file) AND
+a load-the-real-ACD-and-re-export-through-this-library comparison against that same ground truth
+(`created_date`/`edited_date` matched to the millisecond between the two, confirming genuinely the
+same, unedited AOI) — the strongest verification available without an actual Studio 5000 import.
+
+**Confirmed correct, no changes needed**: `Use="Target"` placement and attribute order on
+`<AddOnInstructionDefinition>`, the `<Description>`/`<RevisionNote>`/`<Parameters>` child order, the
+top-level `<DataTypes>` → `<AddOnInstructionDefinitions>` section order, and the `ExportOptions=`
+string all matched exactly.
+
+**Two real gaps found and fixed**, both low-risk and mechanically verified against the real file:
+1. `new_aoi()`'s `created_date`/`edited_date` used `"%a %b %d %H:%M:%S %Y"` (copied from
+   `export_date`'s own unrelated convention) — Rockwell's real format is ISO-8601 with milliseconds
+   and a `Z` suffix (`"2014-04-02T15:31:19.017Z"`), confirmed via `AoiBuilder`'s own EXISTING decode
+   (which already reads this correctly from real ACDs) matching the ground-truth file's own dates
+   exactly. Fixed to generate the same format.
+2. Every real `<AddOnInstructionDefinition>` (the target AND every context dependency) carries its
+   own `<Dependencies>` child listing `<Dependency Type="DataType"/"AddOnInstructionDefinition"
+   Name="..."/>` entries, positioned right before the closing tag — `export_aoi()`'s wrapper never
+   rendered this at all. Added `_inject_aoi_dependencies_xml()` (`acd/api.py`, same
+   "post-process the rendered XML string" pattern as `_inject_use_attr()`), wired in for the TARGET
+   AOI only (a context AOI's own `<Dependencies>` isn't rendered — `AOI.to_xml()` has no data for it
+   without externally-computed closure info, and this hasn't been tested either way). Best-effort,
+   not exact: lists the FULL resolved dependency closure, not precisely limited to this one AOI's own
+   DIRECT dependencies the way Rockwell's own export is (`_resolve_type_closure()` doesn't track
+   per-node direct edges at that granularity) — over-including a few transitively-reachable names is
+   judged safer than omitting a real one.
+3. Also added `TargetRevision`/`TargetLastEdited` to the wrapper's own `<RSLogix5000Content>`
+   attributes (redundant with the AOI element's own `Revision`/`EditedDate`, but present at the
+   wrapper level too in the real file) — a small, low-risk addition alongside the other two.
+
+**A separate, real, CONFIRMED bug found in the EXISTING decode path (`AoiBuilder.build()`), unrelated
+to this session's AOI-creation feature — left un-fixed, deliberately, pending more data.**
+`execute_prescan`/`execute_postscan`/`execute_enable_in_false` are hardcoded to `"false", "false",
+"false"` in `AoiBuilder.build()`'s own `return AOI(...)` call — never actually read from the real ACD
+binary at all. The real `AOI_SNTP_QUERY` has `ExecutePrescan="true"` (a real, load-bearing setting,
+not incidental) — confirmed genuinely the same AOI via the matching millisecond-precision
+`created_date`/`edited_date` described above, ruling out "it's just a different/edited copy" as an
+explanation. **Not fixed in this pass**: finding the real byte offset/bit for these three flags would
+need reverse-engineering against MULTIPLE real samples with different True/False combinations (the
+same rigor this file's own "Connection Type / RPI" and "BIT-overlay member Target resolution"
+investigations required) — only ONE real data point is available so far (Prescan=true,
+Postscan=false, EnableInFalse=false), nowhere near enough to safely triangulate an offset without
+risking a wrong guess that looks plausible but isn't (the exact mistake this file has been burned by
+more than once — see its own repeated "don't guess a fix without real data" lesson). Revisit with
+more real AOI samples if this becomes a real blocker.
+
+**Known, NOT-yet-addressed gaps this same comparison surfaced, still open** (both now confirmed real,
+not speculative, but genuinely out of scope for this pass):
+- A real Studio-authored AOI always carries `EnableIn`/`EnableOut` system-defined parameters
+  (`Required="false"`, `Visible="false"`, `ExternalAccess="Read Only"` — none of which
+  `new_aoi_parameter()` currently supports, since it always hardcodes `Required`/`Visible` to
+  `"true"`) — `new_aoi()` doesn't add these automatically. A caller wanting a structurally-complete
+  AOI needs to construct these two `Parameter` objects by hand.
+- An AOI's own logic can reference a GSV/SSV system object (`AOI_SNTP_QUERY` does this via
+  `GSV(WallClockTime,,DateTime,...)`/`SSV(WallClockTime,,DateTime,...)`, reading/setting the
+  controller's own wall-clock time) — a real dependency class Rockwell's own export handles (a bare
+  `<WallClockTime Use="Reference">` element, sibling to `<AddOnInstructionDefinitions>`, not wrapped
+  in a `<Modules Use="Context">` container the way a real hardware Module reference is) that this
+  wrapper's dependency resolution has no concept of at all — only `.parameters`/`.local_tags` data
+  types are walked, never a routine's own instruction text for system-object references.
+
+Covered by `test_new_aoi_dates_use_real_iso8601_format`,
+`test_export_aoi_wrapper_includes_target_revision_and_last_edited`,
+`test_export_aoi_includes_dependencies_block_for_target_with_udt_parameter`, and
+`test_export_aoi_no_dependencies_block_when_nothing_referenced` (`test/test_api.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

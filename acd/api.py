@@ -25,6 +25,7 @@ from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
 from acd.l5x.elements import (
+    AOI,
     DataType,
     DumpCompsRecords,
     Member,
@@ -34,6 +35,7 @@ from acd.l5x.elements import (
     _multiline_xml_text,
     _validate_tag_types_resolve,
     _validate_data_type_resolves,
+    _validate_aoi_parameters_resolve,
     _validate_rll_rung_syntax,
     new_member,
 )
@@ -855,6 +857,46 @@ def _inject_use_attr(xml_str: str, element_name: str, use_value: str) -> str:
     return xml_str[:insert_at] + f'Use="{use_value}" ' + xml_str[insert_at:]
 
 
+def _inject_aoi_dependencies_xml(aoi_xml: str, data_types: List[DataType], aois: List[AOI]) -> str:
+    """Insert a `<Dependencies>` block just before `</AddOnInstructionDefinition>`,
+    listing `data_types`/`aois` as `<Dependency Type="DataType"/"AddOnInstructionDefinition"
+    Name="..."/>` entries.
+
+    Verified this element is real, not a guess: a real, Rockwell-authored AOI
+    export (`AOI_SNTP_QUERY`) carries a `<Dependencies>` child on EVERY
+    `<AddOnInstructionDefinition>` in the file, including ones present only
+    as Context dependencies, not just the Target -- e.g. `AOI_TIME_ADD`
+    (itself only a dependency of the real target) has its own `<Dependencies>`
+    listing `DateTime`. This function only ever gets called for the TARGET
+    AOI, though (see `export_aoi()`) -- a context AOI's own `<Dependencies>`
+    isn't rendered, since `AOI.to_xml()` has no data for it without this same
+    externally-computed closure, and Studio very likely doesn't need a
+    Context-only AOI's own transitive dependencies spelled out (nothing here
+    has been tested against a real import either way).
+
+    Best-effort, not exact: `data_types`/`aois` here is the FULL resolved
+    closure already computed for the wrapper's own `<DataTypes Use="Context">`/
+    `<AddOnInstructionDefinitions Use="Context">` sections -- not precisely
+    limited to this ONE AOI's own DIRECT dependencies the way Rockwell's own
+    export is (`_resolve_type_closure()` doesn't track per-node direct edges
+    at that granularity). Listing a few transitively-reachable names that
+    Rockwell's own export wouldn't have is judged a safer failure mode than
+    omitting a real one.
+    """
+    if not data_types and not aois:
+        return aoi_xml
+    deps_xml = "".join(
+        f'<Dependency Type="DataType" Name="{_escape_xml_attr(dt.name)}"/>\n' for dt in data_types
+    )
+    deps_xml += "".join(
+        f'<Dependency Type="AddOnInstructionDefinition" Name="{_escape_xml_attr(a.name)}"/>\n'
+        for a in aois
+    )
+    block = f'<Dependencies>\n{deps_xml}</Dependencies>\n'
+    idx = aoi_xml.rindex("</AddOnInstructionDefinition>")
+    return aoi_xml[:idx] + block + aoi_xml[idx:]
+
+
 _TAG_TOKEN_RE = None  # compiled lazily to avoid importing re at module load if unused
 
 
@@ -1510,6 +1552,145 @@ def export_datatype(project: RSLogix5000Content, data_type: DataType, output_pat
         f'ExportOptions="{export_options}">\n'
         f'<Controller Use="Context" Name="{_escape_xml_attr(controller_name)}">\n'
         f'<DataTypes Use="Context">\n{data_types_xml}\n</DataTypes>\n'
+        f'</Controller>\n'
+        f'</RSLogix5000Content>\n'
+    )
+
+    Path(output_path).write_text(xml, encoding="utf-8")
+
+
+def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
+                owner: str = None, validate: bool = False) -> None:
+    """Export a single Add-On Instruction as a standalone, partial L5X file,
+    for Studio 5000's native "Import Add-On Instruction..." command --
+    the same "native-import escape hatch" strategy as `export_routine()`/
+    `export_datatype()`, sidestepping raw-binary `save_acd()`/`patch_rungs()`
+    limitations for the case of creating or extending an AOI.
+
+    To **create** a brand-new AOI: construct one with `new_aoi()`, append it
+    to `project.controller.aois`, add parameters with `new_aoi_parameter()`
+    (append to `aoi.parameters`) and a logic routine with `new_routine()`
+    (append to `aoi.routines`, then `Routine.insert_rung()`/`insert_st_line()`
+    to populate it) -- then export it. To **modify** an existing AOI: get it
+    from `project.controller.aois`, mutate `.parameters`/`.routines` in
+    place, then export the same way -- no special-casing needed, matching
+    the same pattern already proven for tags/UDTs/routines (see CLAUDE.md).
+
+    Any DataType/AOI this one depends on (a parameter typed as a project UDT
+    or another AOI, transitively) is automatically included as additional
+    context via `_resolve_type_closure()` -- the same dependency-resolution
+    logic already used for `export_routine()`'s/`export_datatype()`'s own
+    context sections. `.local_tags` are walked for this same dependency
+    resolution (their own data types can pull in a UDT/AOI dependency too),
+    but this library has no constructor support for CREATING a LocalTag at
+    all (`new_aoi()` always starts `.local_tags` empty) -- append `LocalTag(...)`
+    objects directly if you need one, the same way you'd construct any other
+    dataclass here by hand.
+
+    CAUTION -- structurally compared against one real Rockwell-authored AOI
+    export (`AOI_SNTP_QUERY`, a fairly complex sample AOI), but still NEVER
+    tried against a real Studio 5000 IMPORT. That comparison confirmed the
+    wrapper attributes (including `TargetRevision`/`TargetLastEdited`,
+    `ExportOptions`), the `Use="Target"` placement/attribute order on
+    `<AddOnInstructionDefinition>`, the `<Description>`/`<RevisionNote>`/
+    `<Parameters>` child order, and the `<DataTypes>`/
+    `<AddOnInstructionDefinitions>` top-level section order all match --
+    and found (and fixed) two real gaps: `new_aoi()`'s date format didn't
+    match Rockwell's own ISO-8601-with-milliseconds convention, and every
+    real `<AddOnInstructionDefinition>` (target AND context) carries its own
+    `<Dependencies>` block, which this wrapper didn't render at all before.
+    Known, NOT-yet-addressed gaps that same comparison surfaced (see
+    CLAUDE.md's AOI support section for the full detail): a real
+    Studio-authored AOI always carries `EnableIn`/`EnableOut` system-defined
+    parameters that `new_aoi()` doesn't add; an AOI's own logic can reference
+    a GSV/SSV system object (e.g. `WallClockTime`) as a bare
+    `<WallClockTime Use="Reference">` sibling of `<AddOnInstructionDefinitions>`,
+    a dependency class this wrapper's own resolution has no concept of at
+    all (only `.parameters`/`.local_tags` data types are resolved, not
+    system-object references inside routine logic). Test on a COPY of your
+    project first, and expect this may still need real-import-driven
+    adjustment the same way `export_routine()` did (see CLAUDE.md's
+    "Partial/context L5X exports" section for how many rounds that took).
+
+    Args:
+        project: The loaded project (from `load_acd()`/`to_controller()`)
+            that owns `aoi` (or that you've just appended a brand-new `aoi`
+            to).
+        aoi: The AOI to export -- must already be an element of
+            `project.controller.aois`.
+        output_path: Destination `.L5X` file path.
+        owner: Optional "Owner" attribute value, as in `export_routine()`.
+        validate: Before writing, verify every struct-typed name reachable
+            from `aoi.parameters`' own declared types actually resolves
+            (`_validate_aoi_parameters_resolve()`) -- does NOT check
+            `.local_tags` (see above). Off by default.
+
+    Raises:
+        ValueError: if `aoi` isn't in `project.controller.aois`, or (if
+            `validate=True`) if a parameter's type doesn't resolve.
+    """
+    import datetime
+
+    if not any(a is aoi for a in (project.controller.aois or [])):
+        raise ValueError(
+            "aoi not found in project.controller.aois -- append it there first "
+            "(for a brand-new AOI) or pass the same AOI object obtained from "
+            "project.controller.aois"
+        )
+
+    _sync_data_types_map(project)
+
+    if validate:
+        _validate_aoi_parameters_resolve(aoi, project.controller._data_types_map)
+
+    referenced_type_names = set()
+    for p in aoi.parameters:
+        if p.data_type:
+            referenced_type_names.add(p.data_type.upper())
+    for lt in aoi.local_tags:
+        if lt.data_type:
+            referenced_type_names.add(lt.data_type.upper())
+
+    referenced_data_types, referenced_aois = _resolve_type_closure(referenced_type_names, project)
+    # aoi is the TARGET, never its own "Context" dependency, even if it
+    # somehow ended up in the resolved closure (e.g. a LocalTag typed as
+    # itself, which Logix disallows anyway, but guarded defensively).
+    referenced_aois = [a for a in referenced_aois if a is not aoi]
+
+    controller_name = project.controller.name
+    export_date = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    export_options = (
+        "References NoRawData L5KData DecoratedData Context Dependencies "
+        "ForceProtectedEncoding AllProjDocTrans"
+    )
+
+    data_types_xml = "".join(dt.to_xml() for dt in referenced_data_types)
+    context_aois_xml = "".join(a.to_xml() for a in referenced_aois)
+    # Same Use= rule already verified for export_routine()'s <Tag>/<Routine>
+    # and export_datatype()'s <DataType>: only the element actually being
+    # targeted carries Use="Target"; every other AOI in this wrapper is a
+    # plain Context dependency with no Use= of its own.
+    aoi_xml = _inject_use_attr(aoi.to_xml(), "AddOnInstructionDefinition", "Target")
+    # Verified against a real Rockwell AOI export -- see
+    # _inject_aoi_dependencies_xml()'s own docstring.
+    aoi_xml = _inject_aoi_dependencies_xml(aoi_xml, referenced_data_types, referenced_aois)
+
+    owner_attr = f' Owner="{_escape_xml_attr(owner)}"' if owner else ""
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        f'<RSLogix5000Content SchemaRevision="{project.schema_revision}" '
+        f'SoftwareRevision="{project.software_revision}" '
+        f'TargetName="{_escape_xml_attr(aoi.name)}" '
+        f'TargetType="AddOnInstructionDefinition" '
+        f'TargetRevision="{_escape_xml_attr(aoi.revision)}" '
+        f'TargetLastEdited="{_escape_xml_attr(aoi.edited_date)}"'
+        f'{owner_attr} ContainsContext="true" ExportDate="{export_date}" '
+        f'ExportOptions="{export_options}">\n'
+        f'<Controller Use="Context" Name="{_escape_xml_attr(controller_name)}">\n'
+        f'<DataTypes Use="Context">\n{data_types_xml}\n</DataTypes>\n'
+        f'<AddOnInstructionDefinitions Use="Context">\n{context_aois_xml}{aoi_xml}\n'
+        f'</AddOnInstructionDefinitions>\n'
         f'</Controller>\n'
         f'</RSLogix5000Content>\n'
     )

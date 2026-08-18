@@ -97,12 +97,30 @@ EDITS -- durable the moment the call returns (see above), each raising
     member, or creating a new one) -- previously committed with no error
     but with no `target`/`bit_number` at all, only failing a real Studio
     "Import Data Type..." on `Target` several steps later.
-  - `db_new_routine(acd_path, routine_name, routine_type, program_name,
-    description=None)` -- create a new, empty routine (`routine_type`
-    `"RLL"` or `"ST"`) in an EXISTING program. Unlike `db_new_tag()`,
-    `program_name` is REQUIRED (no controller-scope routine concept to
-    default to). Use `db_insert_rung()`/`db_insert_st_line()` afterward to
-    populate it.
+  - `db_new_aoi(acd_path, name, description=None)` -- create a new, empty
+    Add-On Instruction. Use `db_new_aoi_parameter()` to add
+    Input/Output/InOut parameters and `db_new_routine(..., aoi_name=name)`
+    for its logic routine. **v1 scope limit**: only newly-created AOIs are
+    addressable through this table at all -- a real project's own
+    pre-existing AOIs are never edited through it (though `db_export_aoi()`
+    can still export one of THOSE directly, unmodified or after you mutate
+    it via `db_to_controller()`). LocalTags, `ExecutePrescan`/
+    `ExecutePostscan`/`ExecuteEnableInFalse`, and read-back beyond
+    `db_get_project_summary()`'s own AOI name list are all explicitly out
+    of scope for this v1 pass.
+  - `db_new_aoi_parameter(acd_path, aoi_name, name, data_type,
+    usage="Input", dimension=None, description=None, index=None)` -- add a
+    public parameter to an AOI created via `db_new_aoi()` (RAISES if
+    `aoi_name` is a real project AOI this table doesn't know about --
+    same v1 scope limit as `db_new_aoi()` itself). `usage` is `"Input"`,
+    `"Output"`, or `"InOut"`.
+  - `db_new_routine(acd_path, routine_name, routine_type,
+    program_name=None, description=None, aoi_name=None)` -- create a new,
+    empty routine (`routine_type` `"RLL"` or `"ST"`) in an EXISTING program
+    OR an AOI created via `db_new_aoi()`. EXACTLY ONE of
+    `program_name`/`aoi_name` is required (unlike `db_new_tag()`, there is
+    no controller-scope routine concept to default to for either). Use
+    `db_insert_rung()`/`db_insert_st_line()` afterward to populate it.
   - `db_insert_rung(acd_path, routine_name, index, text, comment=None,
     program_name=None)` / `db_delete_rung(acd_path, routine_name, index,
     program_name=None)` -- RLL ONLY, raises `ValueError` if the routine's
@@ -176,8 +194,8 @@ its own separate connection and would deadlock trying to acquire the same
 project lock this transaction is already holding.
 
 EXPORTING TO REAL STUDIO 5000 -- the only durable write path (see above).
-`validate` defaults to `True` on BOTH functions below -- both checks it
-runs are cheap relative to a full edit -> export -> Studio-import round
+`validate` defaults to `True` on ALL THREE functions below -- every check
+they run is cheap relative to a full edit -> export -> Studio-import round
 trip, and the failure modes they catch (a struct-typed name that doesn't
 resolve, silently rendered as a bare zero instead of a real nested
 structure; for `db_export_routine`, malformed RLL rung syntax -- see
@@ -196,6 +214,16 @@ explicitly if you're confident it's unnecessary and want to skip the pass:
     Type..." feature, for creating/modifying a UDT (e.g. inserting a
     member via `db_new_member()` first). Validates every struct-typed
     member of `data_type_name` itself.
+  - `db_export_aoi(acd_path, aoi_name, output_path, owner=None,
+    validate=True)` -- a standalone partial L5X for Studio's "Import Add-On
+    Instruction..." feature, for creating/modifying an AOI (`db_new_aoi()`/
+    `db_new_aoi_parameter()`/`db_new_routine(..., aoi_name=...)` first).
+    Validates every struct-typed parameter of `aoi_name` itself (NOT its
+    LocalTags -- out of scope, see `db_new_aoi()`). **CAUTION, more so than
+    the other two**: this wrapper's shape has never been tried against a
+    real Studio 5000 import at all (built by symmetry with the other two
+    ALREADY-verified wrappers, not from its own real-import evidence) --
+    test on a copy of your project first.
 
 COMPARING TWO PROJECTS/SAVES/ROUTINES -- READ THIS BEFORE WRITING YOUR OWN
 COMPARISON CODE. Do NOT fetch two routines via `db_get_routine()` and
@@ -253,6 +281,8 @@ from acd.l5x.project_db import (  # noqa: F401
     db_set_tag_comment,
     db_new_datatype,
     db_new_member,
+    db_new_aoi,
+    db_new_aoi_parameter,
     db_new_routine,
     db_insert_rung,
     db_delete_rung,
@@ -266,6 +296,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_delete_member,
     db_export_routine,
     db_export_datatype,
+    db_export_aoi,
     db_list_tags,
     db_list_routines,
     db_tag_exists,

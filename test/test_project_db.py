@@ -14,6 +14,7 @@ from acd import (
     db_diff_io_addresses,
     db_diff_project,
     db_diff_routine,
+    db_export_aoi,
     db_export_datatype,
     db_export_routine,
     db_find_tag_references,
@@ -24,6 +25,8 @@ from acd import (
     db_insert_st_line,
     db_io_addresses_by_routine,
     db_list_routines,
+    db_new_aoi,
+    db_new_aoi_parameter,
     db_new_datatype,
     db_new_member,
     db_new_routine,
@@ -60,6 +63,17 @@ def st_acd_copy(tmp_path):
     """
     dst = tmp_path / "ACDTestsNonRedundant.ACD"
     shutil.copy(os.path.join("..", "resources", "ACDTestsNonRedundant.ACD"), dst)
+    return dst
+
+
+@pytest.fixture
+def aoi_acd_copy(tmp_path):
+    """A private copy of a fixture ACD that has a real, pre-existing AOI
+    (with real LocalTags) -- for confirming new_aoi()/db_new_aoi() never
+    touches/replaces a real project's own AOIs, only appends alongside them.
+    """
+    dst = tmp_path / "ACDTestsWithAOI.ACD"
+    shutil.copy(os.path.join("..", "resources", "ACDTestsWithAOI.ACD"), dst)
     return dst
 
 
@@ -612,9 +626,13 @@ def test_new_routine_st_can_be_populated_and_read_back(acd_copy):
 
 
 def test_new_routine_requires_program_name(acd_copy):
+    # program_name=None with no aoi_name given either is the same "neither
+    # scope given" case as test_new_routine_requires_exactly_one_of_program_or_aoi
+    # -- kept as its own test since this is the exact call shape a caller
+    # migrating from the pre-AOI-support signature would still write.
     db = open_project_db(str(acd_copy), verbose=False)
     try:
-        with pytest.raises(ValueError, match="program_name is required"):
+        with pytest.raises(ValueError, match="exactly one of program_name/aoi_name"):
             db.new_routine("PDB_NEW_ROUTINE", "RLL", None)
     finally:
         db.close()
@@ -667,6 +685,113 @@ def test_db_new_routine_stateless_wrapper_and_export(acd_copy, tmp_path):
     content = output_path.read_text(encoding="utf-8")
     assert 'Name="PDB_NEW_ROUTINE"' in content
     assert "OTE(Always_Off)" in content
+
+
+def test_new_aoi_creates_empty_aoi(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI", description="a test AOI")
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+        assert aoi.parameters == []
+        assert aoi.routines == []
+        assert aoi._description == "a test AOI"
+    finally:
+        db.close()
+
+
+def test_new_aoi_can_be_populated_with_parameters_and_routine(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_aoi_parameter("PDB_NEW_AOI", "In1", "DINT", usage="Input")
+        db.new_aoi_parameter("PDB_NEW_AOI", "Out1", "DINT", usage="Output")
+        db.new_routine("PDB_AOI_LOGIC", "RLL", aoi_name="PDB_NEW_AOI")
+        db.insert_rung("PDB_AOI_LOGIC", 0, "MOV(In1,Out1);", program_name=None)
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+        assert [p.name for p in aoi.parameters] == ["In1", "Out1"]
+        assert len(aoi.routines) == 1
+        assert aoi.routines[0].name == "PDB_AOI_LOGIC"
+        assert aoi.routines[0].rungs == ["MOV(In1,Out1);"]
+    finally:
+        db.close()
+
+
+def test_new_aoi_parameter_missing_aoi_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.new_aoi_parameter("NO_SUCH_AOI", "In1", "DINT")
+    finally:
+        db.close()
+
+
+def test_new_aoi_duplicate_name_raises(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        with pytest.raises(sqlite3.IntegrityError):
+            db.new_aoi("PDB_NEW_AOI")
+    finally:
+        db.close()
+
+
+def test_new_routine_requires_exactly_one_of_program_or_aoi(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        program_name = project.controller.programs[0].name
+        db.new_aoi("PDB_NEW_AOI")
+
+        with pytest.raises(ValueError, match="exactly one"):
+            db.new_routine("BAD1", "RLL")
+        with pytest.raises(ValueError, match="exactly one"):
+            db.new_routine("BAD2", "RLL", program_name=program_name, aoi_name="PDB_NEW_AOI")
+    finally:
+        db.close()
+
+
+def test_new_aoi_never_touches_real_pre_existing_aoi(aoi_acd_copy):
+    # Regression/design-confirmation test: proj_aois holds ONLY brand-new
+    # AOIs, never a real project's own -- confirms to_controller() APPENDS
+    # rather than replacing .aois, so a real AOI's own LocalTags (never
+    # persisted through proj_aois at all) survive rehydration untouched.
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    real_aoi_names = {a.name for a in reference.controller.aois}
+    assert real_aoi_names, "fixture should have at least one real AOI"
+    real_local_tag_counts = {a.name: len(a.local_tags) for a in reference.controller.aois}
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+
+        project = db.to_controller()
+        all_names = {a.name for a in project.controller.aois}
+        assert real_aoi_names <= all_names
+        assert "PDB_NEW_AOI" in all_names
+        for a in project.controller.aois:
+            if a.name in real_local_tag_counts:
+                assert len(a.local_tags) == real_local_tag_counts[a.name]
+    finally:
+        db.close()
+
+
+def test_db_new_aoi_stateless_wrappers_and_export(acd_copy, tmp_path):
+    db_new_aoi(str(acd_copy), "PDB_NEW_AOI", description="a test AOI")
+    db_new_aoi_parameter(str(acd_copy), "PDB_NEW_AOI", "In1", "DINT", usage="Input")
+    db_new_aoi_parameter(str(acd_copy), "PDB_NEW_AOI", "Out1", "DINT", usage="Output")
+    db_new_routine(str(acd_copy), "PDB_AOI_LOGIC", "RLL", aoi_name="PDB_NEW_AOI")
+    db_insert_rung(str(acd_copy), "PDB_AOI_LOGIC", 0, "MOV(In1,Out1);", program_name=None)
+
+    output_path = tmp_path / "new_aoi.L5X"
+    db_export_aoi(str(acd_copy), "PDB_NEW_AOI", str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'TargetName="PDB_NEW_AOI"' in content
+    assert 'Name="In1"' in content
+    assert "MOV(In1,Out1)" in content
 
 
 def _first_routine(db):

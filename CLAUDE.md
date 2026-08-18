@@ -3642,6 +3642,40 @@ ONE object survives per name and it's the fresh one) and
 confirming the rendered L5X reflects the fresh parameter, not the real fixture AOI's own) —
 `test/test_project_db.py`.
 
+### AOI `Input`/`Output` parameters can never be arrays — only `InOut` can
+
+The next real Studio 5000 import attempt on the same real AOI (`Lug_Advance`, now past the
+stale-parameter fix above) failed on a different, previously-unencoded Rockwell constraint:
+```
+Error: Line 22: Invalid array. Input or output parameter must be of supported elementary data
+type with no dimensions.
+    RSLogix5000Content/Controller/AddOnInstructionDefinitions/AddOnInstructionDefinition[@Name="Lug_Advance"]/Parameters/Parameter[@Name="StaticTP"]
+```
+An AOI parameter declared `Usage="Input"`/`"Output"` (passed by value/copied) may ONLY be a scalar
+elementary type — Rockwell rejects an array outright, unlike `Usage="InOut"` (passed by reference),
+which may be an array. Neither `new_aoi_parameter()` nor `db_new_aoi_parameter()` (nor `export_aoi()`
+itself) had ever checked this — an Input/Output parameter with a `dimension` simply rendered as-is,
+looking structurally fine right up until a real Studio import.
+
+Fixed at three layers, mirroring the reserved-routine-name fix above exactly:
+- `new_aoi_parameter()` (`acd/l5x/elements/model.py`) raises `ValueError` immediately if `dimension`
+  is given with any `usage` other than `"InOut"` — catches the mistake at construction time. This
+  required fixing an existing test (`test_new_aoi_parameter_dimension`) that had been exercising
+  exactly this now-invalid combination (`usage="Output", dimension=10`) since it was first written —
+  nobody had checked it against real Rockwell rules before this report.
+- `ProjectDB.new_aoi_parameter()`/`db_new_aoi_parameter()` inherit the same guard for free, since both
+  call the same underlying constructor.
+- `export_aoi()` (`acd/api.py`) checks every parameter in `aoi.parameters` unconditionally (not gated
+  by `validate=`, same reasoning as the routine-name check: this is a certainty to fail import, not a
+  "might be a problem" risk) — defense-in-depth for a caller who hand-constructs a `Parameter` object
+  directly rather than going through `new_aoi_parameter()`.
+
+Covered by `test_new_aoi_parameter_rejects_array_input`, `test_new_aoi_parameter_rejects_array_output`,
+`test_new_aoi_parameter_scalar_input_output_still_allowed`,
+`test_export_aoi_rejects_array_input_output_parameter` (the defense-in-depth layer, via a
+hand-constructed `Parameter`), and `test_export_aoi_accepts_array_inout_parameter` (confirms `InOut`
+arrays are still allowed, not accidentally banned entirely) — `test/test_api.py`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

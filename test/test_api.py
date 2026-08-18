@@ -34,6 +34,7 @@ from acd.api import (
 from acd.l5x.elements import (
     DataType,
     Member,
+    Parameter,
     Tag,
     new_aoi,
     new_aoi_enable_parameters,
@@ -645,13 +646,36 @@ def test_new_aoi_parameter_udt_type_omits_radix():
 
 
 def test_new_aoi_parameter_dimension():
-    p = new_aoi_parameter("Arr1", "DINT", usage="Output", dimension=10)
+    p = new_aoi_parameter("Arr1", "DINT", usage="InOut", dimension=10)
     assert p.dimensions == "10"
 
 
 def test_new_aoi_parameter_rejects_invalid_usage():
     with pytest.raises(ValueError, match="must be 'Input', 'Output', or 'InOut'"):
         new_aoi_parameter("Bad", "DINT", usage="Local")
+
+
+def test_new_aoi_parameter_rejects_array_input():
+    # Regression test: real Studio 5000 rejected import of an array Input
+    # parameter with "Invalid array. Input or output parameter must be of
+    # supported elementary data type with no dimensions." -- only InOut
+    # parameters may be arrays.
+    with pytest.raises(ValueError, match="only valid for usage='InOut'"):
+        new_aoi_parameter("Arr1", "DINT", usage="Input", dimension=4)
+
+
+def test_new_aoi_parameter_rejects_array_output():
+    with pytest.raises(ValueError, match="only valid for usage='InOut'"):
+        new_aoi_parameter("Arr1", "DINT", usage="Output", dimension=4)
+
+
+def test_new_aoi_parameter_scalar_input_output_still_allowed():
+    # dimension=None (the default) must still work for Input/Output --
+    # only a real array dimension is rejected.
+    p_in = new_aoi_parameter("In1", "DINT", usage="Input")
+    p_out = new_aoi_parameter("Out1", "DINT", usage="Output")
+    assert p_in.dimensions is None
+    assert p_out.dimensions is None
 
 
 def test_new_aoi_parameter_overrides_required_visible_external_access():
@@ -848,6 +872,35 @@ def test_export_aoi_accepts_reserved_routine_name(tmp_path):
     export_aoi(project, aoi, str(output_path))
     content = output_path.read_text(encoding="utf-8")
     assert 'Routine Name="Logic"' in content
+
+
+def test_export_aoi_rejects_array_input_output_parameter():
+    # Defense-in-depth: export_aoi() checks this unconditionally (not just
+    # new_aoi_parameter()'s own constructor-time guard), since a caller
+    # could hand-construct a Parameter directly, bypassing the constructor.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    bad_param = Parameter(
+        "Arr1", "Arr1", "Base", "DINT", "Input", "Decimal", "true", "true",
+        "Read/Write", None, "4",
+    )
+    aoi.parameters.append(bad_param)
+    project.controller.aois.append(aoi)
+
+    with pytest.raises(ValueError, match="Invalid array"):
+        export_aoi(project, aoi, "build/should_not_be_written.L5X")
+
+
+def test_export_aoi_accepts_array_inout_parameter(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    aoi.parameters.append(new_aoi_parameter("Arr1", "DINT", usage="InOut", dimension=4))
+    project.controller.aois.append(aoi)
+
+    output_path = tmp_path / "aoi_export.L5X"
+    export_aoi(project, aoi, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'Name="Arr1"' in content
 
 
 def test_export_aoi_validate_rejects_unresolved_local_tag_type():

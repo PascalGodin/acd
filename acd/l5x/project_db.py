@@ -1143,9 +1143,11 @@ class ProjectDB:
 
         Raises `KeyError` if `aoi_name` doesn't resolve to an AOI created in
         THIS project DB (see `new_aoi()`'s own v1 scope limit), `ValueError`
-        if `usage` isn't `"Input"`/`"Output"`/`"InOut"`,
-        `sqlite3.IntegrityError` if a parameter with this name already
-        exists on that AOI.
+        if `usage` isn't `"Input"`/`"Output"`/`"InOut"` OR if `dimension` is
+        given with a `usage` other than `"InOut"` (Studio 5000 rejects an
+        array `Input`/`Output` parameter outright -- see
+        `new_aoi_parameter()`'s own docstring), `sqlite3.IntegrityError` if
+        a parameter with this name already exists on that AOI.
         """
         param = _new_aoi_parameter(name, data_type, usage=usage, dimension=dimension,
                                     description=description, required=required,

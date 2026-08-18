@@ -1604,25 +1604,30 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
     resolution too (their own data types can pull in a UDT/AOI dependency).
 
     CAUTION -- structurally compared against one real Rockwell-authored AOI
-    export (`AOI_SNTP_QUERY`, a fairly complex sample AOI), but still NEVER
-    tried against a real Studio 5000 IMPORT. That comparison confirmed the
-    wrapper attributes (including `TargetRevision`/`TargetLastEdited`,
-    `ExportOptions`), the `Use="Target"` placement/attribute order on
-    `<AddOnInstructionDefinition>`, the `<Description>`/`<RevisionNote>`/
-    `<Parameters>` child order, and the `<DataTypes>`/
-    `<AddOnInstructionDefinitions>` top-level section order all match --
-    and found (and fixed) two real gaps: `new_aoi()`'s date format didn't
-    match Rockwell's own ISO-8601-with-milliseconds convention, and every
-    real `<AddOnInstructionDefinition>` (target AND context) carries its own
-    `<Dependencies>` block, which this wrapper didn't render at all before.
-    Known, NOT-yet-addressed gap that same comparison surfaced (see
-    CLAUDE.md's AOI support section for the full detail): an AOI's own logic
-    can reference a GSV/SSV system object (e.g. `WallClockTime`) as a bare
-    `<WallClockTime Use="Reference">` sibling of `<AddOnInstructionDefinitions>`,
-    a dependency class this wrapper's own resolution has no concept of at
-    all (only `.parameters`/`.local_tags` data types are resolved, not
+    export (`AOI_SNTP_QUERY`, a fairly complex sample AOI), AND has since had
+    real Studio 5000 import ATTEMPTS (not yet a single fully clean one) that
+    found (and fixed) several more real gaps beyond the structural
+    comparison: `new_aoi()`'s date format didn't match Rockwell's own
+    ISO-8601-with-milliseconds convention; every real
+    `<AddOnInstructionDefinition>` (target AND context) carries its own
+    `<Dependencies>` block, which this wrapper didn't render at all before;
+    an AOI's own routine may ONLY be named `"Logic"`/`"Prescan"`/
+    `"Postscan"`/`"EnableInFalse"`, never a caller-chosen name (Studio
+    rejected `"Invalid name for Add-On Instruction routine."` outright --
+    see CLAUDE.md); and an `Input`/`Output` parameter (unlike `InOut`) may
+    NEVER be an array (Studio rejected `"Invalid array. Input or output
+    parameter must be of supported elementary data type with no
+    dimensions."` -- see CLAUDE.md). `EnableIn`/`EnableOut` (via
+    `new_aoi_enable_parameters()`) and AOI `LocalTags` (via
+    `new_aoi_local_tag()`) HAVE been confirmed working end-to-end in a real
+    import. Known, NOT-yet-addressed gap (see CLAUDE.md's AOI support
+    section for the full detail): an AOI's own logic can reference a
+    GSV/SSV system object (e.g. `WallClockTime`) as a bare `<WallClockTime
+    Use="Reference">` sibling of `<AddOnInstructionDefinitions>`, a
+    dependency class this wrapper's own resolution has no concept of at all
+    (only `.parameters`/`.local_tags` data types are resolved, not
     system-object references inside routine logic). Test on a COPY of your
-    project first, and expect this may still need real-import-driven
+    project first, and expect this may still need further real-import-driven
     adjustment the same way `export_routine()` did (see CLAUDE.md's
     "Partial/context L5X exports" section for how many rounds that took).
 
@@ -1640,9 +1645,14 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
             default.
 
     Raises:
-        ValueError: if `aoi` isn't in `project.controller.aois`, or (if
-            `validate=True`) if a parameter's or local tag's type doesn't
-            resolve.
+        ValueError: if `aoi` isn't in `project.controller.aois`; if any of
+            `aoi.routines` isn't named `"Logic"`/`"Prescan"`/`"Postscan"`/
+            `"EnableInFalse"`; if any `Input`/`Output` (non-`InOut`)
+            parameter is an array; or (if `validate=True`) if a parameter's
+            or local tag's type doesn't resolve. The first three checks run
+            unconditionally (not gated by `validate=`) since they're
+            certainties to fail a real Studio 5000 import, not "might be a
+            problem" data-shape risks.
     """
     import datetime
 
@@ -1661,6 +1671,16 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
                 f"of {sorted(_AOI_RESERVED_ROUTINE_NAMES)} (confirmed via a real Studio "
                 f"5000 import rejection: \"Invalid name for Add-On Instruction routine.\"). "
                 f"Rename it (typically to 'Logic') before exporting."
+            )
+
+    for p in aoi.parameters:
+        if p.dimensions and p.usage != "InOut":
+            raise ValueError(
+                f"AOI parameter {p.name!r} is an array (Dimensions={p.dimensions!r}) with "
+                f"Usage={p.usage!r} -- Studio 5000 rejects this (\"Invalid array. Input or "
+                f"output parameter must be of supported elementary data type with no "
+                f"dimensions.\"). Only an InOut parameter may be an array; change Usage to "
+                f"'InOut' or make {p.name!r} a scalar."
             )
 
     _sync_data_types_map(project)

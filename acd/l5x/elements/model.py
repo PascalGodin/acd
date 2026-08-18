@@ -732,11 +732,27 @@ def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
     size; `None`/`0` means scalar, matching `Tag.dimensions`' own
     convention (not `Member.dimension`'s -- there is no `0`-means-scalar
     ambiguity to guard against here since this only ever produces a plain
-    int-or-None, never a raw stored field).
+    int-or-None, never a raw stored field). ONLY VALID for `usage="InOut"`
+    -- a real Studio 5000 import rejects an array `Input`/`Output`
+    parameter outright (`"Invalid array. Input or output parameter must be
+    of supported elementary data type with no dimensions."`); raises
+    `ValueError` immediately for `dimension` with any other `usage` rather
+    than letting that surface only at import time. An `InOut` parameter is
+    passed by reference, so Rockwell allows it to be an array; `Input`/
+    `Output` are passed by value/copied and may only be a scalar
+    elementary type.
     """
     if usage not in ("Input", "Output", "InOut"):
         raise ValueError(
             f"new_aoi_parameter(): usage must be 'Input', 'Output', or 'InOut', not {usage!r}"
+        )
+    if dimension and usage != "InOut":
+        raise ValueError(
+            f"new_aoi_parameter(): dimension is only valid for usage='InOut' -- Studio 5000 "
+            f"rejects an array {usage} parameter (\"Invalid array. Input or output parameter "
+            f"must be of supported elementary data type with no dimensions.\"). Use "
+            f"usage='InOut' if {name!r} genuinely needs to be an array, or drop dimension "
+            f"for a scalar {usage} parameter."
         )
     radix = _PRIMITIVE_RADIX.get(data_type.upper())
     if usage == "InOut":

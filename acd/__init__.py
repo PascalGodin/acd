@@ -122,7 +122,13 @@ EDITS -- durable the moment the call returns (see above), each raising
     (`Required="false"`, `Visible="false"`, `ExternalAccess="Read Only"`;
     `new_aoi_enable_parameters()` at the in-memory `acd.l5x.elements` layer
     builds this exact pair ready-made if you're constructing `Parameter`
-    objects directly instead of going through `db_*`).
+    objects directly instead of going through `db_*`). **`dimension` is
+    only valid for `usage="InOut"`** -- RAISES immediately otherwise
+    (confirmed via a real Studio 5000 import rejection: `"Invalid array.
+    Input or output parameter must be of supported elementary data type
+    with no dimensions."`). An `Input`/`Output` parameter is passed by
+    value and may only be a scalar elementary type; only `InOut` (passed by
+    reference) may be an array.
   - `db_new_aoi_local_tag(acd_path, aoi_name, name, data_type,
     dimension=None, description=None, index=None)` -- add a private/scratch
     LocalTag (internal AOI state that shouldn't be a public parameter) to

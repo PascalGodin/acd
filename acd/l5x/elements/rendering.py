@@ -387,12 +387,10 @@ def _validate_data_type_resolves(data_type: "DataType", data_types_map: Dict[str
 
 def _validate_aoi_parameters_resolve(aoi: "AOI", data_types_map: Dict[str, "DataType"]) -> None:
     """The `export_aoi()` counterpart to `_validate_data_type_resolves()` --
-    checks an AOI's own `.parameters` declarations resolve. Deliberately
-    does NOT walk `.local_tags` -- this whole AOI-support feature has no
-    constructor support for creating LocalTags at all (out of scope, see
-    CLAUDE.md's AOI support section), so there's nothing this validate pass
-    would ever catch there that a caller could have caused through this
-    library's own API.
+    checks an AOI's own `.parameters` AND `.local_tags` declarations resolve
+    (both are reachable through this library's own API now --
+    `new_aoi_parameter()`/`db_new_aoi_parameter()` and
+    `new_aoi_local_tag()`/`db_new_aoi_local_tag()`).
 
     Raises ValueError on the first unresolved type found.
     """
@@ -400,6 +398,11 @@ def _validate_aoi_parameters_resolve(aoi: "AOI", data_types_map: Dict[str, "Data
     for param in aoi.parameters:
         if param.data_type:
             _validate_type_graph_resolves(param.data_type, f"AOI {aoi.name!r} parameter {param.name!r}",
+                                           data_types_map, seen)
+    for local_tag in aoi.local_tags:
+        if local_tag.data_type:
+            _validate_type_graph_resolves(local_tag.data_type,
+                                           f"AOI {aoi.name!r} local tag {local_tag.name!r}",
                                            data_types_map, seen)
 
 

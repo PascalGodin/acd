@@ -3409,11 +3409,8 @@ more real AOI samples if this becomes a real blocker.
 
 **Known, NOT-yet-addressed gaps this same comparison surfaced, still open** (both now confirmed real,
 not speculative, but genuinely out of scope for this pass):
-- A real Studio-authored AOI always carries `EnableIn`/`EnableOut` system-defined parameters
-  (`Required="false"`, `Visible="false"`, `ExternalAccess="Read Only"` — none of which
-  `new_aoi_parameter()` currently supports, since it always hardcodes `Required`/`Visible` to
-  `"true"`) — `new_aoi()` doesn't add these automatically. A caller wanting a structurally-complete
-  AOI needs to construct these two `Parameter` objects by hand.
+- ~~A real Studio-authored AOI always carries `EnableIn`/`EnableOut` system-defined parameters...~~
+  — **fixed, see "EnableIn/EnableOut and AOI LocalTag creation" below.**
 - An AOI's own logic can reference a GSV/SSV system object (`AOI_SNTP_QUERY` does this via
   `GSV(WallClockTime,,DateTime,...)`/`SSV(WallClockTime,,DateTime,...)`, reading/setting the
   controller's own wall-clock time) — a real dependency class Rockwell's own export handles (a bare
@@ -3426,6 +3423,78 @@ Covered by `test_new_aoi_dates_use_real_iso8601_format`,
 `test_export_aoi_wrapper_includes_target_revision_and_last_edited`,
 `test_export_aoi_includes_dependencies_block_for_target_with_udt_parameter`, and
 `test_export_aoi_no_dependencies_block_when_nothing_referenced` (`test/test_api.py`).
+
+### EnableIn/EnableOut and AOI LocalTag creation — the two gaps flagged after the first real AOI build
+
+A downstream agent's first real build against the brand-new `db_new_aoi()`/`db_new_aoi_parameter()`/
+`db_export_aoi()` support (confirmed working via a smoke test first — create/parameter/routine/rung/
+export all succeeded on a scratch copy) hit both of the "known, not-yet-addressed" gaps flagged in the
+section above the moment it needed an AOI with real internal logic, not just the smoke-test shape:
+
+1. **No way to produce a correct `EnableIn`/`EnableOut` pair.** `new_aoi_parameter()`/
+   `db_new_aoi_parameter()` always hardcoded `Required="true"`, `Visible="true"`, and (for
+   Input/Output) `ExternalAccess="Read/Write"` — the real convention for these two specifically is
+   `Required="false"`, `Visible="false"`, `ExternalAccess="Read Only"`, with no way to get there
+   short of hand-constructing a `Parameter` and bypassing the constructor entirely.
+2. **No `db_*`/constructor path to add an AOI LocalTag at all.** `new_aoi()`'s own docstring said so
+   explicitly — real internal scratch state (the agent's case: 1-2 reconstructed/clamped working
+   values per scan with no business being a public Input/Output pin) had no way in except appending a
+   hand-built `LocalTag(...)` object directly.
+
+**Fix, both requested shapes delivered rather than picking one over the other** (the agent's own
+write-up offered either "overrides on `new_aoi_parameter()`" or "a dedicated call," and both are cheap
+enough to add together):
+
+- `new_aoi_parameter()`/`db_new_aoi_parameter()` gained optional `required`/`visible`/
+  `external_access` override parameters (`None` = original default behavior, unchanged for every
+  existing caller) — the general-purpose fix, usable for `EnableIn`/`EnableOut` or any other
+  parameter needing non-default attributes.
+- `new_aoi_enable_parameters() -> (Parameter, Parameter)` (`acd/l5x/elements/model.py`) — a
+  ready-made, correctly-attributed `EnableIn`/`EnableOut` pair built on top of the overrides above, so
+  a caller doesn't have to get the three attributes right by hand for the one case that needs them on
+  every single AOI. No `db_*`-layer equivalent constructor was added (nothing to add — a caller uses
+  `db_new_aoi_parameter(..., required="false", visible="false", external_access="Read Only")` twice,
+  or builds the pair via the in-memory function and inserts both through the ordinary
+  `project.controller.aois`/`export_aoi()` path if working at that layer instead).
+- `new_aoi_local_tag(name, data_type, dimension=None, description=None) -> LocalTag`
+  (`acd/l5x/elements/model.py`, mirroring `new_aoi_parameter()`'s shape minus the
+  Usage/Required/Visible concerns a LocalTag doesn't have) and `ProjectDB.new_aoi_local_tag()`/
+  `db_new_aoi_local_tag()` (`acd/l5x/project_db.py`) — a real SQL-backed creation path, not just the
+  in-memory constructor. New `proj_aoi_local_tags` table (`aoi_id`, `seq`, `name`, `data_type_name`,
+  `dimensions`, `radix`, `external_access`, `description`), same shape and same negative-intermediate
+  seq-shift technique as `proj_aoi_parameters`/`proj_members`. `_load_aois()` now populates
+  `AOI.local_tags` from this table instead of always passing `[]` — the one other place that needed
+  updating, since `to_controller()`'s own append-not-replace convention for `.aois` (see the AOI
+  creation section above) required no changes at all.
+- `_validate_aoi_parameters_resolve()` (`rendering.py`) now ALSO walks `.local_tags`, not just
+  `.parameters` — its own docstring previously said local tags were skipped specifically because
+  nothing could create one through this library's API, so there was nothing the check could ever catch
+  there; now that `new_aoi_local_tag()`/`db_new_aoi_local_tag()` exist, that reasoning no longer holds,
+  and a local tag typed as an unresolvable struct name is exactly the same silent-bare-zero failure
+  mode this whole `validate=True` mechanism exists to catch early (see "Second convenience-API batch"
+  above for the original incident this pattern was built to prevent).
+
+**Still not fixed, deliberately, same reasoning as before**: `ExecutePrescan`/`ExecutePostscan`/
+`ExecuteEnableInFalse` decode (confirmed wrong via the real `AOI_SNTP_QUERY` instance, see above) is
+unrelated to either of these two gaps and still needs more real samples before a byte-offset fix is
+safe to attempt.
+
+Covered by `test_new_aoi_parameter_overrides_required_visible_external_access`,
+`test_new_aoi_parameter_overrides_default_to_original_behavior_when_omitted`,
+`test_new_aoi_enable_parameters`, `test_new_aoi_local_tag_defaults`, `test_new_aoi_local_tag_dimension`,
+`test_new_aoi_local_tag_udt_type_omits_radix`, `test_export_aoi_validate_rejects_unresolved_local_tag_type`,
+and `test_export_aoi_renders_enable_parameters_and_local_tags` (`test/test_api.py`); `test_new_aoi_parameter_required_visible_external_access_overrides`,
+`test_new_aoi_local_tag_creates_and_persists`, `test_new_aoi_local_tag_missing_aoi_raises_key_error`,
+`test_new_aoi_local_tag_duplicate_name_raises`, `test_new_aoi_never_touches_real_pre_existing_aoi_local_tags`
+(companion to the pre-existing `test_new_aoi_never_touches_real_pre_existing_aoi`, confirming the
+append-not-replace guarantee still holds now that a brand-new AOI can carry its own LocalTags too), and
+`test_db_new_aoi_local_tag_stateless_wrapper_and_export` (`test/test_project_db.py`) — full suite
+re-run clean (335 passed, 2 skipped, up from 321 before this round).
+
+**Still unverified, same caveat as the rest of this AOI feature**: none of this has been tried against
+a real Studio 5000 import yet — the attribute values (`Required="false"`/`Visible="false"`/
+`ExternalAccess="Read Only"` for the enable pair) are confirmed correct only by structural comparison
+against the real `AOI_SNTP_QUERY` export, not by an actual successful import of a file built with them.
 
 ## Testing gotchas
 

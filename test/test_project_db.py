@@ -26,6 +26,7 @@ from acd import (
     db_io_addresses_by_routine,
     db_list_routines,
     db_new_aoi,
+    db_new_aoi_local_tag,
     db_new_aoi_parameter,
     db_new_datatype,
     db_new_member,
@@ -792,6 +793,93 @@ def test_db_new_aoi_stateless_wrappers_and_export(acd_copy, tmp_path):
     assert 'TargetName="PDB_NEW_AOI"' in content
     assert 'Name="In1"' in content
     assert "MOV(In1,Out1)" in content
+
+
+def test_new_aoi_parameter_required_visible_external_access_overrides(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_aoi_parameter(
+            "PDB_NEW_AOI", "EnableIn", "BOOL", usage="Input",
+            required="false", visible="false", external_access="Read Only",
+        )
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+        p = aoi.parameters[0]
+        assert p.required == "false"
+        assert p.visible == "false"
+        assert p.external_access == "Read Only"
+    finally:
+        db.close()
+
+
+def test_new_aoi_local_tag_creates_and_persists(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_aoi_local_tag("PDB_NEW_AOI", "Scratch1", "DINT", description="scratch value")
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+        assert [lt.name for lt in aoi.local_tags] == ["Scratch1"]
+        assert aoi.local_tags[0].data_type == "DINT"
+        assert aoi.local_tags[0]._description == "scratch value"
+    finally:
+        db.close()
+
+
+def test_new_aoi_local_tag_missing_aoi_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.new_aoi_local_tag("NO_SUCH_AOI", "Scratch1", "DINT")
+    finally:
+        db.close()
+
+
+def test_new_aoi_local_tag_duplicate_name_raises(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_aoi_local_tag("PDB_NEW_AOI", "Scratch1", "DINT")
+        with pytest.raises(sqlite3.IntegrityError):
+            db.new_aoi_local_tag("PDB_NEW_AOI", "Scratch1", "DINT")
+    finally:
+        db.close()
+
+
+def test_new_aoi_never_touches_real_pre_existing_aoi_local_tags(aoi_acd_copy):
+    # Companion to test_new_aoi_never_touches_real_pre_existing_aoi above --
+    # confirms this holds even after a brand-new AOI ALSO adds its own
+    # LocalTags via proj_aoi_local_tags, not just proj_aois itself.
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    real_local_tag_counts = {a.name: len(a.local_tags) for a in reference.controller.aois}
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_aoi_local_tag("PDB_NEW_AOI", "Scratch1", "DINT")
+
+        project = db.to_controller()
+        for a in project.controller.aois:
+            if a.name in real_local_tag_counts:
+                assert len(a.local_tags) == real_local_tag_counts[a.name]
+    finally:
+        db.close()
+
+
+def test_db_new_aoi_local_tag_stateless_wrapper_and_export(acd_copy, tmp_path):
+    db_new_aoi(str(acd_copy), "PDB_NEW_AOI")
+    db_new_aoi_local_tag(str(acd_copy), "PDB_NEW_AOI", "Scratch1", "DINT",
+                          description="scratch value")
+
+    output_path = tmp_path / "new_aoi.L5X"
+    db_export_aoi(str(acd_copy), "PDB_NEW_AOI", str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'TargetName="PDB_NEW_AOI"' in content
+    assert '<LocalTags' in content
+    assert 'Name="Scratch1"' in content
 
 
 def _first_routine(db):

@@ -36,6 +36,8 @@ from acd.l5x.elements import (
     Member,
     Tag,
     new_aoi,
+    new_aoi_enable_parameters,
+    new_aoi_local_tag,
     new_aoi_parameter,
     new_bit_member,
     new_datatype,
@@ -652,6 +654,64 @@ def test_new_aoi_parameter_rejects_invalid_usage():
         new_aoi_parameter("Bad", "DINT", usage="Local")
 
 
+def test_new_aoi_parameter_overrides_required_visible_external_access():
+    p = new_aoi_parameter(
+        "In1", "DINT", usage="Input",
+        required="false", visible="false", external_access="Read Only",
+    )
+    assert p.required == "false"
+    assert p.visible == "false"
+    assert p.external_access == "Read Only"
+
+
+def test_new_aoi_parameter_overrides_default_to_original_behavior_when_omitted():
+    p = new_aoi_parameter("In1", "DINT", usage="Input")
+    assert p.required == "true"
+    assert p.visible == "true"
+    assert p.external_access == "Read/Write"
+
+
+def test_new_aoi_enable_parameters():
+    # Regression test: real Studio-authored AOIs always carry EnableIn/
+    # EnableOut with these exact attributes -- this is the ready-made pair
+    # a caller shouldn't have to hand-construct via new_aoi_parameter().
+    enable_in, enable_out = new_aoi_enable_parameters()
+
+    assert enable_in.name == "EnableIn"
+    assert enable_in.data_type == "BOOL"
+    assert enable_in.usage == "Input"
+    assert enable_in.required == "false"
+    assert enable_in.visible == "false"
+    assert enable_in.external_access == "Read Only"
+
+    assert enable_out.name == "EnableOut"
+    assert enable_out.data_type == "BOOL"
+    assert enable_out.usage == "Output"
+    assert enable_out.required == "false"
+    assert enable_out.visible == "false"
+    assert enable_out.external_access == "Read Only"
+
+
+def test_new_aoi_local_tag_defaults():
+    lt = new_aoi_local_tag("Scratch1", "DINT", description="internal state")
+    assert lt.name == "Scratch1"
+    assert lt.data_type == "DINT"
+    assert lt.radix == "Decimal"
+    assert lt.external_access == "Read/Write"
+    assert lt.dimensions is None
+    assert lt._description == "internal state"
+
+
+def test_new_aoi_local_tag_dimension():
+    lt = new_aoi_local_tag("ScratchArr", "DINT", dimension=5)
+    assert lt.dimensions == "5"
+
+
+def test_new_aoi_local_tag_udt_type_omits_radix():
+    lt = new_aoi_local_tag("ScratchStruct", "SomeUdt")
+    assert lt.radix is None
+
+
 def test_new_aoi_can_be_populated_with_parameters_and_routine():
     aoi = new_aoi("MyAOI")
     aoi.parameters.append(new_aoi_parameter("In1", "DINT", usage="Input"))
@@ -757,6 +817,38 @@ def test_export_aoi_validate_rejects_unresolved_parameter_type():
 
     with pytest.raises(ValueError, match="does not resolve"):
         export_aoi(project, aoi, "build/should_not_be_written.L5X", validate=True)
+
+
+def test_export_aoi_validate_rejects_unresolved_local_tag_type():
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    aoi.local_tags.append(new_aoi_local_tag("Bad", "NoSuchUdtType"))
+    project.controller.aois.append(aoi)
+
+    with pytest.raises(ValueError, match="does not resolve"):
+        export_aoi(project, aoi, "build/should_not_be_written.L5X", validate=True)
+
+
+def test_export_aoi_renders_enable_parameters_and_local_tags(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    enable_in, enable_out = new_aoi_enable_parameters()
+    aoi.parameters.append(enable_in)
+    aoi.parameters.append(enable_out)
+    aoi.parameters.append(new_aoi_parameter("In1", "DINT", usage="Input"))
+    aoi.local_tags.append(new_aoi_local_tag("Scratch1", "DINT", description="scratch"))
+    project.controller.aois.append(aoi)
+
+    output_path = tmp_path / "aoi_export.L5X"
+    export_aoi(project, aoi, str(output_path), validate=True)
+    content = output_path.read_text(encoding="utf-8")
+
+    minidom.parse(str(output_path))  # well-formed
+    assert 'Name="EnableIn"' in content
+    assert 'Required="false"' in content
+    assert 'ExternalAccess="Read Only"' in content
+    assert 'Name="EnableOut"' in content
+    assert 'Name="Scratch1"' in content
 
 
 def test_new_tag_primitive_defaults_radix_by_data_type():

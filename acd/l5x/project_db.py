@@ -86,6 +86,7 @@ from acd.l5x.elements import (
     Controller,
     ControllerBuilder,
     DataType,
+    LocalTag,
     Member,
     Parameter,
     Program,
@@ -95,6 +96,7 @@ from acd.l5x.elements import (
     Tag,
     _validate_rll_rung_syntax,
     new_aoi as _new_aoi,
+    new_aoi_local_tag as _new_aoi_local_tag,
     new_aoi_parameter as _new_aoi_parameter,
     new_bit_member as _new_bit_member,
     new_datatype as _new_datatype,
@@ -244,6 +246,7 @@ DROP TABLE IF EXISTS proj_rungs;
 DROP TABLE IF EXISTS proj_st_lines;
 DROP TABLE IF EXISTS proj_routines;
 DROP TABLE IF EXISTS proj_programs;
+DROP TABLE IF EXISTS proj_aoi_local_tags;
 DROP TABLE IF EXISTS proj_aoi_parameters;
 DROP TABLE IF EXISTS proj_aois;
 
@@ -338,6 +341,20 @@ CREATE TABLE proj_aoi_parameters (
 );
 CREATE UNIQUE INDEX idx_proj_aoi_params_seq ON proj_aoi_parameters(aoi_id, seq);
 CREATE UNIQUE INDEX idx_proj_aoi_params_name ON proj_aoi_parameters(aoi_id, name COLLATE NOCASE);
+
+CREATE TABLE proj_aoi_local_tags (
+    id INTEGER PRIMARY KEY,
+    aoi_id INTEGER NOT NULL REFERENCES proj_aois(id),
+    seq INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    data_type_name TEXT NOT NULL,
+    dimensions TEXT,
+    radix TEXT,
+    external_access TEXT NOT NULL,
+    description TEXT
+);
+CREATE UNIQUE INDEX idx_proj_aoi_local_tags_seq ON proj_aoi_local_tags(aoi_id, seq);
+CREATE UNIQUE INDEX idx_proj_aoi_local_tags_name ON proj_aoi_local_tags(aoi_id, name COLLATE NOCASE);
 
 CREATE TABLE proj_tags (
     id INTEGER PRIMARY KEY,
@@ -1075,14 +1092,22 @@ class ProjectDB:
 
     def new_aoi_parameter(self, aoi_name: str, name: str, data_type: str,
                            usage: str = "Input", dimension: Union[int, None] = None,
-                           description: Union[str, None] = None, index: Union[int, None] = None
+                           description: Union[str, None] = None, index: Union[int, None] = None,
+                           required: Union[str, None] = None, visible: Union[str, None] = None,
+                           external_access: Union[str, None] = None,
                            ) -> int:
         """Add a public parameter to an AOI created via `new_aoi()`/
         `db_new_aoi()`, at position `index` (default: appended) -- the SQL
         equivalent of appending `new_aoi_parameter(...)`
         (`acd/l5x/elements/model.py`) to `AOI.parameters`. See that
         function's own docstring for `usage`/`radix`/`external_access`/
-        `constant`/`required`/`visible` conventions.
+        `constant`/`required`/`visible` conventions, including the
+        `required`/`visible`/`external_access` override args here (`None` =
+        this constructor's own default; pass an explicit string to override
+        -- e.g. to build a real `EnableIn`/`EnableOut` parameter by hand, or
+        use `new_aoi_parameter()`/`new_aoi_enable_parameters()` directly and
+        insert the two returned `Parameter` objects yourself if you need the
+        ready-made pair without duplicating this call twice).
 
         Raises `KeyError` if `aoi_name` doesn't resolve to an AOI created in
         THIS project DB (see `new_aoi()`'s own v1 scope limit), `ValueError`
@@ -1091,7 +1116,8 @@ class ProjectDB:
         exists on that AOI.
         """
         param = _new_aoi_parameter(name, data_type, usage=usage, dimension=dimension,
-                                    description=description)
+                                    description=description, required=required,
+                                    visible=visible, external_access=external_access)
         aoi_id = self._aoi_id(aoi_name)
         cur = self._conn.cursor()
         count = cur.execute(
@@ -1121,6 +1147,53 @@ class ProjectDB:
         if not self._in_transaction:
             self._conn.commit()
         return param_id
+
+    def new_aoi_local_tag(self, aoi_name: str, name: str, data_type: str,
+                           dimension: Union[int, None] = None,
+                           description: Union[str, None] = None,
+                           index: Union[int, None] = None) -> int:
+        """Add a private/scratch LocalTag to an AOI created via `new_aoi()`/
+        `db_new_aoi()`, at position `index` (default: appended) -- the SQL
+        equivalent of appending `new_aoi_local_tag(...)`
+        (`acd/l5x/elements/model.py`) to `AOI.local_tags`. Unlike a
+        `Parameter`, a LocalTag has no `Usage`/`Required`/`Visible` concept
+        -- it's never a public Input/Output/InOut pin, just internal state
+        for the AOI's own logic.
+
+        Raises `KeyError` if `aoi_name` doesn't resolve to an AOI created in
+        THIS project DB (see `new_aoi()`'s own v1 scope limit),
+        `sqlite3.IntegrityError` if a local tag with this name already
+        exists on that AOI.
+        """
+        local_tag = _new_aoi_local_tag(name, data_type, dimension=dimension,
+                                        description=description)
+        aoi_id = self._aoi_id(aoi_name)
+        cur = self._conn.cursor()
+        count = cur.execute(
+            "SELECT COUNT(*) FROM proj_aoi_local_tags WHERE aoi_id=?", (aoi_id,)
+        ).fetchone()[0]
+        insert_at = count if index is None else index
+        # Negative-intermediate shift -- same UNIQUE-collision reasoning as
+        # new_member()'s own (data_type_id, seq) shift above.
+        cur.execute(
+            "UPDATE proj_aoi_local_tags SET seq = -(seq + 1) WHERE aoi_id=? AND seq >= ?",
+            (aoi_id, insert_at),
+        )
+        cur.execute(
+            "UPDATE proj_aoi_local_tags SET seq = -seq WHERE aoi_id=? AND seq < 0",
+            (aoi_id,),
+        )
+        cur.execute(
+            "INSERT INTO proj_aoi_local_tags (aoi_id, seq, name, data_type_name, dimensions, "
+            "radix, external_access, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (aoi_id, insert_at, local_tag.name, local_tag.data_type, local_tag.dimensions,
+             local_tag.radix, local_tag.external_access, local_tag._description),
+        )
+        local_tag_id = cur.lastrowid
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+        return local_tag_id
 
     def new_routine(self, routine_name: str, routine_type: str,
                      program_name: Union[str, None] = None,
@@ -1632,11 +1705,20 @@ class ProjectDB:
                 for (pname, dtype, dims, radix, usage, required, visible, ext_access, constant,
                      pdesc) in param_rows
             ]
+            lt_rows = cur.execute(
+                "SELECT name, data_type_name, dimensions, radix, external_access, description "
+                "FROM proj_aoi_local_tags WHERE aoi_id=? ORDER BY seq",
+                (aid,),
+            ).fetchall()
+            local_tags = [
+                LocalTag(ltname, ltname, dtype, dims, radix, ext_access, _description=ltdesc)
+                for (ltname, dtype, dims, radix, ext_access, ltdesc) in lt_rows
+            ]
             routines = self._load_routines_where(cur, "aoi_id", aid)
             aois.append(AOI(
                 name, name, revision, rev_ext, vendor, exec_prescan, exec_postscan,
                 exec_enable_in_false, created_date, created_by, edited_date, edited_by,
-                sw_rev, parameters, [], routines, _description=description,
+                sw_rev, parameters, local_tags, routines, _description=description,
             ))
         return aois
 
@@ -1922,11 +2004,24 @@ def db_new_aoi(acd_path, name: str, description: Union[str, None] = None,
 def db_new_aoi_parameter(acd_path, aoi_name: str, name: str, data_type: str,
                           usage: str = "Input", dimension: Union[int, None] = None,
                           description: Union[str, None] = None, index: Union[int, None] = None,
+                          required: Union[str, None] = None, visible: Union[str, None] = None,
+                          external_access: Union[str, None] = None,
                           project_dir=None, verbose: bool = False) -> int:
     """Stateless equivalent of `ProjectDB.new_aoi_parameter()` -- see its docstring."""
     return _run(acd_path, project_dir, verbose, lambda db: db.new_aoi_parameter(
         aoi_name, name, data_type, usage=usage, dimension=dimension,
-        description=description, index=index,
+        description=description, index=index, required=required, visible=visible,
+        external_access=external_access,
+    ))
+
+
+def db_new_aoi_local_tag(acd_path, aoi_name: str, name: str, data_type: str,
+                          dimension: Union[int, None] = None,
+                          description: Union[str, None] = None, index: Union[int, None] = None,
+                          project_dir=None, verbose: bool = False) -> int:
+    """Stateless equivalent of `ProjectDB.new_aoi_local_tag()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose, lambda db: db.new_aoi_local_tag(
+        aoi_name, name, data_type, dimension=dimension, description=description, index=index,
     ))
 
 

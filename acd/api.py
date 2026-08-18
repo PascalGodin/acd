@@ -1569,23 +1569,23 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
 
     To **create** a brand-new AOI: construct one with `new_aoi()`, append it
     to `project.controller.aois`, add parameters with `new_aoi_parameter()`
-    (append to `aoi.parameters`) and a logic routine with `new_routine()`
-    (append to `aoi.routines`, then `Routine.insert_rung()`/`insert_st_line()`
-    to populate it) -- then export it. To **modify** an existing AOI: get it
-    from `project.controller.aois`, mutate `.parameters`/`.routines` in
-    place, then export the same way -- no special-casing needed, matching
-    the same pattern already proven for tags/UDTs/routines (see CLAUDE.md).
+    (append to `aoi.parameters` -- also see `new_aoi_enable_parameters()` for
+    the real `EnableIn`/`EnableOut` system-defined pair every Studio-authored
+    AOI carries), local/scratch storage with `new_aoi_local_tag()` (append to
+    `aoi.local_tags`), and a logic routine with `new_routine()` (append to
+    `aoi.routines`, then `Routine.insert_rung()`/`insert_st_line()` to
+    populate it) -- then export it. To **modify** an existing AOI: get it
+    from `project.controller.aois`, mutate `.parameters`/`.local_tags`/
+    `.routines` in place, then export the same way -- no special-casing
+    needed, matching the same pattern already proven for tags/UDTs/routines
+    (see CLAUDE.md).
 
     Any DataType/AOI this one depends on (a parameter typed as a project UDT
     or another AOI, transitively) is automatically included as additional
     context via `_resolve_type_closure()` -- the same dependency-resolution
     logic already used for `export_routine()`'s/`export_datatype()`'s own
     context sections. `.local_tags` are walked for this same dependency
-    resolution (their own data types can pull in a UDT/AOI dependency too),
-    but this library has no constructor support for CREATING a LocalTag at
-    all (`new_aoi()` always starts `.local_tags` empty) -- append `LocalTag(...)`
-    objects directly if you need one, the same way you'd construct any other
-    dataclass here by hand.
+    resolution too (their own data types can pull in a UDT/AOI dependency).
 
     CAUTION -- structurally compared against one real Rockwell-authored AOI
     export (`AOI_SNTP_QUERY`, a fairly complex sample AOI), but still NEVER
@@ -1599,11 +1599,9 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
     match Rockwell's own ISO-8601-with-milliseconds convention, and every
     real `<AddOnInstructionDefinition>` (target AND context) carries its own
     `<Dependencies>` block, which this wrapper didn't render at all before.
-    Known, NOT-yet-addressed gaps that same comparison surfaced (see
-    CLAUDE.md's AOI support section for the full detail): a real
-    Studio-authored AOI always carries `EnableIn`/`EnableOut` system-defined
-    parameters that `new_aoi()` doesn't add; an AOI's own logic can reference
-    a GSV/SSV system object (e.g. `WallClockTime`) as a bare
+    Known, NOT-yet-addressed gap that same comparison surfaced (see
+    CLAUDE.md's AOI support section for the full detail): an AOI's own logic
+    can reference a GSV/SSV system object (e.g. `WallClockTime`) as a bare
     `<WallClockTime Use="Reference">` sibling of `<AddOnInstructionDefinitions>`,
     a dependency class this wrapper's own resolution has no concept of at
     all (only `.parameters`/`.local_tags` data types are resolved, not
@@ -1621,13 +1619,14 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
         output_path: Destination `.L5X` file path.
         owner: Optional "Owner" attribute value, as in `export_routine()`.
         validate: Before writing, verify every struct-typed name reachable
-            from `aoi.parameters`' own declared types actually resolves
-            (`_validate_aoi_parameters_resolve()`) -- does NOT check
-            `.local_tags` (see above). Off by default.
+            from `aoi.parameters`' AND `aoi.local_tags`' own declared types
+            actually resolves (`_validate_aoi_parameters_resolve()`). Off by
+            default.
 
     Raises:
         ValueError: if `aoi` isn't in `project.controller.aois`, or (if
-            `validate=True`) if a parameter's type doesn't resolve.
+            `validate=True`) if a parameter's or local tag's type doesn't
+            resolve.
     """
     import datetime
 

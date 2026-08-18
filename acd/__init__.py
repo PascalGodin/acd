@@ -99,21 +99,35 @@ EDITS -- durable the moment the call returns (see above), each raising
     "Import Data Type..." on `Target` several steps later.
   - `db_new_aoi(acd_path, name, description=None)` -- create a new, empty
     Add-On Instruction. Use `db_new_aoi_parameter()` to add
-    Input/Output/InOut parameters and `db_new_routine(..., aoi_name=name)`
-    for its logic routine. **v1 scope limit**: only newly-created AOIs are
-    addressable through this table at all -- a real project's own
-    pre-existing AOIs are never edited through it (though `db_export_aoi()`
-    can still export one of THOSE directly, unmodified or after you mutate
-    it via `db_to_controller()`). LocalTags, `ExecutePrescan`/
-    `ExecutePostscan`/`ExecuteEnableInFalse`, and read-back beyond
-    `db_get_project_summary()`'s own AOI name list are all explicitly out
-    of scope for this v1 pass.
+    Input/Output/InOut parameters, `db_new_aoi_local_tag()` for private
+    scratch storage, and `db_new_routine(..., aoi_name=name)` for its logic
+    routine. **v1 scope limit**: only newly-created AOIs are addressable
+    through this table at all -- a real project's own pre-existing AOIs are
+    never edited through it (though `db_export_aoi()` can still export one
+    of THOSE directly, unmodified or after you mutate it via
+    `db_to_controller()`). `ExecutePrescan`/`ExecutePostscan`/
+    `ExecuteEnableInFalse` and read-back beyond `db_get_project_summary()`'s
+    own AOI name list are still explicitly out of scope for this v1 pass.
   - `db_new_aoi_parameter(acd_path, aoi_name, name, data_type,
-    usage="Input", dimension=None, description=None, index=None)` -- add a
-    public parameter to an AOI created via `db_new_aoi()` (RAISES if
-    `aoi_name` is a real project AOI this table doesn't know about --
-    same v1 scope limit as `db_new_aoi()` itself). `usage` is `"Input"`,
-    `"Output"`, or `"InOut"`.
+    usage="Input", dimension=None, description=None, index=None,
+    required=None, visible=None, external_access=None)` -- add a public
+    parameter to an AOI created via `db_new_aoi()` (RAISES if `aoi_name` is
+    a real project AOI this table doesn't know about -- same v1 scope limit
+    as `db_new_aoi()` itself). `usage` is `"Input"`, `"Output"`, or
+    `"InOut"`. `required`/`visible`/`external_access` default to
+    `"true"`/`"true"`/usage-derived when omitted (`None`) -- pass explicit
+    strings to override, e.g. to build the real `EnableIn`/`EnableOut`
+    system-defined parameter pair every Studio-authored AOI carries
+    (`Required="false"`, `Visible="false"`, `ExternalAccess="Read Only"`;
+    `new_aoi_enable_parameters()` at the in-memory `acd.l5x.elements` layer
+    builds this exact pair ready-made if you're constructing `Parameter`
+    objects directly instead of going through `db_*`).
+  - `db_new_aoi_local_tag(acd_path, aoi_name, name, data_type,
+    dimension=None, description=None, index=None)` -- add a private/scratch
+    LocalTag (internal AOI state that shouldn't be a public parameter) to
+    an AOI created via `db_new_aoi()` (same v1 scope/RAISES rule as
+    `db_new_aoi_parameter()`). No `Usage`/`Required`/`Visible` concept --
+    unlike a `Parameter`, a LocalTag is never a public pin.
   - `db_new_routine(acd_path, routine_name, routine_type,
     program_name=None, description=None, aoi_name=None)` -- create a new,
     empty routine (`routine_type` `"RLL"` or `"ST"`) in an EXISTING program
@@ -217,9 +231,9 @@ explicitly if you're confident it's unnecessary and want to skip the pass:
   - `db_export_aoi(acd_path, aoi_name, output_path, owner=None,
     validate=True)` -- a standalone partial L5X for Studio's "Import Add-On
     Instruction..." feature, for creating/modifying an AOI (`db_new_aoi()`/
-    `db_new_aoi_parameter()`/`db_new_routine(..., aoi_name=...)` first).
-    Validates every struct-typed parameter of `aoi_name` itself (NOT its
-    LocalTags -- out of scope, see `db_new_aoi()`). **CAUTION, more so than
+    `db_new_aoi_parameter()`/`db_new_aoi_local_tag()`/
+    `db_new_routine(..., aoi_name=...)` first). Validates every struct-typed
+    parameter AND local tag of `aoi_name` itself. **CAUTION, more so than
     the other two**: this wrapper's shape has never been tried against a
     real Studio 5000 import at all (built by symmetry with the other two
     ALREADY-verified wrappers, not from its own real-import evidence) --
@@ -283,6 +297,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_new_member,
     db_new_aoi,
     db_new_aoi_parameter,
+    db_new_aoi_local_tag,
     db_new_routine,
     db_insert_rung,
     db_delete_rung,

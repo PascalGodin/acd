@@ -703,7 +703,10 @@ class Parameter(L5xElement):
 
 def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
                        dimension: Union[int, None] = None,
-                       description: Union[str, None] = None) -> Parameter:
+                       description: Union[str, None] = None,
+                       required: Union[str, None] = None,
+                       visible: Union[str, None] = None,
+                       external_access: Union[str, None] = None) -> Parameter:
     """Construct a new public `Parameter` for insertion into an AOI's own
     `.parameters` list -- e.g. to add an Input/Output/InOut to a brand-new
     AOI (see `new_aoi()`) before calling `export_aoi()`.
@@ -711,15 +714,19 @@ def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
     `usage` must be `"Input"`, `"Output"`, or `"InOut"`. `radix` is derived
     from `data_type` the same way `new_tag()` does (`None` for a UDT/AOI-
     typed parameter, matching every ACD-decoded struct-typed `Parameter`).
-    `external_access`/`constant` follow the same real convention documented
-    on the `Parameter` dataclass itself: Input/Output gets
-    `external_access="Read/Write"`/`constant=None`; InOut gets
-    `external_access=None`/`constant="false"` (the non-MESSAGE-type case --
-    a MESSAGE-typed InOut parameter, which omits `Constant` too, isn't
-    handled specially here, since nothing in this constructor targets that
-    narrow case). `required`/`visible` both default to `"true"`, matching a
-    freshly-created parameter's typical Studio defaults before anyone
-    unchecks either box.
+
+    `required`/`visible`/`external_access` default to this constructor's own
+    original behavior when omitted (`None`): `required="true"`,
+    `visible="true"`, and `external_access` following the real convention
+    documented on the `Parameter` dataclass itself (Input/Output gets
+    `"Read/Write"`; InOut gets `None`, replaced by `constant="false"` --
+    the non-MESSAGE-type case; a MESSAGE-typed InOut parameter, which omits
+    `Constant` too, isn't handled specially here). Pass an explicit string
+    for any of the three to override -- e.g. to build the real `EnableIn`/
+    `EnableOut` system-defined parameters every Studio-authored AOI carries
+    (`Required="false"`, `Visible="false"`, `ExternalAccess="Read Only"` --
+    see `new_aoi_enable_parameters()` for a ready-made pair instead of
+    passing these by hand).
 
     `dimension`, if given (an `int` > 0), becomes the parameter's array
     size; `None`/`0` means scalar, matching `Tag.dimensions`' own
@@ -733,15 +740,71 @@ def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
         )
     radix = _PRIMITIVE_RADIX.get(data_type.upper())
     if usage == "InOut":
-        external_access = None
+        default_external_access = None
         constant = "false"
     else:
-        external_access = "Read/Write"
+        default_external_access = "Read/Write"
         constant = None
     dimensions = str(dimension) if dimension else None
     return Parameter(
-        name, name, "Base", data_type, usage, radix, "true", "true",
-        external_access, constant, dimensions, _description=description,
+        name, name, "Base", data_type, usage, radix,
+        required if required is not None else "true",
+        visible if visible is not None else "true",
+        external_access if external_access is not None else default_external_access,
+        constant, dimensions, _description=description,
+    )
+
+
+def new_aoi_enable_parameters() -> Tuple[Parameter, Parameter]:
+    """Construct the `EnableIn`/`EnableOut` system-defined BOOL parameter
+    pair every real Studio-authored AOI carries automatically (confirmed
+    present, with these exact attributes, on every real
+    `<AddOnInstructionDefinition>` checked against a real Rockwell AOI
+    export -- see CLAUDE.md's AOI verification notes) -- `new_aoi()` itself
+    does NOT add these, since hand-getting `Required`/`Visible`/
+    `ExternalAccess` right via a bare `new_aoi_parameter()` call is easy to
+    get subtly wrong.
+
+    Returns `(enable_in, enable_out)`; append both to a new AOI's
+    `.parameters` (typically first, before any user-defined parameters,
+    matching real Studio placement) before calling `export_aoi()`.
+    """
+    enable_in = new_aoi_parameter(
+        "EnableIn", "BOOL", usage="Input",
+        required="false", visible="false", external_access="Read Only",
+    )
+    enable_out = new_aoi_parameter(
+        "EnableOut", "BOOL", usage="Output",
+        required="false", visible="false", external_access="Read Only",
+    )
+    return enable_in, enable_out
+
+
+def new_aoi_local_tag(name: str, data_type: str, dimension: Union[int, None] = None,
+                       description: Union[str, None] = None) -> LocalTag:
+    """Construct a new `LocalTag` (private, non-public AOI storage -- scratch
+    values/internal state that shouldn't be a visible Input/Output/InOut
+    parameter) for insertion into an AOI's own `.local_tags` list -- e.g. to
+    add scratch storage to a brand-new AOI (see `new_aoi()`) before calling
+    `export_aoi()`.
+
+    `radix` is derived from `data_type` the same way `new_tag()`/
+    `new_aoi_parameter()` do (`None` for a UDT-typed local tag).
+    `external_access` is always `"Read/Write"`, matching a real ACD-decoded
+    `LocalTag` whose own extended record doesn't declare one
+    (`LocalTagBuilder`'s own fallback, `acd/l5x/elements/builders_routine.py`)
+    -- there is no `Usage`/`Required`/`Visible` concept for a LocalTag at
+    all, unlike `Parameter`.
+
+    `dimension`, if given (an `int` > 0), becomes the tag's array size;
+    `None`/`0` means scalar, matching `new_tag()`/`new_aoi_parameter()`'s
+    own convention.
+    """
+    radix = _PRIMITIVE_RADIX.get(data_type.upper())
+    dimensions = str(dimension) if dimension else None
+    return LocalTag(
+        name, name, data_type, dimensions, radix, "Read/Write",
+        _description=description,
     )
 
 
@@ -1187,18 +1250,15 @@ def new_aoi(name: str, description: Union[str, None] = None) -> AOI:
     `new_member()`/`new_routine()`, with no project object in scope to pull
     a real value from.
 
-    Starts with `.parameters`/`.local_tags`/`.routines` all empty. `.local_tags`
-    specifically has no constructor support at all yet (out of scope per the
-    original request this was built for) -- append `LocalTag(...)` objects
-    directly if needed. Also NOT included: the `EnableIn`/`EnableOut` system-
-    defined parameters every real Studio-authored AOI carries automatically
-    (confirmed present on every `<AddOnInstructionDefinition>` in that same
-    real AOI's export, both the target and its own context dependencies) --
-    add them yourself with `new_aoi_parameter()` if you need a structurally
-    complete AOI (`Required="false"`/`Visible="false"`/
-    `ExternalAccess="Read Only"`, neither of which `new_aoi_parameter()`
-    currently supports either -- construct a `Parameter` by hand for these
-    two if it matters for your case).
+    Starts with `.parameters`/`.local_tags`/`.routines` all empty. Use
+    `new_aoi_local_tag()` to build private/scratch storage for
+    `.local_tags`, and `new_aoi_enable_parameters()` to build the real
+    `EnableIn`/`EnableOut` system-defined parameter pair every Studio-
+    authored AOI carries automatically -- neither is added here by default
+    (this constructor stays a plain, empty starting point), but both exist
+    specifically so a caller doesn't have to hand-construct their attributes
+    (`Required="false"`/`Visible="false"`/`ExternalAccess="Read Only"` for
+    the enable pair) to get a structurally complete AOI.
 
     NOT independently verified against a real Studio 5000 "Import Add-On
     Instruction" -- unlike `export_routine()`/`export_datatype()`, which

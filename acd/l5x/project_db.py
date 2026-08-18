@@ -1736,8 +1736,14 @@ class ProjectDB:
         """Every AOI created via `new_aoi()`/`db_new_aoi()` in THIS project
         DB, fully populated (parameters + logic routine, if any) -- NEVER a
         real project's own pre-existing AOIs (v1 scope limit, see
-        `new_aoi()`'s own docstring). `to_controller()` APPENDS this list
-        onto the real, freshly-decoded `.aois` rather than replacing it.
+        `new_aoi()`'s own docstring). `to_controller()` merges this list
+        onto the real, freshly-decoded `.aois`, with a name collision
+        resolved in favor of the AOI loaded HERE (see `to_controller()`'s
+        own comment for why: once a `db_new_aoi()`-authored AOI is actually
+        imported into Studio and re-saved, the real ACD gains an AOI under
+        the same name too, and the one loaded here is always the more
+        current of the two for anyone still editing that name through
+        `db_*`).
         """
         cur = self._conn.cursor()
         rows = cur.execute(
@@ -1825,10 +1831,33 @@ class ProjectDB:
         controller.__post_init__()  # recompute io_tags/alias_tags from the new .tags
 
         # AOIs are handled differently from every other collection here:
-        # APPENDED, never replaced -- see _load_aois()'s own docstring for
-        # why (a real project's own pre-existing AOIs, including LocalTags
-        # this DB never persists, must never be touched).
-        controller.aois = controller.aois + self._load_aois()
+        # APPENDED, never fully replaced -- see _load_aois()'s own docstring
+        # for why (a real project's own pre-existing AOIs, including
+        # LocalTags this DB never persists, must never be touched or
+        # dropped). BUT a real AOI here CAN share a name with a proj_aois
+        # one: once a db_new_aoi()-authored AOI is actually imported into
+        # Studio and the project re-saved, the next rebuild's fresh
+        # ControllerBuilder decode picks up that AOI for real, while the
+        # user keeps editing the SAME name through db_new_aoi_parameter()/
+        # db_new_aoi_local_tag() against the still-separate proj_aois row --
+        # producing two same-named AOI objects in this one list. Any
+        # name-keyed lookup downstream (this class's own export_aoi(), or a
+        # caller's own next(a for a in aois if a.name == ...)) then risks
+        # silently resolving to whichever happens to come first, which used
+        # to be the real one -- stale relative to every edit made since that
+        # import (a real report: Parameters/LocalTags came back from a
+        # 3-recreate-cycles-ago version while db_get_routine()'s routine
+        # content, sourced independently via proj_routines.aoi_id, was
+        # already correctly fresh). The proj_aois-sourced object is always
+        # the more current one for a name the user is actively authoring
+        # through db_*, so it wins any collision -- exclude the
+        # ControllerBuilder-decoded AOI(s) sharing a name with one loaded
+        # here before appending.
+        new_aois = self._load_aois()
+        new_aoi_names = {a.name.upper() for a in new_aois}
+        controller.aois = [
+            a for a in controller.aois if a.name.upper() not in new_aoi_names
+        ] + new_aois
 
         project = ProjectBuilder(str(self.project_dir / "QuickInfo.XML")).build()
         project.controller = controller

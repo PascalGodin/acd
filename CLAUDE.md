@@ -3584,6 +3584,64 @@ repro: two AOIs, both with a `"Logic"` routine, disambiguated via `aoi_name=` in
 `test_export_aoi_rejects_invalid_routine_name`, `test_export_aoi_accepts_reserved_routine_name`
 (`test/test_api.py`) — full suite re-run clean (342 passed, 2 skipped, up from 335 before this round).
 
+### `to_controller()` returned STALE Parameters/LocalTags for an AOI whose routine content was fresh
+
+The very next real report, from the very same real AOI (`Lug_Advance`), after the `aoi_name=` fix
+above unblocked the naming/routine-disambiguation problem: `db_get_routine(acd_path, "Logic",
+aoi_name="Lug_Advance")` and `db_list_routines()` both correctly showed the CURRENT routine body (a
+74-line ST rewrite, several `db_new_aoi("Lug_Advance", ...)` recreate-cycles later), but
+`db_to_controller(acd_path).controller.aois` — and therefore `db_export_aoi()`, which uses it
+internally — returned a completely different, OLDER `Parameters`/`LocalTags` shape for that same AOI
+(a scalar `AdvTP` with `Required="true"`, `LocalTags` including members that don't exist in the
+current design at all). Net effect: `db_export_aoi()` was producing an internally-inconsistent L5X —
+`<Parameters>` describing `AdvTP` as a scalar while the (correctly fresh) `<Routine>` ST text wrote to
+it as an array (`AdvTP[i] := ...`) — something a real Studio import would either reject outright or,
+worse, accept with a silently wrong definition. One detail in the report turned out to be the key
+clue rather than a red herring: `aoi.local_tags` also included a hex-placeholder-looking name
+(`$...$`) that was never created by any `db_new_aoi_local_tag()` call.
+
+**Root cause, confirmed directly**: the reporting agent had, by this point in the same session,
+actually completed a real Studio 5000 import of an earlier `Lug_Advance.L5X` (see the `aoi_name=`
+section above — that's what surfaced the `"Invalid name"` rejection in the first place; a later retry,
+after renaming the routine to `"Logic"`, evidently succeeded) and the project had been re-saved from
+Studio. On the NEXT `open_project_db()` call, the changed mtime triggered `rebuild=True` — which,
+correctly per `_load_aois()`'s own documented v1 scope, means `ControllerBuilder`'s fresh decode of
+the real ACD NOW includes a real, Studio-authored `Lug_Advance` AOI (the hex-placeholder LocalTag is
+exactly the kind of real, ACD-decoded artifact this codebase has documented elsewhere — see the
+`"__Map:"`/hex-named-connection sections above — never something a synthetic `proj_aois` row would
+ever contain). Meanwhile the user kept iterating on `Lug_Advance` through `db_new_aoi_parameter()`/
+`db_new_aoi_local_tag()`, which (correctly, per `new_aoi()`'s own v1 scope: `db_new_aoi()` never
+checks against real project AOI names) created a SEPARATE, still-fresh `proj_aois` row under the
+identical name. `to_controller()` then did `controller.aois = controller.aois + self._load_aois()` —
+literally concatenating both same-named objects into one list, real-decoded first, `proj_aois`-sourced
+second. `ProjectDB.export_aoi()`'s own lookup (`next(a for a in ... aois if a.name.upper() ==
+aoi_name.upper())`) — and the reporting agent's own diagnostic script's `[a for a in ctrl.aois if
+a.name == "Lug_Advance"][0]` — both pick the FIRST match, i.e. the stale, real one, never reaching the
+fresh one appended right after it.
+
+**Fixed** in `to_controller()` (`acd/l5x/project_db.py`): before appending, any real,
+`ControllerBuilder`-decoded AOI whose name (case-insensitively) collides with one loaded via
+`_load_aois()` is excluded from the real portion first — the `proj_aois`-sourced object always wins a
+name collision, on the reasoning that it's unconditionally the more current state of that name for
+anyone actively editing it through `db_*` (the same reasoning already applied everywhere else in this
+subsystem: `proj_*` tables ARE the live, editable project state). This is a targeted collision rule,
+not a reversal of the "never materialize a real AOI into `proj_aois`" v1 design decision — a real AOI
+with NO name collision is completely unaffected, still sourced fresh from the ACD with its real
+LocalTags intact, exactly as before.
+
+The hex-placeholder LocalTag needed no separate fix: `LocalTag._l5x_exclude` (checked generically by
+every list-section XML serializer, `acd/l5x/elements/base.py`) already excludes any name whose first
+character isn't alphabetic/`_` — a `$hex$`-style name was already being filtered out of `<LocalTags>`
+XML rendering before this fix; it was only ever a diagnostic clue (proof the picked object was the
+real, ACD-decoded one), never itself a rendering bug.
+
+Covered by `test_new_aoi_wins_name_collision_against_real_pre_existing_aoi` (constructs the exact
+collision using the real `AddOnInstruction` AOI in the `ACDTestsWithAOI.ACD` fixture, confirms exactly
+ONE object survives per name and it's the fresh one) and
+`test_db_export_aoi_uses_fresh_parameters_on_name_collision` (end-to-end through `db_export_aoi()`,
+confirming the rendered L5X reflects the fresh parameter, not the real fixture AOI's own) —
+`test/test_project_db.py`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

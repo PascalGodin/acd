@@ -874,6 +874,47 @@ def test_new_aoi_never_touches_real_pre_existing_aoi(aoi_acd_copy):
         db.close()
 
 
+def test_new_aoi_wins_name_collision_against_real_pre_existing_aoi(aoi_acd_copy):
+    # Regression test for a real report: once a db_new_aoi()-authored AOI is
+    # actually imported into Studio and the project re-saved, the next
+    # rebuild's fresh ControllerBuilder decode picks up that AOI for real,
+    # while proj_aois keeps its own separate, still-being-edited row under
+    # the same name -- to_controller() used to APPEND the fresh proj_aois
+    # object after the real one, so a name-keyed lookup (this class's own
+    # export_aoi(), or any next(a for a in aois if a.name == ...)) could
+    # silently resolve to the stale real one instead. The fixture's real
+    # AOI is named "AddOnInstruction" -- reuse that exact name for a
+    # brand-new proj_aois entry to force the collision.
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    real_aoi = next(a for a in reference.controller.aois if a.name == "AddOnInstruction")
+    real_param_names = [p.name for p in real_aoi.parameters]
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.new_aoi("AddOnInstruction")
+        db.new_aoi_parameter("AddOnInstruction", "FreshParam", "DINT", usage="Input")
+
+        project = db.to_controller()
+        matches = [a for a in project.controller.aois if a.name == "AddOnInstruction"]
+        assert len(matches) == 1, "the real and proj_aois-sourced AOI must not both survive"
+        aoi = matches[0]
+        assert [p.name for p in aoi.parameters] == ["FreshParam"]
+        assert [p.name for p in aoi.parameters] != real_param_names
+    finally:
+        db.close()
+
+
+def test_db_export_aoi_uses_fresh_parameters_on_name_collision(aoi_acd_copy, tmp_path):
+    db_new_aoi(str(aoi_acd_copy), "AddOnInstruction")
+    db_new_aoi_parameter(str(aoi_acd_copy), "AddOnInstruction", "FreshParam", "DINT",
+                          usage="Input")
+
+    output_path = tmp_path / "collided_aoi.L5X"
+    db_export_aoi(str(aoi_acd_copy), "AddOnInstruction", str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'Name="FreshParam"' in content
+
+
 def test_db_new_aoi_stateless_wrappers_and_export(acd_copy, tmp_path):
     db_new_aoi(str(acd_copy), "PDB_NEW_AOI", description="a test AOI")
     db_new_aoi_parameter(str(acd_copy), "PDB_NEW_AOI", "In1", "DINT", usage="Input")

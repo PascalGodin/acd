@@ -48,15 +48,16 @@ step, so a call never returns more than actually asked for:
   - `db_list_routines(acd_path, program_name=None)` -- name/type/line-count
     for every routine, no rung/line content -- then `db_get_routine()` for
     one routine's actual logic.
-  - `db_get_routine(acd_path, routine_name, program_name=None)` -- one
-    routine's current rungs/comments (or ST lines) plus its description.
-    A routine name is only unique WITHIN a program (many projects have a
-    "Main" in several programs) -- raises `ValueError` if ambiguous and no
-    `program_name` was given, rather than silently picking one. Its
-    `"rung_comments"` is `Dict[int, str]` keyed by the INTEGER rung index
-    (same index space as `"rungs"`) -- NOT stringified keys;
-    `comments.get(str(i))` silently returns `None` for every rung instead
-    of erroring, so use the int index directly.
+  - `db_get_routine(acd_path, routine_name, program_name=None,
+    aoi_name=None)` -- one routine's current rungs/comments (or ST lines)
+    plus its description. A routine name is only unique WITHIN a program or
+    AOI (many projects have a "Main" in several programs, and nearly every
+    AOI names its own routine "Logic") -- raises `ValueError` if ambiguous
+    and neither `program_name` nor `aoi_name` was given, rather than
+    silently picking one. Its `"rung_comments"` is `Dict[int, str]` keyed by
+    the INTEGER rung index (same index space as `"rungs"`) -- NOT
+    stringified keys; `comments.get(str(i))` silently returns `None` for
+    every rung instead of erroring, so use the int index directly.
   - `db_list_tags(acd_path, program_name=None)` -- name/data_type/
     dimensions/description for tags in one scope, WITHOUT the decoded
     value (can be large on its own for a UDT array tag) -- then
@@ -135,55 +136,83 @@ EDITS -- durable the moment the call returns (see above), each raising
     `program_name`/`aoi_name` is required (unlike `db_new_tag()`, there is
     no controller-scope routine concept to default to for either). Use
     `db_insert_rung()`/`db_insert_st_line()` afterward to populate it.
+    **When `aoi_name` is given, `routine_name` MUST be one of `"Logic"`/
+    `"Prescan"`/`"Postscan"`/`"EnableInFalse"`** -- unlike a Program's
+    routine, an AOI's own routine name is a fixed, Rockwell-reserved set
+    (confirmed via a real Studio 5000 import rejection of a differently-
+    named routine: `"Invalid name for Add-On Instruction routine."`).
+    RAISES immediately if you pass anything else, rather than letting a
+    creatively-named routine (e.g. named after the AOI itself, to dodge a
+    collision with every other AOI's own `"Logic"` routine) fail much
+    later at import time.
+  - EVERY routine-content function below EXCEPT `db_export_routine`
+    (`db_insert_rung`, `db_delete_rung`, `db_replace_rung_safe`,
+    `db_set_rung_comment`, `db_insert_st_line`, `db_delete_st_line`,
+    `db_replace_st_line_safe`, `db_delete_routine`, `db_get_routine`) also
+    accepts `aoi_name=` alongside `program_name=` (exactly one of the two,
+    or neither to search every program AND AOI and raise if ambiguous) --
+    this is how you address an AOI's `"Logic"` routine, since nearly every
+    AOI in a real project uses that exact name and `program_name=` doesn't
+    resolve AOI scope at all. Was a real, confirmed gap: creating an
+    AOI-scoped routine via `aoi_name=` worked, but nothing downstream could
+    address it back, forcing a workaround of renaming the routine away from
+    Rockwell's own convention -- fixed by adding `aoi_name=` everywhere
+    `program_name=` was already accepted for a routine, not just at
+    creation. `db_export_routine` accepts `aoi_name=` too, but ALWAYS
+    raises if given -- see its own bullet below for why (there's no
+    "Import Routine" mechanism for an AOI-owned routine at all; use
+    `db_export_aoi()` instead).
   - `db_insert_rung(acd_path, routine_name, index, text, comment=None,
-    program_name=None)` / `db_delete_rung(acd_path, routine_name, index,
-    program_name=None)` -- RLL ONLY, raises `ValueError` if the routine's
-    own type isn't `"RLL"` (see `db_insert_st_line`/`db_delete_st_line`
-    below for ST). `text` is also checked for unbalanced brackets and a
-    one-member `"[...]"` branch group (see `_validate_rll_rung_syntax()`)
-    before being inserted; raises `ValueError` instead of silently
-    accepting rung text a real Studio 5000 import would reject.
+    program_name=None, aoi_name=None)` / `db_delete_rung(acd_path,
+    routine_name, index, program_name=None, aoi_name=None)` -- RLL ONLY,
+    raises `ValueError` if the routine's own type isn't `"RLL"` (see
+    `db_insert_st_line`/`db_delete_st_line` below for ST). `text` is also
+    checked for unbalanced brackets and a one-member `"[...]"` branch group
+    (see `_validate_rll_rung_syntax()`) before being inserted; raises
+    `ValueError` instead of silently accepting rung text a real Studio 5000
+    import would reject.
   - `db_replace_rung_safe(acd_path, routine_name, index, expected_old,
-    new_text, program_name=None)` -- RLL ONLY (same type guard as above;
-    use `db_replace_st_line_safe` for ST). Edit an EXISTING rung's text,
-    but only if it still matches `expected_old` (raises with a readable
-    diff otherwise) -- guards against clobbering a rung someone
+    new_text, program_name=None, aoi_name=None)` -- RLL ONLY (same type
+    guard as above; use `db_replace_st_line_safe` for ST). Edit an EXISTING
+    rung's text, but only if it still matches `expected_old` (raises with a
+    readable diff otherwise) -- guards against clobbering a rung someone
     hand-edited in Studio since your last read. This guard is about
     editing the WRONG rung, not rung grammar -- `new_text` gets the same
     RLL syntax check as `db_insert_rung()` above, run separately, after
     the match check.
   - `db_set_rung_comment(acd_path, routine_name, index, comment,
-    program_name=None)` -- set or clear (`comment=None`) a rung's comment
-    WITHOUT touching its text; use this instead of delete_rung+insert_rung
-    just to rename a comment.
+    program_name=None, aoi_name=None)` -- set or clear (`comment=None`) a
+    rung's comment WITHOUT touching its text; use this instead of
+    delete_rung+insert_rung just to rename a comment.
   - `db_insert_st_line(acd_path, routine_name, index, text,
-    program_name=None)` / `db_delete_st_line(acd_path, routine_name,
-    index, program_name=None)` / `db_replace_st_line_safe(acd_path,
-    routine_name, index, expected_old, new_text, program_name=None)` --
-    ST ONLY (raises `ValueError` if the routine's own type isn't `"ST"`),
-    same shapes as the RLL `*_rung*` functions above but for an ST
-    routine's `"st_lines"`. Added because the RLL functions above used to
-    accept being called on an ST routine with NO error -- silently writing
-    into `"rungs"` (which `export_routine()` never reads for an ST
-    routine) while the routine's real `"st_lines"` (what actually gets
-    exported/imported) stayed untouched. That looked like a successful,
-    committed edit with nothing marking it as wrong -- caught only because
-    a downstream agent happened to diff `"st_lines"` before/after on a
-    scratch copy before ever exporting for real. `db_insert_st_line`/etc.
-    give ST routines their own real editing primitives instead of a
-    silently-wrong RLL one; NO RLL syntax check applies to ST lines (ST
-    syntax validation doesn't exist yet).
+    program_name=None, aoi_name=None)` / `db_delete_st_line(acd_path,
+    routine_name, index, program_name=None, aoi_name=None)` /
+    `db_replace_st_line_safe(acd_path, routine_name, index, expected_old,
+    new_text, program_name=None, aoi_name=None)` -- ST ONLY (raises
+    `ValueError` if the routine's own type isn't `"ST"`), same shapes as
+    the RLL `*_rung*` functions above but for an ST routine's `"st_lines"`.
+    Added because the RLL functions above used to accept being called on an
+    ST routine with NO error -- silently writing into `"rungs"` (which
+    `export_routine()` never reads for an ST routine) while the routine's
+    real `"st_lines"` (what actually gets exported/imported) stayed
+    untouched. That looked like a successful, committed edit with nothing
+    marking it as wrong -- caught only because a downstream agent happened
+    to diff `"st_lines"` before/after on a scratch copy before ever
+    exporting for real. `db_insert_st_line`/etc. give ST routines their own
+    real editing primitives instead of a silently-wrong RLL one; NO RLL
+    syntax check applies to ST lines (ST syntax validation doesn't exist
+    yet).
   - `db_delete_tag(acd_path, name, program_name=None)` /
-    `db_delete_routine(acd_path, routine_name, program_name=None)` /
-    `db_delete_member(acd_path, data_type_name, member_name)` -- remove
-    dead code (e.g. a tag/routine/member left behind after a redesign)
-    from this project's DB bookkeeping. Does NOT delete anything in the
-    real `.ACD`/Studio project -- Studio's native Import Routine/Import
-    Data Type mechanism has no delete semantics (it can only add/update
-    entities present in the partial L5X, never remove ones that aren't
-    mentioned), so removing something from the real project still needs a
-    manual Studio action regardless. This only stops an abandoned entry
-    from cluttering `db_list_tags()`/`db_list_routines()`/
+    `db_delete_routine(acd_path, routine_name, program_name=None,
+    aoi_name=None)` / `db_delete_member(acd_path, data_type_name,
+    member_name)` -- remove dead code (e.g. a tag/routine/member left
+    behind after a redesign) from this project's DB bookkeeping. Does NOT
+    delete anything in the real `.ACD`/Studio project -- Studio's native
+    Import Routine/Import Data Type mechanism has no delete semantics (it
+    can only add/update entities present in the partial L5X, never remove
+    ones that aren't mentioned), so removing something from the real
+    project still needs a manual Studio action regardless. This only stops
+    an abandoned entry from cluttering `db_list_tags()`/`db_list_routines()`/
     `db_get_project_summary()` forever with nothing marking it as dead.
 
 MULTI-STEP EDITS THAT MUST SUCCEED OR FAIL TOGETHER -- each `db_*` call
@@ -217,12 +246,17 @@ structure; for `db_export_routine`, malformed RLL rung syntax -- see
 is the wrong kind of thing to leave opt-in. Pass `validate=False`
 explicitly if you're confident it's unnecessary and want to skip the pass:
   - `db_export_routine(acd_path, routine_name, output_path,
-    program_name=None, owner=None, validate=True)` -- a standalone
-    partial L5X for Studio's "Import Routine" feature, covering both rung
-    edits and any tag this routine's logic references. Validates every
-    struct-typed name reachable from a referenced tag's own DataType tree,
-    AND (for an RLL routine) every rung's syntax via
-    `_validate_rll_rung_syntax()`.
+    program_name=None, aoi_name=None, owner=None, validate=True)` -- a
+    standalone partial L5X for Studio's "Import Routine" feature, covering
+    both rung edits and any tag this routine's logic references. Validates
+    every struct-typed name reachable from a referenced tag's own DataType
+    tree, AND (for an RLL routine) every rung's syntax via
+    `_validate_rll_rung_syntax()`. `aoi_name` is accepted for signature
+    symmetry with the routine-content functions above but ALWAYS raises --
+    Studio has no "Import Routine" mechanism for a routine living inside an
+    AddOnInstructionDefinition; use `db_export_aoi()` for an AOI's routine
+    instead, which exports the whole AOI (including this routine's
+    content).
   - `db_export_datatype(acd_path, data_type_name, output_path, owner=None,
     validate=True)` -- a standalone partial L5X for Studio's "Import Data
     Type..." feature, for creating/modifying a UDT (e.g. inserting a
@@ -233,7 +267,12 @@ explicitly if you're confident it's unnecessary and want to skip the pass:
     Instruction..." feature, for creating/modifying an AOI (`db_new_aoi()`/
     `db_new_aoi_parameter()`/`db_new_aoi_local_tag()`/
     `db_new_routine(..., aoi_name=...)` first). Validates every struct-typed
-    parameter AND local tag of `aoi_name` itself. **CAUTION, more so than
+    parameter AND local tag of `aoi_name` itself, and (unconditionally, not
+    gated by `validate=`) that every one of its routine names is one of
+    Rockwell's own reserved set (`"Logic"`/`"Prescan"`/`"Postscan"`/
+    `"EnableInFalse"` -- `db_new_routine(..., aoi_name=...)` already
+    enforces this at creation time, this is defense-in-depth for a routine
+    that reached `.routines` some other way). **CAUTION, more so than
     the other two**: this wrapper's shape has never been tried against a
     real Studio 5000 import at all (built by symmetry with the other two
     ALREADY-verified wrappers, not from its own real-import evidence) --

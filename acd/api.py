@@ -1559,6 +1559,22 @@ def export_datatype(project: RSLogix5000Content, data_type: DataType, output_pat
     Path(output_path).write_text(xml, encoding="utf-8")
 
 
+# A routine living directly under an AddOnInstructionDefinition is NOT
+# free-named the way a Program's routine is -- confirmed two ways: (1) a
+# real Studio 5000 import of a routine named "Lug_Advance_Logic" (an
+# otherwise valid, well-formed export) was rejected outright with "Error
+# creating 'Routine' (Invalid name for Add-On Instruction routine.)"; (2) the
+# real, Rockwell-authored AOI_SNTP_QUERY ground-truth export (see CLAUDE.md's
+# AOI verification notes) uses ONLY "Logic"/"Prescan" for its own routines,
+# never a custom name, across every AddOnInstructionDefinition in that file
+# (the target AND its own context dependencies). "Postscan"/"EnableInFalse"
+# complete the set by direct symmetry with the AOI's own
+# ExecutePrescan/ExecutePostscan/ExecuteEnableInFalse flags (not
+# independently observed, since neither flag was "true" in that sample) --
+# revisit if a real sample using either surfaces different rules.
+_AOI_RESERVED_ROUTINE_NAMES = {"Logic", "Prescan", "Postscan", "EnableInFalse"}
+
+
 def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
                 owner: str = None, validate: bool = False) -> None:
     """Export a single Add-On Instruction as a standalone, partial L5X file,
@@ -1636,6 +1652,16 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
             "(for a brand-new AOI) or pass the same AOI object obtained from "
             "project.controller.aois"
         )
+
+    for routine in aoi.routines:
+        if routine.name not in _AOI_RESERVED_ROUTINE_NAMES:
+            raise ValueError(
+                f"AOI routine name {routine.name!r} is not valid -- unlike a Program's "
+                f"routine, an AddOnInstructionDefinition's own routine must be named one "
+                f"of {sorted(_AOI_RESERVED_ROUTINE_NAMES)} (confirmed via a real Studio "
+                f"5000 import rejection: \"Invalid name for Add-On Instruction routine.\"). "
+                f"Rename it (typically to 'Logic') before exporting."
+            )
 
     _sync_data_types_map(project)
 

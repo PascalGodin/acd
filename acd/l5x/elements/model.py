@@ -1176,6 +1176,20 @@ def new_routine(name: str, routine_type: str, description: Union[str, None] = No
     (see CLAUDE.md's "RLL rung edit primitives silently accepted being
     called on ST routines"), so there's no separate guard needed here beyond
     picking a valid `routine_type` up front.
+
+    If appending the result to an AOI's own `.routines` (rather than a
+    Program's), `name` is NOT free-form the way a Program routine's is --
+    Rockwell only accepts `"Logic"`/`"Prescan"`/`"Postscan"`/
+    `"EnableInFalse"` for a routine directly under an
+    AddOnInstructionDefinition (confirmed via a real Studio 5000 import
+    rejection of a differently-named routine: `"Invalid name for Add-On
+    Instruction routine."`) -- this constructor doesn't know which
+    collection you're about to append its result to, so it can't enforce
+    this itself; `export_aoi()`/`ProjectDB.new_routine(..., aoi_name=...)`
+    both do. Use `aoi_name=` on `insert_rung()`/`insert_st_line()`/
+    `get_routine()`/`export_routine()`/etc. (`acd.l5x.project_db`) to
+    disambiguate an AOI's `"Logic"` routine from every other AOI's own
+    `"Logic"` routine, instead of renaming it to something distinctive.
     """
     if routine_type not in ("RLL", "ST"):
         raise ValueError(

@@ -66,6 +66,7 @@ from typing import Dict, List, Union
 from loguru import logger as log
 
 from acd.api import (
+    _AOI_RESERVED_ROUTINE_NAMES,
     diff_io_addresses as _diff_io_addresses,
     diff_project as _diff_project,
     diff_routine as _diff_routine,
@@ -763,6 +764,23 @@ class ProjectDB:
 
     # ---- scope resolution helpers ----
 
+    @staticmethod
+    def _get_routine_scope(program_name: Union[str, None], aoi_name: Union[str, None]) -> Union[str, None]:
+        """Translate this class's own `program_name=`/`aoi_name=` pair into
+        the single `program_name=` string `acd.api.get_routine()` expects --
+        that function already supports AOI-owned routines via its own
+        pre-existing `program_name=f"AOI:{aoi_name}"` convention (see its
+        docstring), so `export_routine()`/`get_routine()` below translate
+        into that rather than needing a second resolution mechanism.
+        """
+        if program_name is not None and aoi_name is not None:
+            raise ValueError(
+                "pass at most one of program_name/aoi_name to disambiguate a routine, not both"
+            )
+        if aoi_name is not None:
+            return f"AOI:{aoi_name}"
+        return program_name
+
     def _program_id(self, program_name: Union[str, None]) -> int:
         if program_name is None:
             return _CONTROLLER_SCOPE
@@ -786,19 +804,24 @@ class ProjectDB:
             )
         return row[0]
 
-    def _routine_id(self, routine_name: str, program_name: Union[str, None]) -> int:
+    def _routine_id(self, routine_name: str, program_name: Union[str, None] = None,
+                     aoi_name: Union[str, None] = None) -> int:
         """Resolve a routine name to its `proj_routines.id`.
 
-        `program_name` given: looks ONLY in that program (unchanged, original
-        behavior). `program_name=None` (default): searches every program AND
-        every AOI created via `new_aoi()`/`db_new_aoi()` -- raises `ValueError`
-        naming every scope a match was found in if genuinely ambiguous. There
-        is currently no equivalent `aoi_name=` disambiguation parameter (unlike
-        `program_name=`) -- if a routine name collides between two AOIs, or an
-        AOI and a program, rename one of them; this wasn't worth a signature
-        change on every routine method for what should be a rare collision in
-        practice (an AOI's own logic routine name is usually distinctive).
+        `program_name` given: looks ONLY in that program. `aoi_name` given:
+        looks ONLY in that AOI (created via `new_aoi()`/`db_new_aoi()` in
+        THIS project DB -- same v1 scope limit as `_aoi_id()`). Passing both
+        raises `ValueError`. Neither given (both `None`, the default):
+        searches every program AND every AOI -- raises `ValueError` naming
+        every scope a match was found in if genuinely ambiguous (this is the
+        case an AOI whose routine uses Rockwell's own conventional name,
+        e.g. `"Logic"`, hits immediately -- pass `aoi_name=`/`program_name=`
+        to disambiguate).
         """
+        if program_name is not None and aoi_name is not None:
+            raise ValueError(
+                "pass at most one of program_name/aoi_name to disambiguate a routine, not both"
+            )
         if program_name is not None:
             program_id = self._program_id(program_name)
             row = self._conn.execute(
@@ -807,6 +830,15 @@ class ProjectDB:
             ).fetchone()
             if row is None:
                 raise KeyError(f"No routine {routine_name!r} in program {program_name!r}")
+            return row[0]
+        if aoi_name is not None:
+            aoi_id = self._aoi_id(aoi_name)
+            row = self._conn.execute(
+                "SELECT id FROM proj_routines WHERE aoi_id=? AND name=? COLLATE NOCASE",
+                (aoi_id, routine_name),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No routine {routine_name!r} in AOI {aoi_name!r}")
             return row[0]
         rows = self._conn.execute(
             "SELECT r.id, COALESCE(p.name, '(AOI:' || a.name || ')') FROM proj_routines r "
@@ -821,7 +853,7 @@ class ProjectDB:
             scopes = [s for _, s in rows]
             raise ValueError(
                 f"Routine name {routine_name!r} is ambiguous -- found in "
-                f"{scopes}; pass program_name= to disambiguate"
+                f"{scopes}; pass program_name= or aoi_name= to disambiguate"
             )
         return rows[0][0]
 
@@ -1216,12 +1248,29 @@ class ProjectDB:
         `KeyError` if the given scope name doesn't resolve,
         `sqlite3.IntegrityError` if a routine with this name already exists
         in that scope.
+
+        When `aoi_name` is given, `routine_name` must be one of
+        `"Logic"`/`"Prescan"`/`"Postscan"`/`"EnableInFalse"` -- unlike a
+        Program's routine, an AOI's own routine name is a fixed, Rockwell-
+        reserved set, confirmed via a real Studio 5000 import rejection
+        (`"Invalid name for Add-On Instruction routine."`) of a routine
+        named after the AOI itself (a natural, but wrong, first guess for
+        avoiding a name collision with every other AOI's own `"Logic"`
+        routine -- see `_routine_id()`'s `aoi_name=` support below for the
+        actual way to disambiguate that without renaming anything).
         """
         if (program_name is None) == (aoi_name is None):
             raise ValueError(
                 "new_routine(): exactly one of program_name/aoi_name is required -- a "
                 "routine always belongs to exactly one Program or one AOI, never both "
                 "and never neither."
+            )
+        if aoi_name is not None and routine_name not in _AOI_RESERVED_ROUTINE_NAMES:
+            raise ValueError(
+                f"new_routine(): {routine_name!r} is not a valid AOI routine name -- must "
+                f"be one of {sorted(_AOI_RESERVED_ROUTINE_NAMES)}. Use aoi_name= on "
+                f"insert_rung()/insert_st_line()/get_routine()/export_routine()/etc. to "
+                f"address this routine unambiguously without needing a distinctive name."
             )
         routine = _new_routine(routine_name, routine_type, description=description)
         cur = self._conn.cursor()
@@ -1247,7 +1296,8 @@ class ProjectDB:
 
     def insert_rung(self, routine_name: str, index: int, text: str,
                      comment: Union[str, None] = None,
-                     program_name: Union[str, None] = None) -> None:
+                     program_name: Union[str, None] = None,
+                     aoi_name: Union[str, None] = None) -> None:
         """SQL equivalent of `Routine.insert_rung()` -- shifts every rung
         at or after `index` up by one, same shape as the in-memory
         version's list-splice. The shift goes through a temporary negative
@@ -1276,7 +1326,7 @@ class ProjectDB:
         imported -- stayed untouched, looking exactly like a successful
         edit that silently never took effect).
         """
-        routine_id = self._routine_id(routine_name, program_name)
+        routine_id = self._routine_id(routine_name, program_name, aoi_name)
         routine_type = self._routine_type(routine_id)
         if routine_type != "RLL":
             raise ValueError(
@@ -1307,7 +1357,8 @@ class ProjectDB:
             self._conn.commit()
 
     def delete_rung(self, routine_name: str, index: int,
-                     program_name: Union[str, None] = None) -> None:
+                     program_name: Union[str, None] = None,
+                     aoi_name: Union[str, None] = None) -> None:
         """SQL equivalent of `Routine.delete_rung()` -- same negative-
         intermediate shift technique as `insert_rung()`, for the same
         reason (shifting down can just as easily collide mid-UPDATE).
@@ -1315,7 +1366,7 @@ class ProjectDB:
         Raises `ValueError` if the routine's own type isn't `"RLL"` -- see
         `insert_rung()`'s docstring for why this guard exists.
         """
-        routine_id = self._routine_id(routine_name, program_name)
+        routine_id = self._routine_id(routine_name, program_name, aoi_name)
         routine_type = self._routine_type(routine_id)
         if routine_type != "RLL":
             raise ValueError(
@@ -1341,7 +1392,8 @@ class ProjectDB:
             self._conn.commit()
 
     def replace_rung_safe(self, routine_name: str, index: int, expected_old: str,
-                           new_text: str, program_name: Union[str, None] = None) -> None:
+                           new_text: str, program_name: Union[str, None] = None,
+                           aoi_name: Union[str, None] = None) -> None:
         """SQL equivalent of `replace_rung_safe()` -- optimistic-concurrency
         guard: raises `ValueError` (showing expected vs. actual) if the
         rung at `index` no longer matches `expected_old`.
@@ -1359,7 +1411,7 @@ class ProjectDB:
         `insert_rung()`'s docstring for why this guard exists; use
         `replace_st_line_safe()` instead for an ST routine.
         """
-        routine_id = self._routine_id(routine_name, program_name)
+        routine_id = self._routine_id(routine_name, program_name, aoi_name)
         routine_type = self._routine_type(routine_id)
         if routine_type != "RLL":
             raise ValueError(
@@ -1387,7 +1439,8 @@ class ProjectDB:
             self._conn.commit()
 
     def set_rung_comment(self, routine_name: str, index: int, comment: Union[str, None],
-                          program_name: Union[str, None] = None) -> None:
+                          program_name: Union[str, None] = None,
+                          aoi_name: Union[str, None] = None) -> None:
         """Set or clear a rung's comment WITHOUT touching its text --
         `comment=None` clears it. Added because the only prior way to
         rename a rung's comment was `delete_rung()` + `insert_rung()` with
@@ -1395,7 +1448,7 @@ class ProjectDB:
         `replace_rung_safe()`'s optimistic-concurrency guard. Raises
         `KeyError` if no rung exists at `index` in this routine.
         """
-        routine_id = self._routine_id(routine_name, program_name)
+        routine_id = self._routine_id(routine_name, program_name, aoi_name)
         cur = self._conn.cursor()
         row = cur.execute(
             "SELECT id FROM proj_rungs WHERE routine_id=? AND rung_index=?", (routine_id, index)
@@ -1409,7 +1462,8 @@ class ProjectDB:
             self._conn.commit()
 
     def insert_st_line(self, routine_name: str, index: int, text: str,
-                        program_name: Union[str, None] = None) -> None:
+                        program_name: Union[str, None] = None,
+                        aoi_name: Union[str, None] = None) -> None:
         """The ST counterpart to `insert_rung()` -- shifts every line at or
         after `index` down by one, via the same negative-intermediate-value
         technique (`(routine_id, line_index)` has the same `UNIQUE`-
@@ -1422,7 +1476,7 @@ class ProjectDB:
         RLL routine's real source lives in `proj_rungs` (see
         `insert_rung()`), not `proj_st_lines`.
         """
-        routine_id = self._routine_id(routine_name, program_name)
+        routine_id = self._routine_id(routine_name, program_name, aoi_name)
         routine_type = self._routine_type(routine_id)
         if routine_type != "ST":
             raise ValueError(
@@ -1451,14 +1505,15 @@ class ProjectDB:
             self._conn.commit()
 
     def delete_st_line(self, routine_name: str, index: int,
-                        program_name: Union[str, None] = None) -> None:
+                        program_name: Union[str, None] = None,
+                        aoi_name: Union[str, None] = None) -> None:
         """The ST counterpart to `delete_rung()` -- same negative-
         intermediate shift technique as `insert_st_line()`.
 
         Raises `ValueError` if the routine's own type isn't `"ST"` -- see
         `insert_st_line()`'s docstring for why this guard exists.
         """
-        routine_id = self._routine_id(routine_name, program_name)
+        routine_id = self._routine_id(routine_name, program_name, aoi_name)
         routine_type = self._routine_type(routine_id)
         if routine_type != "ST":
             raise ValueError(
@@ -1485,7 +1540,8 @@ class ProjectDB:
             self._conn.commit()
 
     def replace_st_line_safe(self, routine_name: str, index: int, expected_old: str,
-                              new_text: str, program_name: Union[str, None] = None) -> None:
+                              new_text: str, program_name: Union[str, None] = None,
+                              aoi_name: Union[str, None] = None) -> None:
         """SQL equivalent of `replace_st_line_safe()` -- the ST counterpart
         to `replace_rung_safe()`, same optimistic-concurrency guard: raises
         `ValueError` (showing expected vs. actual) if the line at `index`
@@ -1494,7 +1550,7 @@ class ProjectDB:
         Raises `ValueError` if the routine's own type isn't `"ST"` -- use
         `replace_rung_safe()` instead for an RLL routine.
         """
-        routine_id = self._routine_id(routine_name, program_name)
+        routine_id = self._routine_id(routine_name, program_name, aoi_name)
         routine_type = self._routine_type(routine_id)
         if routine_type != "ST":
             raise ValueError(
@@ -1552,14 +1608,15 @@ class ProjectDB:
         if not self._in_transaction:
             self._conn.commit()
 
-    def delete_routine(self, routine_name: str, program_name: Union[str, None] = None) -> None:
+    def delete_routine(self, routine_name: str, program_name: Union[str, None] = None,
+                        aoi_name: Union[str, None] = None) -> None:
         """Remove a routine (and all its rungs/ST lines) from this
         project's DB. Same real-`.ACD` caveat as `delete_tag()` -- this
         only cleans up the persistent DB's own bookkeeping, not the real
         Studio project. Raises `KeyError`/`ValueError` the same way
         `get_routine()` does for a missing/ambiguous name.
         """
-        routine_id = self._routine_id(routine_name, program_name)
+        routine_id = self._routine_id(routine_name, program_name, aoi_name)
         cur = self._conn.cursor()
         cur.execute("DELETE FROM proj_rungs WHERE routine_id=?", (routine_id,))
         cur.execute("DELETE FROM proj_st_lines WHERE routine_id=?", (routine_id,))
@@ -1780,6 +1837,7 @@ class ProjectDB:
     # ---- export bridge ----
 
     def export_routine(self, routine_name: str, output_path, program_name: Union[str, None] = None,
+                        aoi_name: Union[str, None] = None,
                         owner: Union[str, None] = None, validate: bool = True) -> None:
         """`to_controller()` + `get_routine()` + the existing, unmodified
         `export_routine()` in one call.
@@ -1798,7 +1856,27 @@ class ProjectDB:
         `validate=True` nor `replace_rung_safe()`'s own guard caught before
         Studio's own import parser did. Pass `validate=False` explicitly to
         skip both checks if you're confident they're unnecessary.
+
+        `aoi_name` is accepted for signature symmetry with the other routine
+        methods (`insert_rung()`, `get_routine()`, ...), but ALWAYS raises
+        `ValueError` if given -- Studio 5000 has no "Import Routine"
+        mechanism for a routine living inside an AddOnInstructionDefinition
+        (unlike a Program's routine); the whole-AOI `export_aoi()` (via
+        Studio's separate "Import Add-On Instruction..." feature) is the
+        only export path for an AOI's own routine, including its content.
+        Found the hard way: passing `aoi_name` through to the underlying,
+        Program-only `export_routine()` (acd.api) surfaced as a confusing
+        "routine not found in any program of this project" instead of
+        pointing at the actual fix.
         """
+        if aoi_name is not None:
+            raise ValueError(
+                "export_routine() cannot export an AOI-owned routine -- Studio 5000 has "
+                "no 'Import Routine' mechanism for a routine inside an "
+                "AddOnInstructionDefinition. Use export_aoi()/db_export_aoi() instead, "
+                "which exports the whole AOI (including this routine's content) via "
+                "Studio's 'Import Add-On Instruction...' feature."
+            )
         project = self.to_controller()
         routine = _get_routine(project, routine_name, program_name)
         _export_routine(project, routine, output_path, owner=owner, validate=validate)
@@ -1858,7 +1936,8 @@ class ProjectDB:
     def get_project_summary(self) -> dict:
         return _get_project_summary(self.to_controller())
 
-    def get_routine(self, routine_name: str, program_name: Union[str, None] = None) -> dict:
+    def get_routine(self, routine_name: str, program_name: Union[str, None] = None,
+                     aoi_name: Union[str, None] = None) -> dict:
         """The current content of one routine -- name/type/description,
         RLL rungs + their comments, or ST lines. Returns a plain dict
         (not a `Routine` object) to keep this surface self-contained --
@@ -1873,8 +1952,12 @@ class ProjectDB:
         every index 0..len(rungs) is present). `comments.get(str(i))` will
         silently return `None` for every rung -- no exception, just quietly
         wrong/empty data.
+
+        Pass `aoi_name=` (not `program_name=`) to read an AOI-owned logic
+        routine -- exactly one of `program_name`/`aoi_name` may be given.
         """
-        routine = _get_routine(self.to_controller(), routine_name, program_name)
+        scope = self._get_routine_scope(program_name, aoi_name)
+        routine = _get_routine(self.to_controller(), routine_name, scope)
         return {
             "name": routine.name,
             "type": routine.type,
@@ -2039,64 +2122,74 @@ def db_new_routine(acd_path, routine_name: str, routine_type: str,
 
 def db_insert_rung(acd_path, routine_name: str, index: int, text: str,
                     comment: Union[str, None] = None, program_name: Union[str, None] = None,
+                    aoi_name: Union[str, None] = None,
                     project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.insert_rung()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.insert_rung(
         routine_name, index, text, comment=comment, program_name=program_name,
+        aoi_name=aoi_name,
     ))
 
 
 def db_delete_rung(acd_path, routine_name: str, index: int,
                     program_name: Union[str, None] = None,
+                    aoi_name: Union[str, None] = None,
                     project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.delete_rung()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.delete_rung(
-        routine_name, index, program_name=program_name,
+        routine_name, index, program_name=program_name, aoi_name=aoi_name,
     ))
 
 
 def db_replace_rung_safe(acd_path, routine_name: str, index: int, expected_old: str,
                           new_text: str, program_name: Union[str, None] = None,
+                          aoi_name: Union[str, None] = None,
                           project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.replace_rung_safe()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.replace_rung_safe(
         routine_name, index, expected_old, new_text, program_name=program_name,
+        aoi_name=aoi_name,
     ))
 
 
 def db_set_rung_comment(acd_path, routine_name: str, index: int,
                          comment: Union[str, None], program_name: Union[str, None] = None,
+                         aoi_name: Union[str, None] = None,
                          project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.set_rung_comment()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.set_rung_comment(
-        routine_name, index, comment, program_name=program_name,
+        routine_name, index, comment, program_name=program_name, aoi_name=aoi_name,
     ))
 
 
 def db_insert_st_line(acd_path, routine_name: str, index: int, text: str,
                        program_name: Union[str, None] = None,
+                       aoi_name: Union[str, None] = None,
                        project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.insert_st_line()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.insert_st_line(
-        routine_name, index, text, program_name=program_name,
+        routine_name, index, text, program_name=program_name, aoi_name=aoi_name,
     ))
 
 
 def db_delete_st_line(acd_path, routine_name: str, index: int,
                        program_name: Union[str, None] = None,
+                       aoi_name: Union[str, None] = None,
                        project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.delete_st_line()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.delete_st_line(
-        routine_name, index, program_name=program_name,
+        routine_name, index, program_name=program_name, aoi_name=aoi_name,
     ))
 
 
 def db_replace_st_line_safe(acd_path, routine_name: str, index: int, expected_old: str,
                              new_text: str, program_name: Union[str, None] = None,
+                             aoi_name: Union[str, None] = None,
                              project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.replace_st_line_safe()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.replace_st_line_safe(
         routine_name, index, expected_old, new_text, program_name=program_name,
+        aoi_name=aoi_name,
     ))
 
 
@@ -2107,10 +2200,11 @@ def db_delete_tag(acd_path, name: str, program_name: Union[str, None] = None,
 
 
 def db_delete_routine(acd_path, routine_name: str, program_name: Union[str, None] = None,
+                       aoi_name: Union[str, None] = None,
                        project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.delete_routine()` -- see its docstring."""
     _run(acd_path, project_dir, verbose,
-         lambda db: db.delete_routine(routine_name, program_name))
+         lambda db: db.delete_routine(routine_name, program_name, aoi_name))
 
 
 def db_delete_member(acd_path, data_type_name: str, member_name: str,
@@ -2121,12 +2215,14 @@ def db_delete_member(acd_path, data_type_name: str, member_name: str,
 
 
 def db_export_routine(acd_path, routine_name: str, output_path,
-                       program_name: Union[str, None] = None, owner: Union[str, None] = None,
+                       program_name: Union[str, None] = None,
+                       aoi_name: Union[str, None] = None, owner: Union[str, None] = None,
                        validate: bool = True, project_dir=None, verbose: bool = False) -> None:
     """Stateless equivalent of `ProjectDB.export_routine()` -- see its docstring
     (including why `validate` defaults to `True` here)."""
     _run(acd_path, project_dir, verbose, lambda db: db.export_routine(
-        routine_name, output_path, program_name=program_name, owner=owner, validate=validate,
+        routine_name, output_path, program_name=program_name, aoi_name=aoi_name,
+        owner=owner, validate=validate,
     ))
 
 
@@ -2183,10 +2279,11 @@ def db_to_controller(acd_path, project_dir=None, verbose: bool = False) -> RSLog
 
 
 def db_get_routine(acd_path, routine_name: str, program_name: Union[str, None] = None,
+                    aoi_name: Union[str, None] = None,
                     project_dir=None, verbose: bool = False) -> dict:
     """Stateless equivalent of `ProjectDB.get_routine()` -- see its docstring."""
     return _run(acd_path, project_dir, verbose,
-                lambda db: db.get_routine(routine_name, program_name))
+                lambda db: db.get_routine(routine_name, program_name, aoi_name))
 
 
 def db_get_tag_value(acd_path, tag_name: str, program_name: Union[str, None] = None,

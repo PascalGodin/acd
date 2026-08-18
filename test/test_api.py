@@ -819,6 +819,37 @@ def test_export_aoi_validate_rejects_unresolved_parameter_type():
         export_aoi(project, aoi, "build/should_not_be_written.L5X", validate=True)
 
 
+def test_export_aoi_rejects_invalid_routine_name():
+    # Regression test: real Studio 5000 rejected import of an AOI routine
+    # named "Lug_Advance_Logic" (a natural, but wrong, way to avoid a name
+    # collision with every other AOI's own "Logic" routine) with "Invalid
+    # name for Add-On Instruction routine." An AOI's own routine name is a
+    # fixed, Rockwell-reserved set, unlike a Program's routine.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    routine = new_routine("MyAOI_Logic", "RLL")
+    routine.insert_rung(0, "NOP();")
+    aoi.routines.append(routine)
+    project.controller.aois.append(aoi)
+
+    with pytest.raises(ValueError, match="not valid"):
+        export_aoi(project, aoi, "build/should_not_be_written.L5X")
+
+
+def test_export_aoi_accepts_reserved_routine_name(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    routine = new_routine("Logic", "RLL")
+    routine.insert_rung(0, "NOP();")
+    aoi.routines.append(routine)
+    project.controller.aois.append(aoi)
+
+    output_path = tmp_path / "aoi_export.L5X"
+    export_aoi(project, aoi, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'Routine Name="Logic"' in content
+
+
 def test_export_aoi_validate_rejects_unresolved_local_tag_type():
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
     aoi = new_aoi("MyAOI")

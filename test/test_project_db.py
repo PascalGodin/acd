@@ -708,14 +708,14 @@ def test_new_aoi_can_be_populated_with_parameters_and_routine(acd_copy):
         db.new_aoi("PDB_NEW_AOI")
         db.new_aoi_parameter("PDB_NEW_AOI", "In1", "DINT", usage="Input")
         db.new_aoi_parameter("PDB_NEW_AOI", "Out1", "DINT", usage="Output")
-        db.new_routine("PDB_AOI_LOGIC", "RLL", aoi_name="PDB_NEW_AOI")
-        db.insert_rung("PDB_AOI_LOGIC", 0, "MOV(In1,Out1);", program_name=None)
+        db.new_routine("Logic", "RLL", aoi_name="PDB_NEW_AOI")
+        db.insert_rung("Logic", 0, "MOV(In1,Out1);", aoi_name="PDB_NEW_AOI")
 
         project = db.to_controller()
         aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
         assert [p.name for p in aoi.parameters] == ["In1", "Out1"]
         assert len(aoi.routines) == 1
-        assert aoi.routines[0].name == "PDB_AOI_LOGIC"
+        assert aoi.routines[0].name == "Logic"
         assert aoi.routines[0].rungs == ["MOV(In1,Out1);"]
     finally:
         db.close()
@@ -755,6 +755,100 @@ def test_new_routine_requires_exactly_one_of_program_or_aoi(acd_copy):
         db.close()
 
 
+def test_new_routine_rejects_invalid_aoi_routine_name(acd_copy):
+    # Regression test: real Studio 5000 rejected import of a routine named
+    # after the AOI itself ("Lug_Advance_Logic") with "Invalid name for
+    # Add-On Instruction routine." -- unlike a Program's routine, an AOI's
+    # own routine name is a fixed, Rockwell-reserved set.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        with pytest.raises(ValueError, match="not a valid AOI routine name"):
+            db.new_routine("PDB_NEW_AOI_Logic", "RLL", aoi_name="PDB_NEW_AOI")
+    finally:
+        db.close()
+
+
+def test_new_routine_accepts_reserved_aoi_routine_names(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_routine("Logic", "RLL", aoi_name="PDB_NEW_AOI")
+        db.new_routine("Prescan", "RLL", aoi_name="PDB_NEW_AOI")
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+        assert {r.name for r in aoi.routines} == {"Logic", "Prescan"}
+    finally:
+        db.close()
+
+
+def test_routine_content_functions_use_aoi_name_to_disambiguate_logic_routines(acd_copy):
+    # The actual reported gap: db_new_routine(..., aoi_name=...) could
+    # create an AOI-scoped "Logic" routine, but nothing downstream could
+    # address it back -- program_name= doesn't resolve AOI scope, and with
+    # two AOIs both named "Logic" is instantly ambiguous. aoi_name= on the
+    # content functions is the fix.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_AOI_ONE")
+        db.new_aoi("PDB_AOI_TWO")
+        db.new_routine("Logic", "RLL", aoi_name="PDB_AOI_ONE")
+        db.new_routine("Logic", "RLL", aoi_name="PDB_AOI_TWO")
+
+        # Ambiguous without a scope.
+        with pytest.raises(ValueError, match="ambiguous"):
+            db.insert_rung("Logic", 0, "NOP();")
+
+        db.insert_rung("Logic", 0, "MOV(1,Out1);", aoi_name="PDB_AOI_ONE")
+        db.insert_rung("Logic", 0, "MOV(2,Out2);", aoi_name="PDB_AOI_TWO")
+
+        one = db.get_routine("Logic", aoi_name="PDB_AOI_ONE")
+        two = db.get_routine("Logic", aoi_name="PDB_AOI_TWO")
+        assert one["rungs"] == ["MOV(1,Out1);"]
+        assert two["rungs"] == ["MOV(2,Out2);"]
+    finally:
+        db.close()
+
+
+def test_db_routine_content_functions_accept_aoi_name(acd_copy, tmp_path):
+    db_new_aoi(str(acd_copy), "PDB_AOI_ONE")
+    db_new_aoi(str(acd_copy), "PDB_AOI_TWO")
+    db_new_routine(str(acd_copy), "Logic", "RLL", aoi_name="PDB_AOI_ONE")
+    db_new_routine(str(acd_copy), "Logic", "RLL", aoi_name="PDB_AOI_TWO")
+    db_insert_rung(str(acd_copy), "Logic", 0, "MOV(1,Out1);", aoi_name="PDB_AOI_ONE")
+    db_insert_rung(str(acd_copy), "Logic", 0, "MOV(2,Out2);", aoi_name="PDB_AOI_TWO")
+
+    one = db_get_routine(str(acd_copy), "Logic", aoi_name="PDB_AOI_ONE")
+    two = db_get_routine(str(acd_copy), "Logic", aoi_name="PDB_AOI_TWO")
+    assert one["rungs"] == ["MOV(1,Out1);"]
+    assert two["rungs"] == ["MOV(2,Out2);"]
+
+    # export_routine() has no "Import Routine" mechanism for an AOI-owned
+    # routine at all -- only export_aoi() (whole-AOI import) can export it.
+    output_path = tmp_path / "aoi_one.L5X"
+    with pytest.raises(ValueError, match="export_aoi"):
+        db_export_routine(str(acd_copy), "Logic", str(output_path), aoi_name="PDB_AOI_ONE")
+
+    db_export_aoi(str(acd_copy), "PDB_AOI_ONE", str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert "MOV(1,Out1)" in content
+
+
+def test_export_routine_raises_clear_error_for_aoi_owned_routine(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_routine("Logic", "RLL", aoi_name="PDB_NEW_AOI")
+        db.insert_rung("Logic", 0, "NOP();", aoi_name="PDB_NEW_AOI")
+
+        with pytest.raises(ValueError, match="export_aoi"):
+            db.export_routine("Logic", "build/should_not_be_written.L5X",
+                               aoi_name="PDB_NEW_AOI")
+    finally:
+        db.close()
+
+
 def test_new_aoi_never_touches_real_pre_existing_aoi(aoi_acd_copy):
     # Regression/design-confirmation test: proj_aois holds ONLY brand-new
     # AOIs, never a real project's own -- confirms to_controller() APPENDS
@@ -784,8 +878,8 @@ def test_db_new_aoi_stateless_wrappers_and_export(acd_copy, tmp_path):
     db_new_aoi(str(acd_copy), "PDB_NEW_AOI", description="a test AOI")
     db_new_aoi_parameter(str(acd_copy), "PDB_NEW_AOI", "In1", "DINT", usage="Input")
     db_new_aoi_parameter(str(acd_copy), "PDB_NEW_AOI", "Out1", "DINT", usage="Output")
-    db_new_routine(str(acd_copy), "PDB_AOI_LOGIC", "RLL", aoi_name="PDB_NEW_AOI")
-    db_insert_rung(str(acd_copy), "PDB_AOI_LOGIC", 0, "MOV(In1,Out1);", program_name=None)
+    db_new_routine(str(acd_copy), "Logic", "RLL", aoi_name="PDB_NEW_AOI")
+    db_insert_rung(str(acd_copy), "Logic", 0, "MOV(In1,Out1);", aoi_name="PDB_NEW_AOI")
 
     output_path = tmp_path / "new_aoi.L5X"
     db_export_aoi(str(acd_copy), "PDB_NEW_AOI", str(output_path))

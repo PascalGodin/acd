@@ -3496,6 +3496,94 @@ a real Studio 5000 import yet — the attribute values (`Required="false"`/`Visi
 `ExternalAccess="Read Only"` for the enable pair) are confirmed correct only by structural comparison
 against the real `AOI_SNTP_QUERY` export, not by an actual successful import of a file built with them.
 
+**UPDATE — the EnableIn/EnableOut and LocalTag fix above WAS verified against a real Studio 5000
+import.** The same downstream agent built a real AOI (rung-count and internal logic elided here per
+this file's own "no real project references" convention) using both features together, verified the
+read-back content matched exactly, and exported it. This is the first real-import confirmation for
+ANY part of the AOI-creation feature since it was first added.
+
+### AOI routines are NOT free-named, and AOI-scoped routine content had no way to be addressed back
+
+Two related, real problems surfaced from that same first real AOI build — one a genuine `db_*` API
+gap, the other a previously-unknown Rockwell constraint this library had never encoded anywhere:
+
+**1. `aoi_name=` was accepted by `db_new_routine()` but nothing downstream could resolve it.**
+`db_new_routine(acd_path, name, type, aoi_name=aoi_name)` could create a routine unambiguously scoped
+to an AOI, but `db_insert_st_line`/`db_insert_rung`/`db_get_routine`/`db_replace_st_line_safe`/
+`db_replace_rung_safe`/`db_delete_st_line`/`db_delete_rung`/`db_set_rung_comment` only ever accepted
+`program_name=` to disambiguate — which doesn't resolve AOI scope at all (`KeyError: "No program
+named '...'"`). Passing neither raised `ValueError: ... is ambiguous ... pass program_name= to
+disambiguate`, but `program_name=` was exactly the thing that didn't work. Since nearly every real
+AOI in a typical project names its main routine `"Logic"` (see point 2 below — this isn't a coincidence,
+it's close to the only legal name), creating ANY new AOI with a `"Logic"` routine became instantly
+ambiguous and uneditable the moment a second AOI existed in the project.
+
+Fixed by adding `aoi_name=` to every one of those eight `ProjectDB` methods (and their `db_*`
+wrappers), mirroring `program_name=`'s own shape exactly — `_routine_id()` (the shared scope-resolution
+helper) now accepts either (raising `ValueError` if both are given), resolving against `proj_routines
+.aoi_id` via `_aoi_id()` the same way `program_name` resolves via `_program_id()`. `get_routine()`/
+`export_routine()` (the two methods that go through the in-memory `acd.api.get_routine()` rather than
+raw SQL) translate `aoi_name` into that function's own PRE-EXISTING `program_name=f"AOI:{aoi_name}"`
+convention internally (`_get_routine_scope()`) — that convention already existed for
+`io_addresses_by_routine()`/`find_tag_references()`, just never plumbed through to these two.
+
+**2. A real Studio 5000 import rejection revealed AOI routine names are a fixed, reserved set —
+not a free-form choice.** Before the `aoi_name=` fix above landed, the practical workaround was
+renaming the routine away from the `"Logic"` collision (e.g. to something derived from the AOI's own
+name) — which felt like the wrong kind of workaround (documented as exactly that at the time), and
+turned out to be provably wrong, not just inelegant: importing the resulting L5X into real Studio 5000
+failed outright:
+```
+Error: Line 36: Error creating 'Routine' (Invalid name for Add-On Instruction routine.).
+    RSLogix5000Content/Controller/AddOnInstructionDefinitions/AddOnInstructionDefinition[@Name="..."]/Routines/Routine[@Name="..._Logic"]
+```
+Confirmed independently against the real, Rockwell-authored `AOI_SNTP_QUERY` ground-truth export
+(already used elsewhere in this file's AOI verification work): `grep`-ing every `<Routine Name=...
+Type=...>` in that file returns ONLY `"Logic"` (three times, across the target and its own context
+AOI dependencies) and `"Prescan"` (once) — never a custom name, anywhere. Unlike a Program's routine
+(any name is fine), a routine living directly under an `AddOnInstructionDefinition` may ONLY be named
+`"Logic"`/`"Prescan"`/`"Postscan"`/`"EnableInFalse"` — the same four names as the AOI's own
+`ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` flags plus the mandatory main routine.
+`"Postscan"`/`"EnableInFalse"` are included by direct symmetry with `"Prescan"`, not independently
+observed (neither flag was `"true"` in the one real sample available) — revisit if a real sample using
+either ever turns up different behavior.
+
+Fixed with defense at three layers, not just one:
+- `ProjectDB.new_routine()` raises `ValueError` immediately if `aoi_name` is given with a
+  `routine_name` outside `{"Logic", "Prescan", "Postscan", "EnableInFalse"}`
+  (`_AOI_RESERVED_ROUTINE_NAMES`, `acd/api.py`) — catches the mistake at creation time, before any
+  content is even written, rather than only at export/import time.
+- `export_aoi()` (`acd/api.py`) checks the SAME constraint unconditionally (not gated behind
+  `validate=`) against every routine in `aoi.routines` — this is the defense-in-depth layer for the
+  in-memory `new_routine()`/`model.py` path, which has no way to know at construction time which
+  collection its result is about to be appended to and so can't enforce this itself (its own docstring
+  now says so explicitly, pointing forward to `export_aoi()`/`ProjectDB.new_routine(...,
+  aoi_name=...)`).
+- This is deliberately NOT gated behind `validate=True/False` the way the type-resolution checks are
+  — a wrong AOI routine name is a certainty to fail Studio's import, not a "might be a problem"
+  data-shape risk, so it isn't optional.
+
+**3. A related design mistake caught before shipping, not after**: the first draft of the `aoi_name=`
+fix added the parameter to `ProjectDB.export_routine()`/`db_export_routine()` too, by analogy with the
+other seven methods. This is wrong and was caught by the test suite itself (a real `ValueError: routine
+not found in any program of this project` from the underlying, Program-only `acd.api.export_routine()`)
+before it ever reached a user: Studio 5000 has no "Import Routine" mechanism for a routine living
+inside an `AddOnInstructionDefinition` at all — the ONLY way to get an AOI's routine content into Studio
+is `export_aoi()`, which exports the whole AOI (parameters, local tags, AND every routine) via "Import
+Add-On Instruction...". `export_routine()`/`db_export_routine()` still accept `aoi_name=` for signature
+symmetry with the other seven methods (so a caller who reflexively tries it gets a clear, actionable
+error naming `export_aoi()` instead of either silently doing the wrong thing or getting a confusing
+"not found in any program" message with no indication of why).
+
+Covered by `test_new_routine_rejects_invalid_aoi_routine_name`,
+`test_new_routine_accepts_reserved_aoi_routine_names`,
+`test_routine_content_functions_use_aoi_name_to_disambiguate_logic_routines` (the literal reported
+repro: two AOIs, both with a `"Logic"` routine, disambiguated via `aoi_name=` instead of renaming),
+`test_db_routine_content_functions_accept_aoi_name`,
+`test_export_routine_raises_clear_error_for_aoi_owned_routine` (`test/test_project_db.py`); and
+`test_export_aoi_rejects_invalid_routine_name`, `test_export_aoi_accepts_reserved_routine_name`
+(`test/test_api.py`) — full suite re-run clean (342 passed, 2 skipped, up from 335 before this round).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

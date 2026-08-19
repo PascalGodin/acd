@@ -1046,20 +1046,37 @@ def _synthetic_aoi_data_type(aoi: "AOI") -> "DataType":
     Rockwell's own real instance shape has room for.
 
     Still deliberately NOT the same fidelity as a real AOI's own
-    Comps.Dat-derived instance shape even after this fix (see CLAUDE.md's
-    own documented gaps in AOI instance-value decoding for a REAL AOI --
-    missing `EnableIn`/`EnableOut` in one investigation, an L5K value count
-    that didn't match the named-member count, an unexplained leading
-    value) -- this is a reasonable default (every Input/Output parameter
-    and local tag zero-filled, in declared order) for the one narrow
-    purpose of not silently producing an EMPTY `<Data>` block (the
-    original, pre-any-of-this-fallback behavior: `_struct_members_xml()`
-    returns `None` for an unresolved type, which is safe -- not
-    wrong-shaped -- but also not useful), not a claim that the rendered
-    value is byte-for-byte what a real Studio-created instance of this same
-    AOI would show.
+    Comps.Dat-derived instance shape (see CLAUDE.md's own documented gaps
+    in AOI instance-value decoding for a REAL AOI -- missing
+    `EnableIn`/`EnableOut` in one investigation, an L5K value count that
+    didn't match the named-member count, an unexplained leading value) --
+    real Rockwell AOI instances carry internal layout details this
+    function has no way to know without decoding an actual Studio-created
+    instance, which doesn't exist yet for a brand-new AOI.
+
+    Because of that, the returned `DataType` is marked
+    `_is_synthetic_aoi_instance = True` and is used ONLY for name/type
+    RESOLUTION (dependency closure, `validate=True`'s type-graph walk) --
+    `Tag.to_xml()` checks this flag and deliberately renders NO `<Data>`
+    element at all for an instance of such a type, rather than asserting
+    a guessed value shape. Found necessary via a real Studio 5000
+    rejection: a value built from this function's own member list (at the
+    time, asserted as the instance's real `<Data>`) was accepted for
+    validation but then rejected on import (`"Data type mismatch"`) the
+    moment the referencing routine was submitted to a project where the
+    AOI had, in the interim, actually been imported for real -- Studio's
+    own real internal layout for the now-real AOI didn't match this
+    function's guess. Omitting `<Data>` entirely sidesteps needing to
+    guess that layout at all: Studio self-initializes the tag's value
+    when it creates the AOI and the tag together. Any static config
+    (e.g. a non-default parameter value on the instance) needs to be set
+    as a follow-up tag edit once the AOI is confirmed real -- at that
+    point `_sync_data_types_map()`'s `setdefault` means this function is
+    never even called for that AOI again, and rendering uses the real,
+    `ControllerBuilder`-decoded instance shape instead.
     """
     dt = DataType(aoi.name, aoi.name, "NoFamily", "User", [])
+    dt._is_synthetic_aoi_instance = True
     for p in aoi.parameters:
         if not p.data_type or p.usage == "InOut":
             continue

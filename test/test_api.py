@@ -1114,6 +1114,43 @@ def test_sync_data_types_map_excludes_inout_parameters_from_instance_shape():
     assert {m.name for m in dt.members} == {"In1", "Out1"}
 
 
+def test_tag_to_xml_omits_data_for_synthetic_aoi_instance_type():
+    # Regression test for a real report: a routine referencing an instance of
+    # a brand-new AOI was accepted by export_routine(validate=True) but
+    # rejected by real Studio 5000 import ("Data type mismatch") once the AOI
+    # had actually been imported for real in the target project -- our
+    # guessed instance value (_synthetic_aoi_data_type()) didn't match
+    # Studio's own real internal layout for the now-real AOI. Rather than
+    # keep guessing at that layout, a tag typed as a still-not-real AOI now
+    # renders NO <Data> element at all, letting Studio self-initialize the
+    # value when it creates the AOI and the tag together.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("Value_To_Str")
+    aoi.parameters.append(new_aoi_parameter("Width", "DINT", usage="Input"))
+    project.controller.aois.append(aoi)
+    _sync_data_types_map(project)
+
+    tag = new_tag("MyInstance", "Value_To_Str", value={"Width": 2})
+    tag._data_types_map = project.controller._data_types_map
+
+    xml = tag.to_xml()
+    assert '<Data' not in xml
+    assert 'MyInstance' in xml
+
+
+def test_tag_to_xml_renders_data_normally_for_a_real_udt_type():
+    # Sanity counterpart to the test above: the synthetic-AOI omission must
+    # not accidentally suppress <Data> for an ordinary, real (non-synthetic)
+    # struct-typed tag.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    real_dt_name = project.controller.data_types[0].name
+    tag = new_tag("MyRealInstance", real_dt_name)
+    tag._data_types_map = project.controller._data_types_map
+
+    xml = tag.to_xml()
+    assert '<Data' in xml
+
+
 def test_sync_data_types_map_does_not_overwrite_real_aoi_synthetic_type():
     # A real, already-imported AOI already has a real synthetic DataType
     # (built by ControllerBuilder at load time from the AOI's own Comps.Dat
@@ -1158,18 +1195,16 @@ def test_export_routine_validate_resolves_new_aoi_instance_type(tmp_path):
     minidom.parse(str(output_path))  # well-formed
     assert '<AddOnInstructionDefinition Name="Value_To_Str"' in content
     assert 'Tag Name="MyInstance"' in content
-    # The instance tag's own Data block should render a real Structure, not
-    # be silently empty (the previous, safe-but-unhelpful fallback).
-    assert '<Structure DataType="Value_To_Str">' in content
-    assert 'DataValueMember Name="Value"' in content
-    # "Result" is InOut -- it correctly still appears in the AOI's own
-    # <Parameters> definition, but must NOT appear inside the INSTANCE tag's
-    # own Data/Structure block specifically (see
-    # test_sync_data_types_map_excludes_inout_parameters_from_instance_shape
-    # for the real Studio import rejection this prevents).
-    struct_start = content.index('<Structure DataType="Value_To_Str">')
-    struct_end = content.index('</Structure>', struct_start)
-    assert 'Name="Result"' not in content[struct_start:struct_end]
+    # The instance tag renders NO <Data> element at all -- see
+    # test_tag_to_xml_omits_data_for_synthetic_aoi_instance_type for why:
+    # a real Studio 5000 import rejected a guessed instance value
+    # ("Data type mismatch") once the AOI became real but our guess didn't
+    # match Studio's own computed layout for it. "Result" (InOut) still
+    # correctly appears in the AOI's own <Parameters> definition.
+    tag_start = content.index('Tag Name="MyInstance"')
+    tag_end = content.index('</Tag>', tag_start)
+    assert '<Data' not in content[tag_start:tag_end]
+    assert 'Name="Result"' in content  # still declared on the AOI itself
 
 
 def test_export_routine_validate_raises_on_unresolved_type(tmp_path):

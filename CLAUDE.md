@@ -3928,6 +3928,87 @@ DINT parameters do) and updated assertions in
 present in the AOI's own `<Parameters>` definition — is specifically absent from the INSTANCE tag's own
 `<Structure>...</Structure>` block) — `test/test_api.py`/`test/test_project_db.py`.
 
+## A not-yet-real AOI's instance tag renders NO `<Data>` at all — stop guessing Rockwell's real internal layout
+
+Direct follow-up to the fix immediately above, on the exact same `Value_To_Str` AOI, one real Studio
+5000 import further. The user did exactly the documented two-step workflow correctly: imported
+`Value_To_Str.L5X` (`Use="Target"`) on its own first — Studio created the real AOI with no errors —
+then tried importing `R11_Printer.L5X` (which references an instance tag typed as `Value_To_Str`, the
+AOI included only as `Use="Context"`). That failed:
+```
+Error: Line 644: Failed to set the 'Data' property (Data type mismatch - the object's value does
+not match its data type.).
+    RSLogix5000Content/Controller/Programs/Program[@Name="VAB_Trim_And_Sort"]/Tags/Tag[@Name="Printer_Thick_V2S"]/Data
+```
+Root cause, confirmed by inspecting the actual rejected file and the project's own `acd.db` directly
+(not guessed): `R11_Printer.L5X` had been generated *before* the AOI import, from a project state
+where `Value_To_Str` was still only a `proj_aois` row, not a real ACD object — so
+`Printer_Thick_V2S`'s `<Data>` content came entirely from `_synthetic_aoi_data_type()`'s best-effort
+guess (`EnableIn`/`EnableOut` + declared `Input`/`Output` parameters + `LocalTags`, zero-filled). By
+the time that file was actually handed to Studio, `Value_To_Str` already existed for real (from the
+just-completed first import) with Studio's own, independently-computed internal instance layout —
+and our guess didn't match it. This is the SAME already-documented, unresolved gap as the real
+`AOI_RPMtoFPM`/`TestFPM` investigation elsewhere in this file (a real AOI instance's true `L5K` value
+count didn't match its named-member count at all — 17 values for 10 named members, with an
+unexplained leading value never traced to anything) — just now biting a *synthetic*, not-yet-real
+AOI's instance too, for the identical underlying reason: Rockwell's real internal AOI instance layout
+has structure beyond what's derivable from a declared Parameter/LocalTag list alone, and nobody has
+ever fully reverse-engineered it.
+
+**The user's own follow-up question was the right one to ask, and changed the fix**: "shouldn't the
+DB be able to know it's there? The whole point of the DB is to do additions without creating the
+whole thing again at export." That's correct, and exposed that my first answer (recommending a
+mandatory two-step Studio workflow) was an unverified assumption, not a real constraint — this
+codebase already has a *proven* precedent that a `Use="Context"` block CAN create a brand-new object
+in a single Import Routine pass (see "Native-import escape hatches" above: a controller-scope tag
+that never existed anywhere was created successfully by Studio from `<Tags Use="Context">` content
+alone, no prior separate import). There's no reason `<AddOnInstructionDefinitions Use="Context">`
+should behave differently for the AOI *definition* itself — and nothing in this investigation
+contradicts that; the AOI creation half of a combined import was never what failed. The one thing
+that's genuinely hard is asserting a *correct instance value* for a struct type whose real internal
+layout we can't fully predict — that's a narrower problem than "AOI creation needs two Studio
+imports," and one that can be sidestepped rather than solved.
+
+**Fix**: rather than continue refining a value-shape guess with no way to verify it, a tag typed as a
+still-not-real AOI (i.e. its `DataType` resolves in `_data_types_map` only via
+`_synthetic_aoi_data_type()`, marked with a new `DataType._is_synthetic_aoi_instance = True` flag) now
+renders **no `<Data>` element at all** — `Tag.to_xml()` (`acd/l5x/elements/model.py`) checks this flag
+and skips both the known-value and the zero-fill-fallback rendering branches entirely. This mirrors an
+existing, already-verified precedent in the very same function: an Alias tag also renders zero
+`<Data>` elements (it has no value of its own), and a `Module` dependency stub already renders as a
+bare, definition-free reference rather than asserting content Studio can supply itself. Studio
+self-initializes the tag's value when it creates the AOI and the tag together — sidestepping the need
+to guess Rockwell's real internal layout at all, rather than trying (and risking another wrong guess)
+to match it. Once the AOI genuinely becomes real, `_sync_data_types_map()`'s own `setdefault` means
+`_synthetic_aoi_data_type()` is never invoked for that name again — a later export of the same tag
+naturally switches to the real, `ControllerBuilder`-decoded instance shape, with no extra code needed
+for that transition.
+
+**Consequence for a caller**: any static config set on a not-yet-real AOI's instance tag (e.g. this
+project's `Width`/`PadChar` on `Printer_Thick_V2S`) is silently NOT carried through the first,
+AOI-creating export — it needs to be applied as a small follow-up tag edit once the AOI is confirmed
+real in Studio (a normal `db_edit_tag()`, which at that point goes through the real decode path and
+should work reliably, the same as every other already-working tag-value edit documented in this
+file). This is a real, deliberate trade-off, not an oversight: asserting a value we can't verify risks
+exactly the failure this section describes; asserting no value at all trades a small extra step for
+correctness.
+
+**Not yet verified against real Studio 5000** — the previous fix in this AOI chain also looked correct
+after unit verification and still needed a real import to catch the next issue; this one hasn't had
+that real round-trip yet. Worth having the user agent retry the ORIGINAL `Value_To_Str`/`R11_Printer`
+case once the project's `.ACD` is resaved and the DB rebuilt (which, per the mechanism above, will now
+use the REAL decoded AOI shape rather than this fix's code path at all, since the AOI is already real
+there) — but any NEW not-yet-real-AOI-plus-referencing-routine case going forward should exercise this
+fix's actual code path and is worth confirming end-to-end.
+
+Covered by `test_tag_to_xml_omits_data_for_synthetic_aoi_instance_type` (direct unit test: a tag typed
+as a not-yet-real AOI, even with an explicit value set, renders zero `<Data>` elements),
+`test_tag_to_xml_renders_data_normally_for_a_real_udt_type` (sanity counterpart: an ordinary struct tag
+is unaffected), and updated assertions in `test_export_routine_validate_resolves_new_aoi_instance_type`/
+`test_db_export_routine_resolves_instance_of_not_yet_real_aoi` (confirming no `<Data` appears anywhere
+inside the instance tag's own element, while the AOI's own `<Parameters>` definition is unaffected) —
+`test/test_api.py`/`test/test_project_db.py`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

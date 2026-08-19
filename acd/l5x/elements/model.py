@@ -278,6 +278,13 @@ class DataType(L5xElement):
     # for how this is detected/estimated. 0 for the overwhelming majority of
     # UDTs (no deleted members at all).
     _dead_member_bytes: int = field(default=0)
+    # True only for the best-effort stand-in `_synthetic_aoi_data_type()`
+    # (acd/api.py) builds for a brand-new, not-yet-real AOI's instance
+    # shape -- never set on a real ACD-decoded DataType (UDT or a real
+    # AOI's own ControllerBuilder-seeded synthetic type). Tag.to_xml()
+    # checks this to skip rendering a <Data> value entirely for an
+    # instance of such a type -- see its own comment for why.
+    _is_synthetic_aoi_instance: bool = field(default=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -435,7 +442,26 @@ class Tag(L5xElement):
         data_xml = ""
         is_alias = self.tag_type == "Alias"
 
-        if not is_alias and self._initial_value is not None:
+        # A tag typed as a not-yet-real AOI (see DataType._is_synthetic_aoi_instance
+        # / _synthetic_aoi_data_type() in acd/api.py) gets NO <Data> element at
+        # all, deliberately -- Rockwell's real internal AOI instance layout isn't
+        # something we can reliably guess (see that function's own docstring),
+        # and a guessed value was confirmed to trigger a real Studio 5000
+        # "Data type mismatch" rejection once the AOI became real in the target
+        # project but our guess didn't match Studio's own computed layout for it.
+        # Omitting <Data> lets Studio self-initialize the tag when it creates
+        # the AOI and the tag together, instead of asserting a shape we can't
+        # verify. Once the AOI is real, _sync_data_types_map()'s setdefault
+        # means this synthetic type is never used again for it -- rendering
+        # then uses the real, ControllerBuilder-decoded instance shape.
+        dt_key_check = self.data_type.split("[")[0].upper() if self.data_type else ""
+        _resolved_dt_check = self._data_types_map.get(dt_key_check)
+        is_synthetic_aoi_instance = bool(
+            _resolved_dt_check is not None
+            and getattr(_resolved_dt_check, "_is_synthetic_aoi_instance", False)
+        )
+
+        if not is_alias and not is_synthetic_aoi_instance and self._initial_value is not None:
             dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
             iv = self._initial_value
 
@@ -585,7 +611,7 @@ class Tag(L5xElement):
                         f'</Data>'
                     )
 
-        if not data_xml and not is_alias:
+        if not data_xml and not is_alias and not is_synthetic_aoi_instance:
             # Scalar primitives with no successfully-decoded initial value
             # (rare -- normally the branch above handles scalar primitives)
             # still get BOTH Format="L5K" and Format="Decorated" blocks at

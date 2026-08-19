@@ -958,16 +958,17 @@ def test_db_export_routine_resolves_instance_of_not_yet_real_aoi(acd_copy, tmp_p
     content = output_path.read_text(encoding="utf-8")
     assert '<AddOnInstructionDefinition Name="Value_To_Str"' in content
     assert 'Tag Name="MyInstance"' in content
-    assert '<Structure DataType="Value_To_Str">' in content
-    # "Result" is InOut -- it correctly still appears in the AOI's own
-    # <Parameters> definition, but must not appear inside MyInstance's own
-    # Data/Structure block specifically (a real Studio import rejected
-    # exactly this: "Data type mismatch" from an instance tag whose Data
-    # block had more fields than the AOI's real InOut-excluded instance
-    # shape has room for).
-    struct_start = content.index('<Structure DataType="Value_To_Str">')
-    struct_end = content.index('</Structure>', struct_start)
-    assert 'Name="Result"' not in content[struct_start:struct_end]
+    # MyInstance renders NO <Data> element at all -- a real Studio import
+    # rejected a guessed instance value ("Data type mismatch") once the AOI
+    # had actually been imported for real, because our guess didn't match
+    # Studio's own real internal layout for it (see
+    # test_tag_to_xml_omits_data_for_synthetic_aoi_instance_type in
+    # test_api.py). "Result" (InOut) still correctly appears in the AOI's
+    # own <Parameters> definition.
+    tag_start = content.index('Tag Name="MyInstance"')
+    tag_end = content.index('</Tag>', tag_start)
+    assert '<Data' not in content[tag_start:tag_end]
+    assert 'Name="Result"' in content
 
 
 def test_new_aoi_parameter_required_visible_external_access_overrides(acd_copy):

@@ -1006,6 +1006,78 @@ def test_sync_data_types_map_propagates_new_type_to_existing_tags():
     assert '<DataValueMember Name="M" DataType="DINT" Radix="Decimal" Value="5"/>' in xml
 
 
+def test_sync_data_types_map_registers_new_aoi_instance_type():
+    # Regression test for a real report: a routine referencing an instance
+    # tag typed as a brand-new AOI (created via new_aoi()/db_new_aoi() this
+    # session, not yet imported into real Studio) failed
+    # export_routine(validate=True) outright -- the AOI's own name was never
+    # registered into data_types_map at all (only project.controller.data_types
+    # was ever synced, never .aois), even though db_export_aoi() for that
+    # same AOI, and creating the instance tag itself, both already worked.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("Value_To_Str")
+    aoi.parameters.append(new_aoi_parameter("Value", "DINT", usage="Input"))
+    aoi.parameters.append(new_aoi_parameter("Result", "STRING", usage="Output"))
+    aoi.local_tags.append(new_aoi_local_tag("Scratch1", "DINT"))
+    project.controller.aois.append(aoi)
+
+    _sync_data_types_map(project)
+
+    dt = project.controller._data_types_map.get("VALUE_TO_STR")
+    assert dt is not None
+    assert {m.name for m in dt.members} == {"Value", "Result", "Scratch1"}
+
+
+def test_sync_data_types_map_does_not_overwrite_real_aoi_synthetic_type():
+    # A real, already-imported AOI already has a real synthetic DataType
+    # (built by ControllerBuilder at load time from the AOI's own Comps.Dat
+    # record) -- _sync_data_types_map() must never replace it with the
+    # best-effort Parameters/LocalTags-derived stand-in.
+    project = load_acd(os.path.join("..", "resources", "ACDTestsWithAOI.ACD"), verbose=False)
+    real_aoi = project.controller.aois[0]
+    key = real_aoi.name.upper()
+    existing = project.controller._data_types_map.get(key)
+    assert existing is not None, "fixture's real AOI should already have a synthetic DataType"
+
+    _sync_data_types_map(project)
+
+    assert project.controller._data_types_map[key] is existing
+
+
+def test_export_routine_validate_resolves_new_aoi_instance_type(tmp_path):
+    # End-to-end version of the same report: export_routine(validate=True)
+    # must succeed for a routine referencing an instance of a brand-new AOI.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("Value_To_Str")
+    aoi.parameters.append(new_aoi_parameter("Value", "DINT", usage="Input"))
+    aoi.parameters.append(new_aoi_parameter("Result", "STRING", usage="Output"))
+    project.controller.aois.append(aoi)
+
+    program = project.controller.programs[0]
+    instance_tag = new_tag("MyInstance", "Value_To_Str")
+    # new_tag() is a pure, project-context-free constructor -- it never
+    # wires ._data_types_map itself (a caller going through db_new_tag()/
+    # ProjectDB gets this automatically, see _load_tags(); a caller using
+    # the bare model-layer new_tag() must do it by hand, same as the
+    # existing test_sync_data_types_map_propagates_new_type_to_existing_tags
+    # above already demonstrates).
+    instance_tag._data_types_map = project.controller._data_types_map
+    program.tags.append(instance_tag)
+    routine = next(r for r in program.routines if r.type == "RLL")
+    routine.insert_rung(0, "XIC(Always_Off)Value_To_Str(MyInstance,1);")
+
+    output_path = tmp_path / "routine_export.L5X"
+    export_routine(project, routine, str(output_path), validate=True)
+    content = output_path.read_text(encoding="utf-8")
+    minidom.parse(str(output_path))  # well-formed
+    assert '<AddOnInstructionDefinition Name="Value_To_Str"' in content
+    assert 'Tag Name="MyInstance"' in content
+    # The instance tag's own Data block should render a real Structure, not
+    # be silently empty (the previous, safe-but-unhelpful fallback).
+    assert '<Structure DataType="Value_To_Str">' in content
+    assert 'DataValueMember Name="Value"' in content
+
+
 def test_export_routine_validate_raises_on_unresolved_type(tmp_path):
     # validate=True should catch, before writing any XML, the exact failure
     # signature the stale-_data_types_map bug produced silently (see

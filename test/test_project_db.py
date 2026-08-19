@@ -930,6 +930,38 @@ def test_db_new_aoi_stateless_wrappers_and_export(acd_copy, tmp_path):
     assert "MOV(In1,Out1)" in content
 
 
+def test_db_export_routine_resolves_instance_of_not_yet_real_aoi(acd_copy, tmp_path):
+    # Regression test for a real report: db_export_routine() failed
+    # validation outright for a routine referencing an instance tag typed
+    # as a brand-new AOI (created via db_new_aoi() this same session, not
+    # yet imported into real Studio) -- the exact repro from the report,
+    # through the real db_* surface (not the lower-level acd.api layer),
+    # since db_new_tag() correctly wires Tag._data_types_map (via
+    # ProjectDB._load_tags()) in a way a bare new_tag() call does not.
+    db_new_aoi(str(acd_copy), "Value_To_Str", description="test")
+    db_new_aoi_parameter(str(acd_copy), "Value_To_Str", "Value", "DINT", usage="Input",
+                          required="true")
+    db_new_aoi_parameter(str(acd_copy), "Value_To_Str", "Result", "STRING", usage="Output",
+                          required="false")
+    db_new_routine(str(acd_copy), "Logic", "ST", aoi_name="Value_To_Str")
+    db_insert_st_line(str(acd_copy), "Logic", 0, "Result := 'x';", aoi_name="Value_To_Str")
+
+    db_export_aoi(str(acd_copy), "Value_To_Str", str(tmp_path / "aoi.L5X"))
+
+    program_name, routine_name = _first_routine_via_path(acd_copy)
+    db_new_tag(str(acd_copy), "MyInstance", "Value_To_Str", program_name=program_name)
+    db_insert_rung(str(acd_copy), routine_name, 0, "XIC(Always_Off)Value_To_Str(MyInstance,1);",
+                    program_name=program_name)
+
+    output_path = tmp_path / "routine.L5X"
+    db_export_routine(str(acd_copy), routine_name, str(output_path), program_name=program_name,
+                       validate=True)
+    content = output_path.read_text(encoding="utf-8")
+    assert '<AddOnInstructionDefinition Name="Value_To_Str"' in content
+    assert 'Tag Name="MyInstance"' in content
+    assert '<Structure DataType="Value_To_Str">' in content
+
+
 def test_new_aoi_parameter_required_visible_external_access_overrides(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:

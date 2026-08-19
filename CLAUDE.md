@@ -3753,6 +3753,75 @@ identical whether reached via the `"AOI:"` prefix shorthand or the explicit `aoi
 `test_list_routines_and_get_routine_line_counts_agree` (cross-checks the two independent SQL paths
 report the same line counts for every routine) — `test/test_project_db.py`.
 
+## `export_routine()` couldn't resolve an instance tag typed as a brand-new (not-yet-real) AOI
+
+A real report, immediately following the `Lug_Advance`/`Value_To_Str` AOI work above: converting a
+6-line ST subroutine into a reusable AOI, then rewiring its 4 call sites into an existing routine
+(`R11_Printer`) in one `db_transaction()`, verified correct via routine-content readback -- but
+`db_export_routine()` for `R11_Printer` failed validation outright, even though `db_export_aoi()` for
+the same new AOI, and creating the instance tag itself via `db_new_tag()`, both already worked. The
+report itself correctly diagnosed the shape of the bug from the error message alone: `"Tag
+'MyInstance': type 'Value_To_Str' does not resolve to ... most likely a stale/incomplete
+data_types_map (see _sync_data_types_map()) rather than a genuinely unknown type"` -- and confirmed it
+was specific to "AOI exists only in `proj_aois`, not yet real" by checking that a routine referencing
+an instance of `Lug_Advance` (a REAL, already-imported AOI from earlier in the same session) exported
+fine through the exact same code path.
+
+**Root cause, confirmed exactly as the report's own diagnosis suggested**: `_sync_data_types_map()`
+(`acd/api.py`) only ever walked `project.controller.data_types`, registering each into the shared
+`data_types_map` every tag/validator consults -- it never touched `project.controller.aois` at all. A
+REAL AOI's own name resolves anyway, but for a completely different reason that has nothing to do with
+this function: `ControllerBuilder.build()` (at `load_acd()`/`to_controller()` time) already seeds a
+real, Comps.Dat-derived SYNTHETIC `DataType` for every real AOI's own instance-data shape into that
+same map (see the "AOI instance-value decoding" gap documented elsewhere in this file for how
+imperfect that synthetic shape actually is) -- a mechanism that only ever runs for AOIs that exist in
+the real ACD at load time. A `db_new_aoi()`-created AOI has no such backing entry at all, so its name
+was never resolvable, regardless of how many times `_sync_data_types_map()` ran.
+
+**Fixed** by extending `_sync_data_types_map()` to also register each `project.controller.aois` entry
+that has no existing map entry (`setdefault`-equivalent, so a REAL AOI's own richer, Comps.Dat-derived
+synthetic shape is never overwritten -- only a genuinely new, not-yet-real AOI gets this fallback) via
+a new `_synthetic_aoi_data_type(aoi)`: a best-effort `DataType`-shaped stand-in built from the AOI's
+own `.parameters` + `.local_tags`, each converted to a plain `Member` via the already-existing
+`new_member()`. Verified this doesn't leak into `_resolve_type_closure()`'s own dependency-closure
+computation (which builds its own separate `data_types_by_name`/`aois_by_name` dicts directly from
+`project.controller.data_types`/`.aois`, never from `data_types_map` at all) -- the AOI still correctly
+resolves as an AOI dependency (`<AddOnInstructionDefinitions Use="Context">`), not a spurious duplicate
+DataType context entry.
+
+**Explicitly NOT claiming real fidelity** -- the docstring says so directly: this is a reasonable
+default (every parameter/local tag rendered zero-filled, in declared order) for the one narrow purpose
+of letting validation pass and the instance tag's own `<Data>` block render SOMETHING real instead of
+silently nothing (the previous, safe-but-unhelpful behavior: `_struct_members_xml()` already gracefully
+returns `None` for an unresolved type rather than crashing, which is why this was "only" a validation
+failure and a silently-empty `<Data>` block, never a corrupt file) -- not a claim that a not-yet-real
+AOI's rendered instance value matches what a real Studio-created instance would eventually show.
+
+**A real, separate gap found and worked around while writing the regression test for this, NOT part of
+the same fix**: a bare model-layer `new_tag()` call (as opposed to `db_new_tag()`, which goes through
+`ProjectDB._load_tags()`) never wires the new `Tag`'s own `_data_types_map` attribute to the project's
+shared map at all -- `new_tag()` is a deliberately pure, project-context-free constructor (matching
+`new_member()`/`new_datatype()`/`new_routine()`'s own established shape), so it has no project reference
+to wire against. This is why the FIRST version of this fix's own end-to-end test failed on a rendering
+assertion (an empty `<Data>` block) even though `export_routine(validate=True)` itself already
+succeeded -- validation reads `project.controller._data_types_map` directly, but XML *rendering* reads
+each tag's OWN `._data_types_map` reference, a genuinely separate value unless something wires them
+together. This exact caveat was already known and already demonstrated correctly by an existing test
+(`test_sync_data_types_map_propagates_new_type_to_existing_tags`, which manually sets
+`tag._data_types_map = project.controller._data_types_map` for precisely this reason) -- not a new bug,
+just a pre-existing trap this investigation walked into and is now flagging explicitly rather than
+leaving implicit. `db_new_tag()`/`ProjectDB` callers (the real, documented, recommended surface) are
+unaffected -- `_load_tags()` already wires this correctly for every tag it builds.
+
+Covered by `test_sync_data_types_map_registers_new_aoi_instance_type`,
+`test_sync_data_types_map_does_not_overwrite_real_aoi_synthetic_type`,
+`test_export_routine_validate_resolves_new_aoi_instance_type` (`test/test_api.py`, the latter using the
+manual `_data_types_map` wiring per the caveat above, checked against real rendered XML: both the
+`<AddOnInstructionDefinition>` context block and a real `<Structure DataType="Value_To_Str">` for the
+instance tag, not just that validation passes) and `test_db_export_routine_resolves_instance_of_not_yet_real_aoi`
+(`test/test_project_db.py` -- the literal reported repro, through the real `db_*` surface end-to-end,
+where `db_new_tag()` wires `_data_types_map` automatically with no manual step needed).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

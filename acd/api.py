@@ -1023,6 +1023,39 @@ def _referenced_called_routines(rung_texts, program) -> list:
     return list(found.values())
 
 
+def _synthetic_aoi_data_type(aoi: "AOI") -> "DataType":
+    """Build a best-effort `DataType`-shaped stand-in for a brand-new AOI's
+    own instance data shape, from its `.parameters` + `.local_tags` (each
+    converted to a plain `Member` via `new_member()`) -- used only so an
+    instance TAG typed as this AOI can resolve/render at all before the AOI
+    is real in Studio 5000 (see `_sync_data_types_map()`).
+
+    Deliberately NOT the same fidelity as a real AOI's own Comps.Dat-derived
+    instance shape (see CLAUDE.md's own documented gaps in AOI
+    instance-value decoding for a REAL AOI -- missing `EnableIn`/
+    `EnableOut`, an L5K value count that doesn't match the named-member
+    count, an unexplained leading value) -- this is a reasonable default
+    (every parameter/local tag zero-filled, in declared order) for the one
+    narrow purpose of not silently producing an EMPTY `<Data>` block (the
+    previous behavior: `_struct_members_xml()` returns `None` for an
+    unresolved type, which is safe -- not wrong-shaped -- but also not
+    useful), not a claim that the rendered value is byte-for-byte what a
+    real Studio-created instance of this same AOI would show.
+    """
+    dt = DataType(aoi.name, aoi.name, "NoFamily", "User", [])
+    for p in aoi.parameters:
+        if not p.data_type:
+            continue
+        dim = int(p.dimensions) if p.dimensions else 0
+        dt.members.append(new_member(p.name, p.data_type, dimension=dim, radix=p.radix))
+    for lt in aoi.local_tags:
+        if not lt.data_type:
+            continue
+        dim = int(lt.dimensions) if lt.dimensions else 0
+        dt.members.append(new_member(lt.name, lt.data_type, dimension=dim, radix=lt.radix))
+    return dt
+
+
 def _sync_data_types_map(project: RSLogix5000Content) -> None:
     """Register any DataType appended to `project.controller.data_types`
     (the documented way to create/register a new UDT -- see
@@ -1038,6 +1071,17 @@ def _sync_data_types_map(project: RSLogix5000Content) -> None:
     routine referencing one of those instances in the same session. See
     CLAUDE.md "Mutating a UDT with live tag instances" for the full story.
 
+    ALSO registers any brand-new AOI in `project.controller.aois` that has
+    no existing entry (a real, already-imported AOI already has one --
+    `ControllerBuilder` seeds a real synthetic instance-shape `DataType`
+    for every AOI at load time, which this never overwrites) -- via
+    `_synthetic_aoi_data_type()`. Without this, a routine referencing an
+    instance of a brand-new (`db_new_aoi()`-created, not-yet-imported) AOI
+    type could never pass `export_routine(..., validate=True)` at all, and
+    the instance tag's own `<Data>` block would silently render empty --
+    a real, reported blocker for the documented "new AOI + first real
+    caller in the same batch" workflow (see CLAUDE.md).
+
     Every `Tag._data_types_map` is the SAME dict object, assigned by
     reference throughout the whole `load_acd()` build -- also exposed as
     `project.controller._data_types_map` for exactly this purpose, so
@@ -1050,6 +1094,10 @@ def _sync_data_types_map(project: RSLogix5000Content) -> None:
     shared_map = project.controller._data_types_map
     for dt in project.controller.data_types:
         shared_map.setdefault(dt.name.upper(), dt)
+    for aoi in (project.controller.aois or []):
+        key = aoi.name.upper()
+        if key not in shared_map:
+            shared_map[key] = _synthetic_aoi_data_type(aoi)
 
 
 def _resolve_type_closure(initial_type_names: set, project: RSLogix5000Content):

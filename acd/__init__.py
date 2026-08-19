@@ -57,7 +57,9 @@ step, so a call never returns more than actually asked for:
     silently picking one. Its `"rung_comments"` is `Dict[int, str]` keyed by
     the INTEGER rung index (same index space as `"rungs"`) -- NOT
     stringified keys; `comments.get(str(i))` silently returns `None` for
-    every rung instead of erroring, so use the int index directly.
+    every rung instead of erroring, so use the int index directly. Do NOT
+    call this in a loop over every routine to search for a reference --
+    see "SCANNING EVERY ROUTINE" below.
   - `db_list_tags(acd_path, program_name=None)` -- name/data_type/
     dimensions/description for tags in one scope, WITHOUT the decoded
     value (can be large on its own for a UDT array tag) -- then
@@ -68,11 +70,54 @@ step, so a call never returns more than actually asked for:
     collision check in a given scope (controller by default).
   - `db_find_tag_references(acd_path, name, regex=False)` -- every
     (program, routine, line_index, text) where a tag/member name is
-    referenced, project-wide -- e.g. to check whether a name is already
-    used before reusing it.
+    referenced, project-wide, in ONE call -- e.g. to check whether a name
+    is already used before reusing it, or to find every place a tag/routine
+    is referenced before converting/renaming it. `regex=True` matches a
+    substring/family of names (e.g. `name=r"Str_Pad"` to match
+    `Str_Pad_A`/`Str_Pad_B`/...) instead of the default whole-token match.
+    **Prefer this over hand-looping `db_get_routine()`/`db_list_routines()`
+    over every routine yourself** -- see "SCANNING EVERY ROUTINE" below.
   - `db_io_addresses_by_routine(acd_path)` -- every routine's I/O
     addresses, without hand-rolling a regex over rung text (easy to
     mis-tokenize -- `"Remote_Rack1:3:I.Pt13.Data"`, `"IO024:I.Data[0].13"`).
+
+SCANNING EVERY ROUTINE FOR A REFERENCE -- READ THIS BEFORE LOOPING
+`db_get_routine()`. A real report: looping the STATELESS `db_get_routine()`
+over all ~180 routines in a project (grepping each result for a tag/routine
+name) took 10+ minutes of actual CPU time, not just wall-clock -- each
+stateless call opens its own connection AND (see below) used to pay for a
+full project rehydration just to answer "what's in this one routine."
+Two separate fixes, worth understanding both:
+  1. **You almost never need to hand-loop at all.** `db_find_tag_references(
+     acd_path, name, regex=True)` already answers "every place X is
+     referenced, project-wide" in ONE call -- including a routine CALLING
+     another routine by name (`JSR(RoutineName,...)` is just text a plain
+     substring/regex search matches like anything else). This is the
+     right tool for "what needs rewiring before I convert/rename this,"
+     not a hand-rolled loop.
+  2. **If you genuinely need per-routine access in a loop anyway** (e.g.
+     editing many routines in sequence, not just searching), open ONE
+     connection with `open_project_db(acd_path)` and call the instance
+     methods (`db.list_routines()`, `db.get_routine(name, program_name=p)`)
+     on it, closing once at the end -- never loop the stateless `db_*`
+     wrappers, each of which opens/verifies/closes its own connection.
+     `get_routine()` is ALSO now backed directly by SQL
+     (`proj_routines`/`proj_rungs`/`proj_st_lines`) for the common case (a
+     Program's routine, or an AOI created via `db_new_aoi()`), not a full
+     `to_controller()` rehydration, specifically because of this report --
+     a full-project routine-by-routine loop with a single connection is a
+     cheap SQL query per routine now for that case, not a full project
+     decode per routine (the original report's slowdown was BOTH factors
+     compounding: opening a new connection AND a full rehydration, on every
+     single iteration). It transparently falls back to the slower, old
+     behavior only for a REAL, pre-existing AOI's own routine (not tracked
+     in the fast path's tables at all) -- rare enough as a single lookup
+     that this is a fine trade. `list_routines()` itself still always does
+     one full `to_controller()` (unavoidable for now: it's the only way to
+     see a real AOI's routines at all, and silently dropping those from a
+     "list every routine" call would be worse than the one-time cost) --
+     but that's ONE call, not the N-times loop that actually caused the
+     reported slowdown.
 
 EDITS -- durable the moment the call returns (see above), each raising
 `KeyError` for an unknown name/scope:

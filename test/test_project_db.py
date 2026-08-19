@@ -1017,6 +1017,94 @@ def test_db_new_aoi_local_tag_stateless_wrapper_and_export(acd_copy, tmp_path):
     assert 'Name="Scratch1"' in content
 
 
+def test_get_routine_does_not_rehydrate_full_controller(acd_copy, monkeypatch):
+    # Regression test for a real report: looping db_get_routine() (or even
+    # ProjectDB.get_routine() on a single reused connection) over every
+    # routine in a ~180-routine project took multiple minutes of real CPU
+    # time, because this method used to call self.to_controller() -- a
+    # FULL project rehydration (every tag's initial value decoded, every
+    # UDT/Module/AOI/Task rebuilt) -- just to answer "what's in this one
+    # routine." Fixed to read only proj_routines/proj_rungs/proj_st_lines
+    # directly via SQL. Spy on ControllerBuilder.build (the expensive part
+    # of to_controller()) to confirm it's never invoked by get_routine().
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        program = project.controller.programs[0]
+        routine = next(r for r in program.routines if r.type == "RLL")
+
+        calls = []
+        original = project_db_module.ControllerBuilder.build
+
+        def _spy(self):
+            calls.append(1)
+            return original(self)
+
+        monkeypatch.setattr(project_db_module.ControllerBuilder, "build", _spy)
+
+        result = db.get_routine(routine.name, program_name=program.name)
+
+        assert calls == []
+        assert result["rungs"] == list(routine.rungs)
+        assert result["type"] == "RLL"
+    finally:
+        db.close()
+
+
+def test_list_routines_still_includes_real_aoi_routines(aoi_acd_copy):
+    # Deliberately NOT converted to the SQL-only fast path get_routine() now
+    # uses -- proj_routines never contains a real, pre-existing AOI's own
+    # routines (_materialize() only walks ctrl.programs), so a SQL-only
+    # list_routines() would silently omit them. Confirms the (still
+    # to_controller()-based) implementation continues to see them.
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    expected_aoi_routines = {
+        (f"AOI:{a.name}", r.name) for a in reference.controller.aois for r in a.routines
+    }
+    assert expected_aoi_routines, "fixture should have at least one real AOI routine"
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        listed = {(r["program"], r["routine"]) for r in db.list_routines()}
+        assert expected_aoi_routines <= listed
+    finally:
+        db.close()
+
+
+def test_list_routines_and_get_routine_line_counts_agree(acd_copy):
+    # list_routines()'s own line_count and get_routine()'s own len(rungs)/
+    # len(st_lines) are now sourced by two independent SQL paths -- confirm
+    # they still agree for every routine, not just that each one runs.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        for entry in db.list_routines():
+            routine = db.get_routine(entry["routine"], program_name=entry["program"])
+            actual = len(routine["rungs"]) if entry["type"] == "RLL" else len(routine["st_lines"])
+            assert actual == entry["line_count"], entry
+    finally:
+        db.close()
+
+
+def test_get_routine_accepts_aoi_prefixed_program_name_from_list_routines(aoi_acd_copy):
+    # list_routines()'s own "program" field for an AOI-owned routine is
+    # "AOI:<name>" (matching acd.api._all_routines()'s own keying) --
+    # get_routine() must accept that shorthand directly (not just the
+    # separate aoi_name= parameter), so a caller can feed a list_routines()
+    # entry straight into get_routine() without special-casing AOI entries.
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        entries = [e for e in db.list_routines() if e["program"].startswith("AOI:")]
+        assert entries, "fixture should have at least one AOI-owned routine"
+        entry = entries[0]
+
+        via_prefix = db.get_routine(entry["routine"], program_name=entry["program"])
+        via_aoi_name = db.get_routine(entry["routine"], aoi_name=entry["program"][len("AOI:"):])
+        assert via_prefix == via_aoi_name
+        assert len(via_prefix["rungs"]) + len(via_prefix["st_lines"]) == entry["line_count"]
+    finally:
+        db.close()
+
+
 def _first_routine(db):
     listed = db.list_routines()
     rll = next(r for r in listed if r["type"] == "RLL" and r["line_count"] > 0)

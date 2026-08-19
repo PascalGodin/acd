@@ -3676,6 +3676,83 @@ Covered by `test_new_aoi_parameter_rejects_array_input`, `test_new_aoi_parameter
 hand-constructed `Parameter`), and `test_export_aoi_accepts_array_inout_parameter` (confirms `InOut`
 arrays are still allowed, not accidentally banned entirely) — `test/test_api.py`.
 
+## `ProjectDB.get_routine()` used to pay for a FULL project rehydration just to answer "what's in this one routine" — a real 10-minute regression on a routine-by-routine scan
+
+A real report, unrelated to the AOI work above but hitting the exact "full-project scan" pattern this
+codebase's own docs (see "Lazy / summary-first lookups" above) explicitly promise is cheap: before
+converting a routine to an AOI, the agent wanted to find every reference to it and to the controller-
+scoped tags it uses — "same pattern as" prior conversions. Two attempts:
+1. Looped `acd.db_get_routine(acd_path, name, program_name=prog)` (the STATELESS wrapper) once per
+   routine over all ~180 routines in the project, grepping each result. Killed after 10+ minutes —
+   `tasklist` showed 10:52 of actual CPU time already burned, not idle/blocked.
+2. Same loop, but through ONE `open_project_db()` connection and the instance methods
+   (`db.list_routines()`/`db.get_routine(...)`) instead of the stateless wrappers, closing once at the
+   end. ~8-9x less CPU time at a comparable wall-clock point (1:16 vs 10+ minutes) — confirming
+   per-call connection open/lock/verify overhead was A real cost — but STILL running past 120 seconds,
+   meaning reusing one connection wasn't the whole story.
+
+**Root cause of the remaining cost, found by reading `ProjectDB.get_routine()`'s own implementation**:
+it built a FULL `to_controller()` rehydration — `ControllerBuilder.build()` decoding every tag's
+initial value, every UDT, every Module/AOI/Task, the whole controller graph — just to pick ONE
+routine's rungs/ST-lines/comments out of it and discard everything else. This is the exact "known v1
+cost/simplicity tradeoff" this class's own docstring already named (see "Persistent project DB" above)
+— always true, but never actually measured against a 180-routine real project until this report made
+it concrete: 180 full rehydrations for a single scan.
+
+**Two real fixes, not one, because they compound differently**:
+1. **`ProjectDB.get_routine()`** (`acd/l5x/project_db.py`) now reads `proj_routines`/`proj_rungs`/
+   `proj_st_lines` DIRECTLY via SQL for the common case — a Program's routine, or an AOI created via
+   `new_aoi()`/`db_new_aoi()` in THIS project DB — no `to_controller()` call at all. `_routine_id()`
+   (already shared by every routine-content method, see the earlier `aoi_name=` section) does the
+   name→id resolution; a small, targeted set of `SELECT`s pulls exactly the rows this one routine
+   needs. Falls back to the old, full-rehydration behavior ONLY when nothing is found in
+   `proj_routines` at all — which happens for exactly one case: **a REAL, pre-existing AOI's own
+   routine, which `_materialize()` never puts in `proj_routines` in the first place** (it only ever
+   walks `ctrl.programs`, never `ctrl.aois` — the same "`proj_aois` never holds a real AOI" design
+   decision from the earlier AOI-collision fix, just discovered to have this second consequence too).
+   That fallback is a single, rare lookup (one named routine, not a 180-iteration loop), so paying the
+   old slow-path cost there is an acceptable, deliberate trade — not something worth chasing further.
+2. **`ProjectDB.list_routines()`** was ALSO tried as a SQL-direct rewrite first, and reverted — this
+   is the one part of this fix that needed a second pass to get right. A SQL-only `list_routines()`
+   would silently OMIT every real, pre-existing AOI's own routines from its output (same
+   `_materialize()` gap as above), which is a much more dangerous failure mode for a "list every
+   routine" call than for a single named lookup: a caller auditing "everything that references X"
+   would get an incomplete, silently-wrong list with no error, exactly the kind of "succeeds with
+   quietly wrong data" bug this codebase's own methodology section warns hardest against. Caught by a
+   dedicated test (`test_get_routine_accepts_aoi_prefixed_program_name_from_list_routines`) failing
+   with `KeyError` when a real AOI's own routine, listed via the (at-the-time SQL-only) `list_routines()`,
+   couldn't be found by the also-SQL-only `get_routine()` — the mismatch is what surfaced the gap.
+   `list_routines()` stays on `to_controller()` — the ONE-time full-decode cost of a single call was
+   never actually the reported problem (the report's own numbers show `db_list_routines()` was called
+   ONCE, not looped; the 180x cost was entirely `get_routine()`).
+3. A related, standalone improvement made while fixing this: `_routine_id()` now also accepts a
+   `program_name` starting with `"AOI:"` (e.g. `"AOI:MyAOI"`) as shorthand for `aoi_name="MyAOI"` —
+   the exact convention `list_routines()`'s own `"program"` field already uses for an AOI-owned routine
+   (matching `acd.api._all_routines()`'s keying). Without this, a caller iterating `list_routines()`'s
+   own output and feeding each entry straight into `get_routine(entry["routine"],
+   program_name=entry["program"])` would get a confusing `KeyError` for every AOI-owned entry (no
+   program is ever literally named `"AOI:MyAOI"`) — this closes that gap so the natural
+   list-then-fetch loop works uniformly regardless of whether a routine belongs to a Program or an AOI.
+
+**Also, a discoverability fix**: the reporting agent's own third question was whether this should be
+called out more explicitly, since reading the docstrings first hadn't surfaced the anti-pattern. Added
+a new "SCANNING EVERY ROUTINE FOR A REFERENCE" section to `acd/__init__.py`'s module docstring
+(positioned right after the READS bullets, where `db_get_routine`/`db_find_tag_references` are
+introduced) naming the real numbers from this report and pointing at the actual best tool for the
+underlying need first: `db_find_tag_references(acd_path, name, regex=True)` already answers "every
+place X is referenced, project-wide" — including a routine CALLING another by name, since `JSR(X,...)`
+is just text a substring/regex search matches like anything else — in ONE call, with no loop needed at
+all. Looping `get_routine()`/`db_get_routine()` is for when you need per-routine access itself (e.g.
+editing many routines in sequence), not for a pure "who references X" search.
+
+Covered by `test_get_routine_does_not_rehydrate_full_controller` (spies on `ControllerBuilder.build`,
+confirms it's never called for a Program routine), `test_list_routines_still_includes_real_aoi_routines`
+(confirms the deliberately-NOT-SQL-only `list_routines()` still sees a real AOI's routines),
+`test_get_routine_accepts_aoi_prefixed_program_name_from_list_routines` (the fallback path, confirmed
+identical whether reached via the `"AOI:"` prefix shorthand or the explicit `aoi_name=` parameter), and
+`test_list_routines_and_get_routine_line_counts_agree` (cross-checks the two independent SQL paths
+report the same line counts for every routine) — `test/test_project_db.py`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

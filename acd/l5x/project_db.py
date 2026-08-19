@@ -764,23 +764,6 @@ class ProjectDB:
 
     # ---- scope resolution helpers ----
 
-    @staticmethod
-    def _get_routine_scope(program_name: Union[str, None], aoi_name: Union[str, None]) -> Union[str, None]:
-        """Translate this class's own `program_name=`/`aoi_name=` pair into
-        the single `program_name=` string `acd.api.get_routine()` expects --
-        that function already supports AOI-owned routines via its own
-        pre-existing `program_name=f"AOI:{aoi_name}"` convention (see its
-        docstring), so `export_routine()`/`get_routine()` below translate
-        into that rather than needing a second resolution mechanism.
-        """
-        if program_name is not None and aoi_name is not None:
-            raise ValueError(
-                "pass at most one of program_name/aoi_name to disambiguate a routine, not both"
-            )
-        if aoi_name is not None:
-            return f"AOI:{aoi_name}"
-        return program_name
-
     def _program_id(self, program_name: Union[str, None]) -> int:
         if program_name is None:
             return _CONTROLLER_SCOPE
@@ -817,7 +800,18 @@ class ProjectDB:
         case an AOI whose routine uses Rockwell's own conventional name,
         e.g. `"Logic"`, hits immediately -- pass `aoi_name=`/`program_name=`
         to disambiguate).
+
+        A `program_name` starting with `"AOI:"` (e.g. `"AOI:MyAOI"`) is
+        treated as shorthand for `aoi_name="MyAOI"` -- this is the exact
+        convention `list_routines()`'s own `"program"` field already uses
+        for an AOI-owned routine (matching `acd.api._all_routines()`'s own
+        keying), so a caller can feed a `list_routines()` entry straight
+        into `get_routine(entry["routine"], program_name=entry["program"])`
+        without special-casing AOI entries themselves.
         """
+        if program_name is not None and program_name.startswith("AOI:") and aoi_name is None:
+            aoi_name = program_name[len("AOI:"):]
+            program_name = None
         if program_name is not None and aoi_name is not None:
             raise ValueError(
                 "pass at most one of program_name/aoi_name to disambiguate a routine, not both"
@@ -1959,6 +1953,26 @@ class ProjectDB:
         return _list_tags(self.to_controller(), program_name)
 
     def list_routines(self, program_name: Union[str, None] = None) -> List[dict]:
+        """Name/type/line-count for every routine, WITHOUT rung/line
+        content -- same shape as `acd.api.list_routines()`. Still sourced
+        via a full `to_controller()` rehydration (NOT the SQL-direct
+        shortcut `get_routine()` now uses -- see its own docstring for why):
+        `proj_routines` never contains a REAL, pre-existing AOI's own
+        routines at all (`_materialize()` only ever walks `ctrl.programs`,
+        never `ctrl.aois` -- deliberate, see `_load_aois()`'s own docstring
+        on why `proj_aois` never holds a real AOI either), so a SQL-only
+        listing here would silently omit every real AOI's routine from the
+        result -- a real, dangerous gap for exactly the "find every routine
+        project-wide" use case this function exists for. Unlike
+        `get_routine()` (one name, cheap to fall back to a full decode only
+        when genuinely needed), there's no equivalently cheap way to list
+        *some* routines fast and merge in the rest, so this method keeps
+        paying the one-time full-decode cost on every call -- acceptable
+        since a caller normally calls this ONCE to see what exists, not in
+        a loop (loop `get_routine()`, not this, if you must; better yet see
+        `db_find_tag_references()` for "who references X" instead of
+        looping either one, per `acd.__init__`'s own guidance).
+        """
         return _list_routines(self.to_controller(), program_name)
 
     def tag_exists(self, name: str, program_name: Union[str, None] = None) -> bool:
@@ -1974,7 +1988,7 @@ class ProjectDB:
         (not a `Routine` object) to keep this surface self-contained --
         pass the rung text you get back to `replace_rung_safe()` if you're
         about to edit it. Raises `KeyError`/`ValueError` the same way
-        `get_routine()` (acd.api) does for a missing/ambiguous name.
+        `_routine_id()` does for a missing/ambiguous name.
 
         `"rung_comments"` is `Dict[int, str]` -- keyed by the INTEGER rung
         index (same index space as `"rungs"`), not a stringified index and
@@ -1986,16 +2000,75 @@ class ProjectDB:
 
         Pass `aoi_name=` (not `program_name=`) to read an AOI-owned logic
         routine -- exactly one of `program_name`/`aoi_name` may be given.
+        `program_name` starting with `"AOI:"` (e.g. `"AOI:MyAOI"`, matching
+        `list_routines()`'s own `"program"` field for an AOI-owned routine)
+        is treated as shorthand for `aoi_name="MyAOI"` -- see `_routine_id()`
+        for why, so a `list_routines()` entry can be fed straight in here.
+
+        Sourced DIRECTLY from `proj_routines`/`proj_rungs`/`proj_st_lines`
+        via SQL, NOT via `to_controller()`, for the common case (a Program's
+        routine, or an AOI created via `new_aoi()`/`db_new_aoi()` in THIS
+        project DB) -- a real report found looping this call (or the
+        stateless `db_get_routine()`) over every routine in a ~180-routine
+        project (a normal "find every reference to X" scan, exactly the
+        pattern `db_find_tag_references()`/`find_tag_references()` already
+        do in ONE call, see their own docstrings -- prefer those over
+        hand-looping `get_routine()` for that specific use case) took 10+
+        minutes of real CPU time with the stateless wrapper, and still
+        multiple minutes with a single `open_project_db()` connection reused
+        across the loop. Root cause: this method used to build a FULL
+        project rehydration (`to_controller()` -- every tag's initial value
+        decoded, every UDT/Module/AOI/Task rebuilt via `ControllerBuilder`)
+        just to answer "what's in this one routine," discarding everything
+        else it just built. Fixed by reading only the `proj_routines`/
+        `proj_rungs`/`proj_st_lines` rows this routine actually needs -- no
+        Controller rehydration at all for the common case, so a
+        full-project routine-by-routine scan (looping this method, NOT the
+        stateless wrapper -- see below) is a cheap SQL query per routine,
+        not a full decode per routine.
+
+        FALLS BACK to a full `to_controller()` rehydration (the old, slow
+        behavior) ONLY when the fast path finds no match at all -- this
+        covers a REAL, pre-existing AOI's own routine, which `proj_routines`
+        never contains (`_materialize()` only ever walks a project's
+        Programs, never its AOIs -- deliberate, see `_load_aois()`'s own
+        docstring). Rare enough in practice (one routine, not 180) that
+        paying the slow path once here is fine; `list_routines()` still
+        always does this (see its own docstring for why a partial/merged
+        fast path isn't safe there the way it is here).
         """
-        scope = self._get_routine_scope(program_name, aoi_name)
-        routine = _get_routine(self.to_controller(), routine_name, scope)
+        try:
+            routine_id = self._routine_id(routine_name, program_name, aoi_name)
+        except KeyError:
+            scope = f"AOI:{aoi_name}" if aoi_name is not None else program_name
+            routine = _get_routine(self.to_controller(), routine_name, scope)
+            return {
+                "name": routine.name,
+                "type": routine.type,
+                "description": routine._description,
+                "rungs": list(routine.rungs),
+                "rung_comments": dict(routine._rung_comments),
+                "st_lines": list(routine._st_lines),
+            }
+        cur = self._conn.cursor()
+        rtype, description = cur.execute(
+            "SELECT type, description FROM proj_routines WHERE id=?", (routine_id,)
+        ).fetchone()
+        rung_rows = cur.execute(
+            "SELECT text, comment FROM proj_rungs WHERE routine_id=? ORDER BY rung_index",
+            (routine_id,),
+        ).fetchall()
+        st_rows = cur.execute(
+            "SELECT text FROM proj_st_lines WHERE routine_id=? ORDER BY line_index",
+            (routine_id,),
+        ).fetchall()
         return {
-            "name": routine.name,
-            "type": routine.type,
-            "description": routine._description,
-            "rungs": list(routine.rungs),
-            "rung_comments": dict(routine._rung_comments),
-            "st_lines": list(routine._st_lines),
+            "name": routine_name,
+            "type": rtype,
+            "description": description,
+            "rungs": [r[0] for r in rung_rows],
+            "rung_comments": {i: r[1] for i, r in enumerate(rung_rows) if r[1] is not None},
+            "st_lines": [r[0] for r in st_rows],
         }
 
     def get_tag_value(self, tag_name: str, program_name: Union[str, None] = None,

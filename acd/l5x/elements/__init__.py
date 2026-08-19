@@ -73,6 +73,7 @@ from .model import (
     Parameter,
     new_aoi_parameter,
     new_aoi_enable_parameters,
+    _AOI_ELEMENTARY_PARAM_TYPES,
     Module,
     Routine,
     new_routine,

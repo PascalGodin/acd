@@ -941,8 +941,7 @@ def test_db_export_routine_resolves_instance_of_not_yet_real_aoi(acd_copy, tmp_p
     db_new_aoi(str(acd_copy), "Value_To_Str", description="test")
     db_new_aoi_parameter(str(acd_copy), "Value_To_Str", "Value", "DINT", usage="Input",
                           required="true")
-    db_new_aoi_parameter(str(acd_copy), "Value_To_Str", "Result", "STRING", usage="Output",
-                          required="false")
+    db_new_aoi_parameter(str(acd_copy), "Value_To_Str", "Result", "STRING", usage="InOut")
     db_new_routine(str(acd_copy), "Logic", "ST", aoi_name="Value_To_Str")
     db_insert_st_line(str(acd_copy), "Logic", 0, "Result := 'x';", aoi_name="Value_To_Str")
 

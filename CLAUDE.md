@@ -3822,6 +3822,59 @@ instance tag, not just that validation passes) and `test_db_export_routine_resol
 (`test/test_project_db.py` -- the literal reported repro, through the real `db_*` surface end-to-end,
 where `db_new_tag()` wires `_data_types_map` automatically with no manual step needed).
 
+## AOI Input/Output parameters must be an elementary (atomic) data type, not just non-array
+
+The very next real Studio 5000 import attempt on the same `Value_To_Str` AOI (after the fix above
+unblocked exporting `R11_Printer`) hit a second, related, previously-unencoded Rockwell constraint:
+```
+Error: Line 14: Error creating 'Parameter' (Input or output parameter must be of supported
+elementary data type.).
+    RSLogix5000Content/Controller/AddOnInstructionDefinitions/AddOnInstructionDefinition[@Name="Value_To_Str"]/Parameters/Parameter[@Name="PadChar"]
+```
+`PadChar` was declared `DataType="STRING"`, `Usage="Input"` — a SCALAR (no dimensions), so the
+already-fixed "array only on InOut" check (see the AOI creation support section above) didn't catch
+it; the actual `Value_To_Str.L5X` export also has a second STRING-typed, non-`InOut` parameter
+(`Result`, `Usage="Output"`) that Studio never even reached, since it stops at the first error per
+import attempt — both would need the same fix.
+
+**This unifies with, rather than replaces, the array-only-on-InOut rule already documented above**:
+Rockwell's real constraint is broader than "no arrays" — an `Input`/`Output` AOI parameter (passed by
+value/copied) may ONLY be one of Rockwell's own "elementary" (atomic) types: `BOOL`, `SINT`/`INT`/
+`DINT`/`LINT` (+ unsigned `U*` variants), `REAL`/`LREAL`. `STRING`, any project UDT, and another AOI are
+all "structured" types in Rockwell's own terminology (same category as `TIMER`/`COUNTER`), and are
+therefore just as invalid on `Input`/`Output` as an array is — only `InOut` (passed by reference) may
+use ANY of: an array, `STRING`, a UDT, or another AOI.
+
+**Fixed the same three-layer way as the array constraint**, generalizing rather than duplicating:
+- `new_aoi_parameter()` (`acd/l5x/elements/model.py`) gained a companion check alongside the existing
+  dimension check: for `usage != "InOut"`, `data_type.upper()` must be in the new
+  `_AOI_ELEMENTARY_PARAM_TYPES` constant (`_PRIMITIVE_RADIX`'s own key set + `"BOOL"`, since `BOOL` has
+  no `Radix` attribute of its own in Rockwell's schema and so isn't in that dict) — raises `ValueError`
+  immediately otherwise, naming the real Studio error text.
+- `ProjectDB.new_aoi_parameter()`/`db_new_aoi_parameter()` inherit the guard for free (same shared
+  constructor).
+- `export_aoi()` (`acd/api.py`) checks every `Input`/`Output` parameter's `data_type` unconditionally
+  (not gated by `validate=`, same reasoning as every other structural AOI check in this file) — the
+  array check and the new elementary-type check are now one combined loop (`if p.usage == "InOut":
+  continue` up front, then both checks in sequence), rather than two separate loops.
+
+**Existing tests needed real fixes, not just additions** — several pre-existing tests had been
+constructing STRING/UDT-typed `Input` parameters (the default `usage`) purely incidentally, never
+checked against this real constraint before now: `test_new_aoi_parameter_udt_type_omits_radix`,
+`test_export_aoi_includes_dependencies_block_for_target_with_udt_parameter`, and
+`test_export_aoi_validate_rejects_unresolved_parameter_type` all switched to `usage="InOut"` so they
+keep testing what they were actually meant to test (radix omission, dependency closure, unresolved-type
+detection) rather than tripping the new, unrelated elementary-type guard first. The two
+`Value_To_Str`-instance-type regression tests from the section above (which use a STRING `Result`
+parameter) were similarly updated to `usage="InOut"` — matching what the REAL AOI will also need once
+both `PadChar` and `Result` are fixed in Studio.
+
+Covered by `test_new_aoi_parameter_rejects_string_input`, `test_new_aoi_parameter_rejects_string_output`,
+`test_new_aoi_parameter_rejects_udt_input`, `test_new_aoi_parameter_string_inout_still_allowed`,
+`test_new_aoi_parameter_all_elementary_types_allowed_for_input_output`,
+`test_export_aoi_rejects_string_input_output_parameter` (defense-in-depth, via a hand-constructed
+`Parameter`), and `test_export_aoi_accepts_string_inout_parameter` (`test/test_api.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

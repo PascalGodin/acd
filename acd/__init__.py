@@ -171,9 +171,15 @@ EDITS -- durable the moment the call returns (see above), each raising
     only valid for `usage="InOut"`** -- RAISES immediately otherwise
     (confirmed via a real Studio 5000 import rejection: `"Invalid array.
     Input or output parameter must be of supported elementary data type
-    with no dimensions."`). An `Input`/`Output` parameter is passed by
-    value and may only be a scalar elementary type; only `InOut` (passed by
-    reference) may be an array.
+    with no dimensions."`). **`data_type` for `usage="Input"`/`"Output"`
+    must be an elementary/atomic type** -- `BOOL`/`SINT`/`INT`/`DINT`/
+    `LINT`/unsigned variants/`REAL`/`LREAL` -- RAISES immediately for
+    `STRING`, a UDT, or another AOI with that usage (confirmed via a real
+    Studio 5000 import rejection: `"Error creating 'Parameter' (Input or
+    output parameter must be of supported elementary data type.)"`). An
+    `Input`/`Output` parameter is passed by value and may only be a single
+    scalar elementary value; only `InOut` (passed by reference) may be an
+    array OR a structured type (`STRING`/UDT/AOI).
   - `db_new_aoi_local_tag(acd_path, aoi_name, name, data_type,
     dimension=None, description=None, index=None)` -- add a private/scratch
     LocalTag (internal AOI state that shouldn't be a public parameter) to

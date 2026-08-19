@@ -641,7 +641,7 @@ def test_new_aoi_parameter_inout_omits_external_access():
 
 
 def test_new_aoi_parameter_udt_type_omits_radix():
-    p = new_aoi_parameter("Struct1", "SomeUdt", usage="Input")
+    p = new_aoi_parameter("Struct1", "SomeUdt", usage="InOut")
     assert p.radix is None
 
 
@@ -676,6 +676,38 @@ def test_new_aoi_parameter_scalar_input_output_still_allowed():
     p_out = new_aoi_parameter("Out1", "DINT", usage="Output")
     assert p_in.dimensions is None
     assert p_out.dimensions is None
+
+
+def test_new_aoi_parameter_rejects_string_input():
+    # Regression test: real Studio 5000 rejected import of a STRING-typed
+    # Input parameter with "Error creating 'Parameter' (Input or output
+    # parameter must be of supported elementary data type.)" -- only InOut
+    # parameters may use a non-elementary (structured) type.
+    with pytest.raises(ValueError, match="must be an elementary data type"):
+        new_aoi_parameter("PadChar", "STRING", usage="Input")
+
+
+def test_new_aoi_parameter_rejects_string_output():
+    with pytest.raises(ValueError, match="must be an elementary data type"):
+        new_aoi_parameter("Result", "STRING", usage="Output")
+
+
+def test_new_aoi_parameter_rejects_udt_input():
+    with pytest.raises(ValueError, match="must be an elementary data type"):
+        new_aoi_parameter("Struct1", "SomeUdt", usage="Input")
+
+
+def test_new_aoi_parameter_string_inout_still_allowed():
+    p = new_aoi_parameter("Result", "STRING", usage="InOut")
+    assert p.data_type == "STRING"
+    assert p.usage == "InOut"
+
+
+def test_new_aoi_parameter_all_elementary_types_allowed_for_input_output():
+    for dt in ("BOOL", "SINT", "INT", "DINT", "LINT", "USINT", "UINT", "UDINT", "ULINT",
+               "REAL", "LREAL"):
+        p = new_aoi_parameter("P", dt, usage="Input")
+        assert p.data_type == dt
 
 
 def test_new_aoi_parameter_overrides_required_visible_external_access():
@@ -795,7 +827,7 @@ def test_export_aoi_includes_dependencies_block_for_target_with_udt_parameter(tm
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
     udt_name = project.controller.data_types[0].name
     aoi = new_aoi("MyAOI")
-    aoi.parameters.append(new_aoi_parameter("Struct1", udt_name, usage="Input"))
+    aoi.parameters.append(new_aoi_parameter("Struct1", udt_name, usage="InOut"))
     project.controller.aois.append(aoi)
 
     output_path = tmp_path / "aoi_export.L5X"
@@ -836,7 +868,7 @@ def test_export_aoi_raises_if_not_in_project():
 def test_export_aoi_validate_rejects_unresolved_parameter_type():
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
     aoi = new_aoi("MyAOI")
-    aoi.parameters.append(new_aoi_parameter("Bad", "NoSuchUdtType", usage="Input"))
+    aoi.parameters.append(new_aoi_parameter("Bad", "NoSuchUdtType", usage="InOut"))
     project.controller.aois.append(aoi)
 
     with pytest.raises(ValueError, match="does not resolve"):
@@ -901,6 +933,35 @@ def test_export_aoi_accepts_array_inout_parameter(tmp_path):
     export_aoi(project, aoi, str(output_path))
     content = output_path.read_text(encoding="utf-8")
     assert 'Name="Arr1"' in content
+
+
+def test_export_aoi_rejects_string_input_output_parameter():
+    # Defense-in-depth: export_aoi() checks this unconditionally (not just
+    # new_aoi_parameter()'s own constructor-time guard), since a caller
+    # could hand-construct a Parameter directly, bypassing the constructor.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    bad_param = Parameter(
+        "PadChar", "PadChar", "Base", "STRING", "Input", None, "true", "true",
+        "Read/Write", None, None,
+    )
+    aoi.parameters.append(bad_param)
+    project.controller.aois.append(aoi)
+
+    with pytest.raises(ValueError, match="must be of supported elementary data type"):
+        export_aoi(project, aoi, "build/should_not_be_written.L5X")
+
+
+def test_export_aoi_accepts_string_inout_parameter(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    aoi.parameters.append(new_aoi_parameter("PadChar", "STRING", usage="InOut"))
+    project.controller.aois.append(aoi)
+
+    output_path = tmp_path / "aoi_export.L5X"
+    export_aoi(project, aoi, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'Name="PadChar"' in content
 
 
 def test_export_aoi_validate_rejects_unresolved_local_tag_type():
@@ -1017,7 +1078,7 @@ def test_sync_data_types_map_registers_new_aoi_instance_type():
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
     aoi = new_aoi("Value_To_Str")
     aoi.parameters.append(new_aoi_parameter("Value", "DINT", usage="Input"))
-    aoi.parameters.append(new_aoi_parameter("Result", "STRING", usage="Output"))
+    aoi.parameters.append(new_aoi_parameter("Result", "STRING", usage="InOut"))
     aoi.local_tags.append(new_aoi_local_tag("Scratch1", "DINT"))
     project.controller.aois.append(aoi)
 
@@ -1050,7 +1111,7 @@ def test_export_routine_validate_resolves_new_aoi_instance_type(tmp_path):
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
     aoi = new_aoi("Value_To_Str")
     aoi.parameters.append(new_aoi_parameter("Value", "DINT", usage="Input"))
-    aoi.parameters.append(new_aoi_parameter("Result", "STRING", usage="Output"))
+    aoi.parameters.append(new_aoi_parameter("Result", "STRING", usage="InOut"))
     project.controller.aois.append(aoi)
 
     program = project.controller.programs[0]

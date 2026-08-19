@@ -31,6 +31,7 @@ from acd.l5x.elements import (
     Member,
     RSLogix5000Content,
     Routine,
+    _AOI_ELEMENTARY_PARAM_TYPES,
     _escape_xml_attr,
     _multiline_xml_text,
     _validate_tag_types_resolve,
@@ -1662,10 +1663,16 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
     an AOI's own routine may ONLY be named `"Logic"`/`"Prescan"`/
     `"Postscan"`/`"EnableInFalse"`, never a caller-chosen name (Studio
     rejected `"Invalid name for Add-On Instruction routine."` outright --
-    see CLAUDE.md); and an `Input`/`Output` parameter (unlike `InOut`) may
+    see CLAUDE.md); an `Input`/`Output` parameter (unlike `InOut`) may
     NEVER be an array (Studio rejected `"Invalid array. Input or output
     parameter must be of supported elementary data type with no
-    dimensions."` -- see CLAUDE.md). `EnableIn`/`EnableOut` (via
+    dimensions."` -- see CLAUDE.md); and an `Input`/`Output` parameter may
+    ONLY use an elementary/atomic data type (`_AOI_ELEMENTARY_PARAM_TYPES`
+    -- `BOOL`/`SINT`/`INT`/`DINT`/`LINT`/unsigned variants/`REAL`/`LREAL`),
+    NEVER `STRING`, a UDT, or another AOI (Studio rejected `"Error creating
+    'Parameter' (Input or output parameter must be of supported elementary
+    data type.)"` for a STRING-typed Input parameter -- see CLAUDE.md).
+    `EnableIn`/`EnableOut` (via
     `new_aoi_enable_parameters()`) and AOI `LocalTags` (via
     `new_aoi_local_tag()`) HAVE been confirmed working end-to-end in a real
     import. Known, NOT-yet-addressed gap (see CLAUDE.md's AOI support
@@ -1696,11 +1703,12 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
         ValueError: if `aoi` isn't in `project.controller.aois`; if any of
             `aoi.routines` isn't named `"Logic"`/`"Prescan"`/`"Postscan"`/
             `"EnableInFalse"`; if any `Input`/`Output` (non-`InOut`)
-            parameter is an array; or (if `validate=True`) if a parameter's
-            or local tag's type doesn't resolve. The first three checks run
-            unconditionally (not gated by `validate=`) since they're
-            certainties to fail a real Studio 5000 import, not "might be a
-            problem" data-shape risks.
+            parameter is an array OR has a non-elementary data type
+            (`STRING`/a UDT/another AOI); or (if `validate=True`) if a
+            parameter's or local tag's type doesn't resolve. The first
+            checks all run unconditionally (not gated by `validate=`) since
+            they're certainties to fail a real Studio 5000 import, not
+            "might be a problem" data-shape risks.
     """
     import datetime
 
@@ -1722,13 +1730,23 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
             )
 
     for p in aoi.parameters:
-        if p.dimensions and p.usage != "InOut":
+        if p.usage == "InOut":
+            continue
+        if p.dimensions:
             raise ValueError(
                 f"AOI parameter {p.name!r} is an array (Dimensions={p.dimensions!r}) with "
                 f"Usage={p.usage!r} -- Studio 5000 rejects this (\"Invalid array. Input or "
                 f"output parameter must be of supported elementary data type with no "
                 f"dimensions.\"). Only an InOut parameter may be an array; change Usage to "
                 f"'InOut' or make {p.name!r} a scalar."
+            )
+        if p.data_type and p.data_type.upper() not in _AOI_ELEMENTARY_PARAM_TYPES:
+            raise ValueError(
+                f"AOI parameter {p.name!r} has DataType={p.data_type!r} with Usage={p.usage!r} "
+                f"-- Studio 5000 rejects this (\"Error creating 'Parameter' (Input or output "
+                f"parameter must be of supported elementary data type.)\"). Only an InOut "
+                f"parameter may be a STRING/UDT/AOI-typed; change Usage to 'InOut' or make "
+                f"{p.name!r} an elementary type ({sorted(_AOI_ELEMENTARY_PARAM_TYPES)})."
             )
 
     _sync_data_types_map(project)

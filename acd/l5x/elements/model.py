@@ -701,6 +701,21 @@ class Parameter(L5xElement):
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
+# Rockwell's own "elementary" (atomic) data types -- the ONLY types a real
+# Studio 5000 Input/Output AOI parameter may use; anything else (STRING, a
+# UDT, another AOI, TIMER/COUNTER/...) requires usage="InOut". Confirmed via
+# a real Studio 5000 import rejection of a STRING-typed Input parameter
+# ("Error creating 'Parameter' (Input or output parameter must be of
+# supported elementary data type.)") -- the same real error class as (and
+# unifying with) the array-only-on-InOut rule below: an Input/Output
+# parameter is passed by value/copied, so Rockwell restricts it to a single
+# atomic value; anything requiring more (an array OR a structured type) must
+# be passed by reference via InOut. `_PRIMITIVE_RADIX`'s own key set is
+# exactly the non-BOOL half of this list (BOOL has no Radix attribute of its
+# own in Rockwell's schema, so it's added separately here).
+_AOI_ELEMENTARY_PARAM_TYPES = frozenset(_PRIMITIVE_RADIX) | {"BOOL"}
+
+
 def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
                        dimension: Union[int, None] = None,
                        description: Union[str, None] = None,
@@ -737,23 +752,42 @@ def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
     parameter outright (`"Invalid array. Input or output parameter must be
     of supported elementary data type with no dimensions."`); raises
     `ValueError` immediately for `dimension` with any other `usage` rather
-    than letting that surface only at import time. An `InOut` parameter is
-    passed by reference, so Rockwell allows it to be an array; `Input`/
-    `Output` are passed by value/copied and may only be a scalar
-    elementary type.
+    than letting that surface only at import time.
+
+    `data_type` for `usage="Input"`/`"Output"` must be one of Rockwell's own
+    "elementary" (atomic) types -- `_AOI_ELEMENTARY_PARAM_TYPES`: `BOOL`,
+    `SINT`/`INT`/`DINT`/`LINT` (+ unsigned `U*` variants), `REAL`/`LREAL`.
+    Confirmed via a real Studio 5000 import rejection of a STRING-typed
+    Input parameter (`"Error creating 'Parameter' (Input or output
+    parameter must be of supported elementary data type.)"`) -- raises
+    `ValueError` immediately for any other type (`STRING`, a UDT, another
+    AOI, `TIMER`/`COUNTER`/...) with `usage` other than `"InOut"`, same
+    reasoning as the array check above: an `InOut` parameter is passed by
+    reference, so Rockwell allows it to be a structured type OR an array;
+    `Input`/`Output` are passed by value/copied and may only be a single
+    scalar elementary value -- never both restrictions apply to `InOut`.
     """
     if usage not in ("Input", "Output", "InOut"):
         raise ValueError(
             f"new_aoi_parameter(): usage must be 'Input', 'Output', or 'InOut', not {usage!r}"
         )
-    if dimension and usage != "InOut":
-        raise ValueError(
-            f"new_aoi_parameter(): dimension is only valid for usage='InOut' -- Studio 5000 "
-            f"rejects an array {usage} parameter (\"Invalid array. Input or output parameter "
-            f"must be of supported elementary data type with no dimensions.\"). Use "
-            f"usage='InOut' if {name!r} genuinely needs to be an array, or drop dimension "
-            f"for a scalar {usage} parameter."
-        )
+    if usage != "InOut":
+        if dimension:
+            raise ValueError(
+                f"new_aoi_parameter(): dimension is only valid for usage='InOut' -- Studio 5000 "
+                f"rejects an array {usage} parameter (\"Invalid array. Input or output parameter "
+                f"must be of supported elementary data type with no dimensions.\"). Use "
+                f"usage='InOut' if {name!r} genuinely needs to be an array, or drop dimension "
+                f"for a scalar {usage} parameter."
+            )
+        if data_type.upper() not in _AOI_ELEMENTARY_PARAM_TYPES:
+            raise ValueError(
+                f"new_aoi_parameter(): {usage} parameter {name!r} must be an elementary data "
+                f"type ({sorted(_AOI_ELEMENTARY_PARAM_TYPES)}), not {data_type!r} -- Studio 5000 "
+                f"rejects this (\"Error creating 'Parameter' (Input or output parameter must be "
+                f"of supported elementary data type.)\"). Use usage='InOut' if {name!r} "
+                f"genuinely needs to be a STRING/UDT/AOI-typed parameter."
+            )
     radix = _PRIMITIVE_RADIX.get(data_type.upper())
     if usage == "InOut":
         default_external_access = None

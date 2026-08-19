@@ -1086,7 +1086,32 @@ def test_sync_data_types_map_registers_new_aoi_instance_type():
 
     dt = project.controller._data_types_map.get("VALUE_TO_STR")
     assert dt is not None
-    assert {m.name for m in dt.members} == {"Value", "Result", "Scratch1"}
+    # "Result" is InOut -- passed by reference, so Rockwell never allocates
+    # instance storage for it; it must NOT appear as a member (see
+    # _synthetic_aoi_data_type()'s own docstring for the real Studio import
+    # rejection this excludes).
+    assert {m.name for m in dt.members} == {"Value", "Scratch1"}
+
+
+def test_sync_data_types_map_excludes_inout_parameters_from_instance_shape():
+    # Regression test for a real report: after correctly changing an AOI's
+    # STRING parameters to InOut (to fix the elementary-type constraint),
+    # a real Studio 5000 import of an instance tag then failed with
+    # "Failed to set the 'Data' property (Data type mismatch...)" --
+    # _synthetic_aoi_data_type() was still including InOut parameters as
+    # regular members, giving the instance more fields than Rockwell's own
+    # real instance shape has room for (InOut has no backing storage at all).
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MyAOI")
+    aoi.parameters.append(new_aoi_parameter("In1", "DINT", usage="Input"))
+    aoi.parameters.append(new_aoi_parameter("Out1", "DINT", usage="Output"))
+    aoi.parameters.append(new_aoi_parameter("Ref1", "STRING", usage="InOut"))
+    project.controller.aois.append(aoi)
+
+    _sync_data_types_map(project)
+
+    dt = project.controller._data_types_map["MYAOI"]
+    assert {m.name for m in dt.members} == {"In1", "Out1"}
 
 
 def test_sync_data_types_map_does_not_overwrite_real_aoi_synthetic_type():
@@ -1137,6 +1162,14 @@ def test_export_routine_validate_resolves_new_aoi_instance_type(tmp_path):
     # be silently empty (the previous, safe-but-unhelpful fallback).
     assert '<Structure DataType="Value_To_Str">' in content
     assert 'DataValueMember Name="Value"' in content
+    # "Result" is InOut -- it correctly still appears in the AOI's own
+    # <Parameters> definition, but must NOT appear inside the INSTANCE tag's
+    # own Data/Structure block specifically (see
+    # test_sync_data_types_map_excludes_inout_parameters_from_instance_shape
+    # for the real Studio import rejection this prevents).
+    struct_start = content.index('<Structure DataType="Value_To_Str">')
+    struct_end = content.index('</Structure>', struct_start)
+    assert 'Name="Result"' not in content[struct_start:struct_end]
 
 
 def test_export_routine_validate_raises_on_unresolved_type(tmp_path):

@@ -1026,26 +1026,42 @@ def _referenced_called_routines(rung_texts, program) -> list:
 
 def _synthetic_aoi_data_type(aoi: "AOI") -> "DataType":
     """Build a best-effort `DataType`-shaped stand-in for a brand-new AOI's
-    own instance data shape, from its `.parameters` + `.local_tags` (each
-    converted to a plain `Member` via `new_member()`) -- used only so an
-    instance TAG typed as this AOI can resolve/render at all before the AOI
-    is real in Studio 5000 (see `_sync_data_types_map()`).
+    own instance data shape, from its Input/Output `.parameters` (NOT
+    `InOut` -- see below) + `.local_tags` (each converted to a plain
+    `Member` via `new_member()`) -- used only so an instance TAG typed as
+    this AOI can resolve/render at all before the AOI is real in Studio
+    5000 (see `_sync_data_types_map()`).
 
-    Deliberately NOT the same fidelity as a real AOI's own Comps.Dat-derived
-    instance shape (see CLAUDE.md's own documented gaps in AOI
-    instance-value decoding for a REAL AOI -- missing `EnableIn`/
-    `EnableOut`, an L5K value count that doesn't match the named-member
-    count, an unexplained leading value) -- this is a reasonable default
-    (every parameter/local tag zero-filled, in declared order) for the one
-    narrow purpose of not silently producing an EMPTY `<Data>` block (the
-    previous behavior: `_struct_members_xml()` returns `None` for an
-    unresolved type, which is safe -- not wrong-shaped -- but also not
-    useful), not a claim that the rendered value is byte-for-byte what a
-    real Studio-created instance of this same AOI would show.
+    `InOut` parameters are deliberately EXCLUDED, not just skipped for
+    array/type reasons -- an `InOut` parameter is passed by reference (an
+    alias to a tag supplied at the call site), so Rockwell never allocates
+    real storage for it inside the instance tag's own data structure at
+    all, unlike `Input`/`Output` (copied in/out, real backing storage) and
+    `LocalTags` (private internal storage). Found via a real Studio 5000
+    import rejection AFTER `PadChar`/`Result` were correctly changed to
+    `InOut` to fix the earlier elementary-type constraint (see CLAUDE.md):
+    `"Failed to set the 'Data' property (Data type mismatch...)"` on an
+    instance tag, because this function was still including the now-`InOut`
+    parameters as regular members -- a real object with more fields than
+    Rockwell's own real instance shape has room for.
+
+    Still deliberately NOT the same fidelity as a real AOI's own
+    Comps.Dat-derived instance shape even after this fix (see CLAUDE.md's
+    own documented gaps in AOI instance-value decoding for a REAL AOI --
+    missing `EnableIn`/`EnableOut` in one investigation, an L5K value count
+    that didn't match the named-member count, an unexplained leading
+    value) -- this is a reasonable default (every Input/Output parameter
+    and local tag zero-filled, in declared order) for the one narrow
+    purpose of not silently producing an EMPTY `<Data>` block (the
+    original, pre-any-of-this-fallback behavior: `_struct_members_xml()`
+    returns `None` for an unresolved type, which is safe -- not
+    wrong-shaped -- but also not useful), not a claim that the rendered
+    value is byte-for-byte what a real Studio-created instance of this same
+    AOI would show.
     """
     dt = DataType(aoi.name, aoi.name, "NoFamily", "User", [])
     for p in aoi.parameters:
-        if not p.data_type:
+        if not p.data_type or p.usage == "InOut":
             continue
         dim = int(p.dimensions) if p.dimensions else 0
         dt.members.append(new_member(p.name, p.data_type, dimension=dim, radix=p.radix))

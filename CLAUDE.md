@@ -3875,6 +3875,59 @@ Covered by `test_new_aoi_parameter_rejects_string_input`, `test_new_aoi_paramete
 `test_export_aoi_rejects_string_input_output_parameter` (defense-in-depth, via a hand-constructed
 `Parameter`), and `test_export_aoi_accepts_string_inout_parameter` (`test/test_api.py`).
 
+## `_synthetic_aoi_data_type()` must exclude InOut parameters — they have no instance storage at all
+
+A direct, immediate consequence of the elementary-type fix above, found on the very next real Studio
+5000 import attempt (of `R11_Printer.L5X`, after `PadChar`/`Result` were correctly changed to `InOut`
+in the still-not-yet-real `Value_To_Str` AOI to fix that constraint):
+```
+Error: Line 644: Failed to set the 'Data' property (Data type mismatch - the object's value does
+not match its data type.).
+    RSLogix5000Content/Controller/Programs/Program[@Name="VAB_Trim_And_Sort"]/Tags/Tag[@Name="Printer_Thick_V2S"]/Data
+```
+`Printer_Thick_V2S` is one of the routine's own context instance tags of `Value_To_Str` (a
+controller-scope tag typed as the AOI, per the "static config on the instance tag" design described in
+the R11_Printer rewire). Root cause: `_synthetic_aoi_data_type()` (see the AOI-instance-type-resolution
+fix above) built its member list from `aoi.parameters` UNCONDITIONALLY — it never excluded `InOut`
+parameters, so once `Result` (and by the same logic, `PadChar`) became `InOut`, the synthetic instance
+shape still included them as regular members, giving the instance tag's own rendered `<Data>` block
+MORE fields than Rockwell's own real instance data shape has room for.
+
+**The real Rockwell fact this was missing**: an AOI's `InOut` parameter is passed BY REFERENCE (an
+alias to whatever tag is supplied at the call site) — Rockwell never allocates any real storage for it
+inside the instance tag's own data structure at all. Only `Input`/`Output` parameters (copied in/out,
+real backing storage) and `LocalTags` (private internal storage) are actually part of an instance's own
+persistent data shape. This is consistent with — and retroactively explains — a detail from the
+earlier, real `AOI_RPMtoFPM` instance-value investigation elsewhere in this file: the real Decorated
+`<Structure>` there showed exactly `EnableIn`/`EnableOut` + the AOI's own Input/Output parameters, never
+any `InOut` ones, though at the time that was noted only as an observation, not traced to this specific
+mechanism.
+
+**Fixed**: `_synthetic_aoi_data_type()` now filters `p.usage == "InOut"` out when building its member
+list (LocalTags are unaffected -- they never had this problem, since a LocalTag has no `Usage` concept
+at all). Left completely untouched, on purpose: `_resolve_type_closure()`'s own walk of `aoi.parameters`
+(finding UDT/AOI dependency TYPES to include as export context) and `_validate_aoi_parameters_resolve()`
+(checking every parameter's type resolves) — both correctly still need to see EVERY parameter including
+`InOut` ones, since those are about the parameter's own TYPE being available as context/resolvable, a
+completely different question from whether the parameter has instance STORAGE.
+
+**A real, second-order lesson worth restating**: this is the third real Studio import round in a row
+for the very same `Value_To_Str` AOI (reserved routine names → array-only-on-InOut → elementary-type →
+this), each fix landing cleanly but each one only revealed by the NEXT real import attempt after the
+previous fix was already applied. None of these were guessable in advance from documentation alone;
+each came from an actual Studio 5000 rejection on an actual real project. This matches this file's own
+long-standing "verified after N rounds, not fixed in one" pattern for `export_routine()`/
+`export_datatype()`'s own history — `export_aoi()`/AOI-parameter creation is now accumulating the same
+kind of real-import mileage, just later, since it's the newer feature.
+
+Covered by `test_sync_data_types_map_excludes_inout_parameters_from_instance_shape` (direct unit test:
+an `InOut` STRING parameter must not appear in the synthetic type's own members, while `Input`/`Output`
+DINT parameters do) and updated assertions in
+`test_export_routine_validate_resolves_new_aoi_instance_type`/
+`test_db_export_routine_resolves_instance_of_not_yet_real_aoi` (confirming `"Result"` — correctly still
+present in the AOI's own `<Parameters>` definition — is specifically absent from the INSTANCE tag's own
+`<Structure>...</Structure>` block) — `test/test_api.py`/`test/test_project_db.py`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

@@ -959,6 +959,15 @@ def test_db_export_routine_resolves_instance_of_not_yet_real_aoi(acd_copy, tmp_p
     assert '<AddOnInstructionDefinition Name="Value_To_Str"' in content
     assert 'Tag Name="MyInstance"' in content
     assert '<Structure DataType="Value_To_Str">' in content
+    # "Result" is InOut -- it correctly still appears in the AOI's own
+    # <Parameters> definition, but must not appear inside MyInstance's own
+    # Data/Structure block specifically (a real Studio import rejected
+    # exactly this: "Data type mismatch" from an instance tag whose Data
+    # block had more fields than the AOI's real InOut-excluded instance
+    # shape has room for).
+    struct_start = content.index('<Structure DataType="Value_To_Str">')
+    struct_end = content.index('</Structure>', struct_start)
+    assert 'Name="Result"' not in content[struct_start:struct_end]
 
 
 def test_new_aoi_parameter_required_visible_external_access_overrides(acd_copy):

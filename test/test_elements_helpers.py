@@ -7,6 +7,7 @@ from xml.dom import minidom
 import pytest
 
 from acd.l5x.elements import (
+    AoiBuilder,
     DataType,
     DataTypeBuilder,
     Member,
@@ -721,3 +722,136 @@ def test_datatype_builder_excludes_deleted_member_with_stale_extended_record():
         "just because a stale extended record still names it"
     )
     assert dt._dead_member_bytes == 2
+
+
+def _aoi_tag_record(member_ref: int, is_param: bool) -> bytes:
+    """Build a synthetic AOI RxTagCollection child (Parameter or LocalTag)
+    comps record. `member_ref` (raw offset [14:18]) is the real Rockwell
+    order key AoiBuilder now sorts by -- see its own docstring for how this
+    was found: `seq_number` (a separate comps COLUMN, not part of this raw
+    record) was found to be an unreliable/constant tie for most children of
+    a real AOI, making `ORDER BY seq_number` alone produce an essentially
+    arbitrary order. `is_param` sets ext01[0x20E] bit 0x04 (Input) so
+    AoiBuilder classifies this child as a Parameter, or leaves it 0 so it's
+    classified as a LocalTag (see `_aoi_tag_usage_flags`).
+    """
+    header = struct.pack("<IIHHH", 0, 0, 40, 999, 0)  # 14 bytes
+    main_record = bytearray(60)
+    struct.pack_into("<I", main_record, 0, member_ref)  # this record's bytes [14:18]
+    ext01 = bytearray(0x210)
+    if is_param:
+        ext01[0x20E] = 0x04  # Input usage bit
+    ext01_attr = struct.pack("<II", 0x01, len(ext01)) + bytes(ext01)
+    dummy_last_attr = struct.pack("<II", 0x02, 4) + b"\x00" * 4  # left unparsed by RxGeneric
+    count_record = 2  # 1 parsed (0x01) + 1 left unparsed
+    return header + bytes(main_record) + struct.pack("<II", 0, count_record) + ext01_attr + dummy_last_attr
+
+
+def test_aoi_builder_orders_parameters_by_member_ref_not_seq_number():
+    # Regression test for a real, critical bug: a real project's AOI
+    # (VAB_PowerFlex_753, 17 real parameters) had `seq_number` IDENTICAL
+    # (a constant value) for 16 of its 19 RxTagCollection children --
+    # AoiBuilder's old `ORDER BY seq_number` alone left SQLite's tie-break
+    # order effectively arbitrary, silently scrambling the exported
+    # <Parameters> order. Since AOI instructions are called POSITIONALLY in
+    # RLL, a scrambled redefinition silently rebinds every existing call
+    # site's arguments to the wrong parameter -- confirmed via a real Studio
+    # 5000 import ("Differences exist between the instruction definitions",
+    # no indication the difference is a reordering) followed by the user
+    # directly comparing the AOI's own Parameters tab before/after. Root
+    # cause: `member_ref` (already decoded by ParameterBuilder for comment
+    # lookup, raw bytes [14:18]) turned out to already fully and correctly
+    # encode the real order -- found by brute-force scanning every raw
+    # record byte offset against the real AOI's own confirmed correct order.
+    #
+    # Three parameters inserted in an order that is the REVERSE of their
+    # real (member_ref-sorted) order, all sharing the same seq_number --
+    # exactly the real, observed tie-break scenario.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE nameless(parent_id int, record BLOB)")
+    db.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    cur = db.cursor()
+
+    AOI_ID = 500
+    TAG_COLL_ID = 501
+    THIRD_ID, FIRST_ID, SECOND_ID = 600, 601, 602  # deliberately reversed insertion order
+
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (AOI_ID, 0, "TestAOI", 0, 256, b"\x00" * 20),  # too short to parse -- safe fallback path
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""),
+    )
+    # Real intended order (by member_ref): First(10) < Second(20) < Third(30),
+    # inserted here in the OPPOSITE order with an identical seq_number=0 for
+    # every one, so a naive ORDER BY seq_number has nothing to discriminate on.
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (THIRD_ID, TAG_COLL_ID, "Third", 0, 256, _aoi_tag_record(30, is_param=True)),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (FIRST_ID, TAG_COLL_ID, "First", 0, 256, _aoi_tag_record(10, is_param=True)),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (SECOND_ID, TAG_COLL_ID, "Second", 0, 256, _aoi_tag_record(20, is_param=True)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+
+    assert [p.name for p in aoi.parameters] == ["First", "Second", "Third"], (
+        "Parameters must be ordered by member_ref (the real Rockwell order key), "
+        "not by seq_number/insertion order"
+    )
+
+
+def test_aoi_builder_orders_local_tags_by_member_ref_too():
+    # Same mechanism as the parameter-ordering test above, for LocalTags --
+    # AoiBuilder applies the same sort to both lists from the same
+    # RxTagCollection walk.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE nameless(parent_id int, record BLOB)")
+    db.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    cur = db.cursor()
+
+    AOI_ID = 700
+    TAG_COLL_ID = 701
+    THIRD_ID, FIRST_ID, SECOND_ID = 800, 801, 802
+
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (AOI_ID, 0, "TestAOI2", 0, 256, b"\x00" * 20),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (THIRD_ID, TAG_COLL_ID, "LT_Third", 0, 256, _aoi_tag_record(30, is_param=False)),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (FIRST_ID, TAG_COLL_ID, "LT_First", 0, 256, _aoi_tag_record(10, is_param=False)),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (SECOND_ID, TAG_COLL_ID, "LT_Second", 0, 256, _aoi_tag_record(20, is_param=False)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+
+    assert [lt.name for lt in aoi.local_tags] == ["LT_First", "LT_Second", "LT_Third"]

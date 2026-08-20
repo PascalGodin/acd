@@ -4103,6 +4103,82 @@ Covered by `test_export_program_produces_well_formed_target_xml`,
 `test_export_program_raises_on_missing_program`, `test_export_program_instance_method`
 (`test/test_project_db.py`).
 
+## CRITICAL: AOI parameter order was scrambled on export -- `seq_number` is not a reliable order key
+
+Found via a real, severe downstream bug report on `db_export_program()`'s very first real use, but the
+root cause turned out to live in `AoiBuilder.build()` (decode-time, not `db_export_program()`-specific)
+-- affecting `export_routine()`/`export_aoi()`/`export_program()` identically, any time any of them pulls
+in a pre-existing project AOI as a referenced Context dependency.
+
+**Why this is critical, not cosmetic**: Studio 5000 calls an AOI instruction POSITIONALLY in RLL, not by
+parameter name. A reordered `<Parameters>` redefinition silently rebinds every existing call site's
+arguments to the wrong pins the moment it's accepted -- e.g. a value meant for `RunFwd` landing on
+`Alarm`'s pin instead. Studio's own import warning for this case (`"Add-on instruction '...' already
+exists ... Differences exist between the instruction definitions"`) does not call out that the
+difference is a reordering, and the ladder logic itself displays completely normally after import --
+this would not be caught by a visual review of the rungs, only by directly comparing the AOI's own
+Parameters tab order before/after, which is exactly how the downstream user caught it (side-by-side
+against the real, un-imported definition, on a copy project -- never risked against production).
+
+**Root cause, confirmed directly against the real project**: `AoiBuilder.build()`'s query for an AOI's
+own Parameters/LocalTags (`RxTagCollection` children) used `ORDER BY seq_number` as its only ordering.
+Decoding the real, reported AOI (`VAB_PowerFlex_753`, 17 parameters) directly -- via a plain, read-only
+`ExportL5x()` call against a throwaway scratch `_temp_dir` (never touching the project's own persistent
+`acd.db`, learned the hard way earlier this same session, see "A real, avoidable mistake" under
+`export_program()` above) -- found `seq_number` was IDENTICAL (a constant value) for 16 of its 19
+`RxTagCollection` children. SQLite's tie-break order for `ORDER BY` on a column with no discriminating
+value is implementation-defined (effectively arbitrary/insertion-order-ish here), which is exactly why
+the resulting `.parameters` list came out scrambled -- confirmed by reproducing the EXACT same wrong
+order the user reported, byte-for-byte, via this same decode path (independent of `db_export_program()`
+or the persistent-DB layer entirely).
+
+**Finding the real order key**: with the real AOI's own confirmed-correct Parameters-tab order in hand
+(the user compared it directly in Studio 5000), every raw byte offset of each Parameter's own comps
+record was brute-force scanned for one whose sort order reproduces that real order exactly. Multiple
+offsets matched (all monotonic re-encodings of the same underlying bytes), but the cleanest and most
+defensible: `member_ref` -- the SAME 4-byte field at raw record offset 14 that `ParameterBuilder`/
+`LocalTagBuilder` ALREADY decode (for comment/description lookup, a completely different, already-
+verified purpose) -- turned out to ALSO already fully and correctly encode the real order, monotonically,
+with zero gaps. No new byte offset or new decode logic was needed -- reusing this already-established
+field was chosen over a newly-discovered single-byte offset (which also happened to match) specifically
+because `member_ref` already has independently-verified real semantic meaning in this codebase, rather
+than trusting an unexplained byte position that "just happens" to match on one example.
+
+**Fix**: `AoiBuilder.build()` now collects `(member_ref, object_id, is_param, original_position)` for
+every `RxTagCollection` child, then does a single stable sort by `(member_ref, original_position)` --
+the second tuple element only ever matters as a deterministic tiebreaker for the case two children
+somehow share the same `member_ref` (never observed, but safer than leaving that case to chance) -- and
+walks the SORTED list to build `parameters`/`local_tags`, instead of trusting the SQL `ORDER BY
+seq_number` result order directly. `seq_number` is still used in the SQL query as that same deterministic
+tiebreaker input's own initial ordering, not removed outright.
+
+**Verified**: re-decoding the real `VAB_PowerFlex_753` AOI (same read-only, scratch-`_temp_dir` method)
+after the fix reproduces the user's own reported CORRECT order exactly, all 17 parameters, zero
+differences. Also confirmed via `export_routine()`/`export_aoi()`'s underlying mechanism: since all three
+(`export_routine()`, `export_aoi()`, `export_program()`) render an AOI's `<Parameters>` via the same
+`AOI.to_xml()` off the same decoded `.parameters` list, and none of them do any reordering of their own
+(`_resolve_type_closure()` -- shared by all three -- only ever READS `.parameters` to find dependency
+names, never mutates or reorders the list, confirmed by inspection), this one fix in the shared decode
+layer covers all three export paths identically. The user's own request to "double check
+`db_export_aoi()`/`db_export_routine()` for the same bug" is answered by this: yes, they had it too,
+same root cause, same fix.
+
+**Caveat, stated plainly since only one real AOI has been checked**: `member_ref` is presumed to be a
+per-child, Rockwell-assigned identifier that happens to track intended Parameter/LocalTag order. It has
+NOT been independently confirmed whether Rockwell reassigns it if a user later manually drag-and-drop
+reorders parameters in Studio's own AOI Definition Editor (as opposed to just tracking original creation
+order) -- if it does, this fix is fully correct; if it doesn't, a real AOI that was manually reordered
+AFTER initial authoring could theoretically still export in its original creation order rather than its
+current display order. No evidence either way has been found yet; revisit if a future real AOI with a
+KNOWN, confirmed manual reorder disagrees with this fix's output.
+
+Covered by `test_aoi_builder_orders_parameters_by_member_ref_not_seq_number` and
+`test_aoi_builder_orders_local_tags_by_member_ref_too` (`test/test_elements_helpers.py`) -- a synthetic
+comps DB reproducing the exact real shape (three RxTagCollection children, all sharing one `seq_number`,
+inserted in the REVERSE of their intended `member_ref`-sorted order) -- confirmed both tests FAIL without
+the fix (reproducing the same raw-insertion-order scramble) before confirming they pass with it, not just
+added as passing tests after the fact.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

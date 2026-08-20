@@ -700,6 +700,38 @@ class AoiBuilder(L5xElementBuilder):
                 + " AND record_type != 512"
                 + " ORDER BY seq_number"
             )
+            # NOTE: `seq_number` (used above only as a stable tiebreaker for the
+            # rare case two children share the same real order key below) is NOT
+            # a reliable Parameter/LocalTag declaration order on its own -- a
+            # real project's AOI (VAB_PowerFlex_753, 17 real parameters) was
+            # found to have `seq_number` IDENTICAL (a constant value) for 16 of
+            # its 19 RxTagCollection children, making SQLite's tie-break order
+            # for those rows effectively arbitrary. This produced a genuinely
+            # scrambled <Parameters> order on export -- confirmed a real, severe
+            # bug: Studio 5000 calls an AOI instruction POSITIONALLY, so a
+            # reordered redefinition silently rebinds every existing call site's
+            # arguments to the wrong parameter, with no visible symptom in the
+            # ladder logic itself (only a generic "Differences exist between the
+            # instruction definitions" import warning, not called out as a
+            # reordering). Root-caused by decoding this real AOI directly
+            # (bypassing the project's own persistent DB, via plain read-only
+            # ExportL5x() against a scratch temp_dir) and brute-force scanning
+            # every raw-record byte offset for one whose sort order reproduces
+            # the AOI's own real Parameters-tab order (independently confirmed
+            # by the user directly in Studio 5000) -- `member_ref` (the same
+            # 4-byte field at raw offset 14 already decoded by
+            # ParameterBuilder/LocalTagBuilder for comment/description lookup,
+            # see below) turned out to ALSO already fully and correctly encode
+            # this order, monotonically, with no new byte offset needed.
+            # CAVEAT, stated plainly since only one real AOI has been checked:
+            # `member_ref` is presumed a per-child creation-time identifier, not
+            # explicitly verified to track a LATER manual drag-and-drop
+            # reordering in Studio's own AOI editor (if Rockwell ever reassigns
+            # it on reorder, this still holds; if not, a manually-reordered real
+            # AOI could theoretically still export in creation order instead of
+            # display order) -- revisit if a future real AOI with a known,
+            # confirmed manual reorder disagrees with this.
+            children_with_order: List[Tuple[int, int, bool, int]] = []
             for child_oid, child_rec in self._cur.fetchall():
                 child_rec = bytes(child_rec)
                 # Determine whether this is a parameter or a local tag by inspecting
@@ -717,6 +749,19 @@ class AoiBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
+                member_ref = (
+                    struct.unpack_from("<I", child_rec, 14)[0] if len(child_rec) >= 18 else 0
+                )
+                children_with_order.append((member_ref, child_oid, is_param, len(children_with_order)))
+
+            # Stable sort by the real order key (member_ref), falling back to
+            # the original seq_number-ordered position (the 4th tuple element)
+            # for the rare tie -- never observed in the one real AOI checked,
+            # but a safe, deterministic fallback rather than relying on
+            # whatever arbitrary order a tie happens to come back in.
+            children_with_order.sort(key=lambda t: (t[0], t[3]))
+
+            for _, child_oid, is_param, _ in children_with_order:
                 if is_param:
                     try:
                         parameters.append(ParameterBuilder(self._cur, child_oid).build())

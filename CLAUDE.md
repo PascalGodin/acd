@@ -4179,6 +4179,57 @@ inserted in the REVERSE of their intended `member_ref`-sorted order) -- confirme
 the fix (reproducing the same raw-insertion-order scramble) before confirming they pass with it, not just
 added as passing tests after the fact.
 
+## `Program.main_routine_name` was always `None` -- `ext[0x12D]` never actually fires; the real field is a footer-based local reference
+
+Found via a real, high-severity downstream report: `MainRoutineName` was completely missing from `db_export_program()`'s output for a real program, and a copy-project Studio 5000 import confirmed the Main Routine designation genuinely got dropped on import. Checked directly (`db_to_controller(acd_path).controller.programs`): every one of 13 real programs in the project returned `main_routine_name = None`.
+
+**The pre-existing code was never actually correct**: `ProgramBuilder.build()` read a raw routine `object_id` from `ext[0x12D]` on the Program's own comps record. Checked directly against a real project: `0x12D` was NEVER present in any Program's parsed extended records at all (only `0x1` ever parses; `RxGeneric`'s own "always leaves the last declared attribute unparsed" quirk, documented elsewhere in this file, meant a second attribute existed but decoded to `0x67` with a value pointing at an unrelated `$hex$`-placeholder object, not `0x12D` and not the main routine). This code had apparently never been verified against real ground truth.
+
+**Investigation dead ends, ruled out with real evidence before finding the real mechanism** (each one exhaustively checked, not just assumed): no raw 4-byte object_id pointer to ANY child routine anywhere in the Program's own 4304-byte comps record (brute-force scanned every offset); nothing in the `RxRoutineCollection` child object's own record (a minimal 78-byte stub, too short to carry anything); no `nameless`-table entry for the Program object; no discriminating byte anywhere in a routine's own extended-record data when diffing the real `Main` routine against 3 confirmed non-main routines in the same program; and a "just guess the routine literally named `Main`" fallback was separately disproven outright -- 6 of the project's 13 real programs have no routine named `Main` at all (their real main routines are named things like `PowerUp`, `Trimmer_LS`, `Main_Motors`).
+
+**The real mechanism, found via a live before/after diff**: the user reassigned one program's (`VAB_Motors`) Main Routine designation in Studio 5000 itself, from `Main` to a different, non-`Main`-named routine (`Mxxx_MCC_Routine`), saved, and supplied both the before and after `.ACD` plus a fresh native "Export Program" of each. Diffing the Program's own raw comps record between the two saves -- an isolated, single-change edit, the same "noop vs. edit" technique already used successfully elsewhere in this file -- found **exactly 2 bytes differed**. Those 2 bytes sit inside `ext[0x01]` (the same blob already used for the `Disabled` flag) at a fixed position relative to the END of the blob: `len(ext01) - 8`, a u16 value. This value is **not the routine's own `object_id`** -- it's a small "local reference number" that separately, ALSO appears at raw offset 16 of the designated routine's own comps record. Resolving `MainRoutineName` means reading this u16 from the Program's footer, then scanning the Program's own `RxRoutineCollection` children for the one whose own record has this same u16 at offset 16.
+
+**Verified, not just theorized**:
+- The isolated 2-byte diff decoded to `47563` (old, `Main`) → `7800` (new, `Mxxx_MCC_Routine`) -- and both values were independently found at raw offset 16 of `Main`'s and `Mxxx_MCC_Routine`'s own comps records respectively, in the SAME (unchanged) original project.
+- A **second, unrelated real program** (`VAB_MainProgram`, completely different tag/routine content) has its own `Main` routine's local-ref value at the exact same footer position (`len(ext01) - 8`), confirming this isn't a `VAB_Motors`-specific coincidence.
+- The offset-16 local-ref field was checked for uniqueness across all 37 routines of the real project's largest program (`VAB_Motors`) -- zero collisions, including the one routine (`M100_Landing_Table`) whose own record otherwise fails to fully parse (see the next section).
+- After the fix, **all 13 real programs** resolve to a real, correct routine name -- including all 6 that have no routine literally named `Main` (`StartUp`→`PowerUp`, `LS_Histogram`→`Trimmer_LS`, `Sort_LS_Histogram`→`Sorter_LS`, `Paddle_Fence_Control`→`Paddle_Fence`, `_2_TONGLOADER`→`_00_MAIN`, `Motors`→`Main_Motors`) -- decisive confirmation this is a real, general mechanism, not a name-matching coincidence.
+
+**`FaultRoutineName` was NOT fixed** -- left as the old, likely-equally-broken `ext[0x066]`-as-object_id code, since every real program checked this session had it unset (all zeros), giving no positive before/after example to diff against the way `MainRoutineName` was solved. Documented in the code as an open, unverified gap rather than guessed at by analogy.
+
+Covered by `test_program_builder_resolves_main_routine_name_via_local_ref` (`test/test_database.py`) -- a synthetic comps DB with a Program record (footer-encoded local ref) and two routine children, one matching and one not -- confirmed to fail (`main_routine_name` comes back `None`) without the fix before confirming it passes with it.
+
+## `M100_Landing_Table` under `VAB_Motors` — investigated as a possible dropped-routine bug, RETRACTED
+
+Found as a side effect of the `MainRoutineName` investigation above: a comps row named `M100_Landing_Table`
+under `VAB_Motors`' `RxRoutineCollection` has `record_type=0` (its 36 live siblings are `256`/`259`) and is
+notably shorter (334 bytes vs. 379 for every sibling); `RxGeneric.from_bytes()` raises on it entirely, and
+`RoutineBuilder.build()`'s existing `except Exception: return None` drops it from `program.routines`.
+
+**Initially misdiagnosed as silent data loss of a live routine** — reasoning: a routine with this same name
+and real rung content appears in the project's own native Studio 5000 "Export Program" output
+(`Motors_Program.L5X`). That reasoning was wrong, corrected directly by the user: `M100_Landing_Table` is
+NOT actually in the project (confirmed checking Studio's own Controller Organizer for `VAB_Motors`) — the
+real, live routine seen in `Motors_Program.L5X` belongs to the *different*, unrelated `Motors` program (part
+of the same `Motors` → `VAB_Motors` reorganization already documented elsewhere in this session), not to
+`VAB_Motors`. The `record_type=0` comps row under `VAB_Motors` is stale debris left over from that
+migration — a genuinely deleted/orphaned object, not a routine anyone is missing.
+
+**So the exclusion is currently CORRECT, but by accident, not by a deliberate, understood rule** — a parse
+exception happens to get caught by the same generic `except Exception: return None` that also (correctly,
+deliberately) handles genuinely deleted routines elsewhere, per that function's own docstring. This is worth
+remembering as a real, if currently harmless, fragility: nothing today actually confirms `record_type=0` +
+unparseable *always* means deleted, only that it did in this one case. Revisit if a future report finds a
+genuinely live routine silently missing with this same signature — don't assume this write-up already ruled
+that out in general, only this specific instance.
+
+**Methodological note**: this was reasoned from circumstantial evidence (same name, real content, in a
+*different* program's export) rather than confirmed directly against the actual program in question — the
+same class of mistake this file has warned against repeatedly elsewhere (don't trust an inference over
+direct confirmation). Caught quickly here because the user could check Studio directly; flagged in this
+file's own history as a reminder rather than quietly deleted, per this project's existing convention of
+retracting wrong conclusions in place rather than erasing them.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

@@ -1,3 +1,4 @@
+import sqlite3
 import struct
 import sys
 
@@ -5,7 +6,7 @@ import pytest
 from loguru import logger as loguru_logger
 
 from acd.database.dbextract import DbExtract
-from acd.l5x.elements import ControllerBuilder, ModuleBuilder, RoutineBuilder
+from acd.l5x.elements import ControllerBuilder, ModuleBuilder, ProgramBuilder, RoutineBuilder
 from acd.l5x.export_l5x import (
     ExportL5x,
     _dedupe_comps_records,
@@ -278,6 +279,91 @@ def test_module_builder_skips_hex_named_connection():
     module = ModuleBuilder(cur, local_object_id).build()
 
     assert module._connections == [("Standard", "20000", "Input")]
+
+
+def _rx_generic_header(cip_type=999):
+    # 14-byte fixed header + 60-byte opaque main_record, enough for
+    # RxGeneric.from_bytes() to parse.
+    header = struct.pack("<IIHHH", 0, 0, 40, cip_type, 0)
+    main_record = b"\x00" * 60
+    return header + main_record
+
+
+def test_program_builder_resolves_main_routine_name_via_local_ref():
+    # Regression test for a real, severe downstream-reported bug:
+    # Program.main_routine_name was ALWAYS None, for every program in a real
+    # project (13 of 13) -- Studio 5000 import of a db_export_program()
+    # output for the first time then genuinely dropped the Main Routine
+    # designation (confirmed by the user in a copy project first).
+    #
+    # The old code read a raw routine object_id from ext[0x12D] -- an
+    # attribute that, checked directly against a real project, was NEVER
+    # actually present in any Program's parsed extended records at all.
+    #
+    # The real mechanism, found by diffing a real Program's raw comps bytes
+    # between two saves of the same project differing by exactly ONE change
+    # (reassigning the Program's own Main Routine designation to a
+    # different, non-"Main"-named routine in Studio 5000 itself): exactly 2
+    # bytes changed. ext[0x01] (the same blob already used for the Disabled
+    # flag) has a small, fixed-size trailing footer whose u16 at byte offset
+    # `len(ext01) - 8` is a "local reference number" -- NOT the routine's own
+    # object_id -- that matches a u16 field at raw offset 16 of the
+    # designated routine's OWN comps record. Independently confirmed against
+    # a SECOND, unrelated real program (same footer position despite
+    # completely different content), and against all 13 real programs in the
+    # project -- including 6 whose real main routine is NOT literally named
+    # "Main" at all (e.g. "PowerUp", "Trimmer_LS", "Main_Motors"), ruling out
+    # a "just guess the routine named Main" heuristic as a coincidence.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE comments(parent int, tag_reference text, record_string text)")
+    cur = db.cursor()
+
+    PROG_ID = 900
+    COLL_ID = 901
+    MAIN_LOCAL_REF = 4242
+
+    # ext01: 40 bytes: the local-ref u16 lives at len(ext01) - 8 = offset 32.
+    ext01 = bytearray(40)
+    struct.pack_into("<H", ext01, 32, MAIN_LOCAL_REF)
+    ext01_attr = struct.pack("<II", 0x01, len(ext01)) + bytes(ext01)
+    dummy_last_attr = struct.pack("<II", 0x02, 4) + b"\x00" * 4  # left unparsed by RxGeneric
+    count_record = 2  # 1 parsed (0x01) + 1 left unparsed
+    prog_record = (
+        _rx_generic_header() + struct.pack("<II", 0, count_record) + ext01_attr + dummy_last_attr
+    )
+
+    def _routine_record(local_ref: int) -> bytes:
+        rec = bytearray(20)
+        struct.pack_into("<H", rec, 16, local_ref)
+        return bytes(rec)
+
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (PROG_ID, 0, "TestProgram", 0, 256, prog_record),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (COLL_ID, PROG_ID, "RxRoutineCollection", 0, 256, b""),
+    )
+    # NOT the main routine -- its own local ref doesn't match.
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (902, COLL_ID, "RoutineA", 0, 256, _routine_record(9999)),
+    )
+    # The real main routine -- its own local ref matches the Program's footer.
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (903, COLL_ID, "RoutineB", 0, 256, _routine_record(MAIN_LOCAL_REF)),
+    )
+    db.commit()
+
+    program = ProgramBuilder(cur, PROG_ID).build()
+
+    assert program.main_routine_name == "RoutineB"
 
 
 def test_routine_builder_disambiguates_colliding_object_id_by_parent():

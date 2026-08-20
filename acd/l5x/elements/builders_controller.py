@@ -53,17 +53,74 @@ class ProgramBuilder(L5xElementBuilder):
 
         name = results[0][0]
 
-        # --- MainRoutineName and FaultRoutineName from extended records ---
-        # ext[0x12D] = MainRoutine object_id, ext[0x066] = FaultRoutine object_id
         exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
+
+        # --- RxRoutineCollection children: needed both for MainRoutineName
+        # resolution just below and for building the actual Routine objects
+        # further down -- fetched once here and reused for both. ---
+        self._cur.execute(
+            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
+            + str(self._object_id)
+            + " AND comp_name='RxRoutineCollection'"
+        )
+        collection_results = self._cur.fetchall()
+
+        collection_id: Union[int, None] = None
+        routine_child_rows: list = []
+        if collection_results:
+            collection_id = collection_results[0][1]
+            self._cur.execute(
+                "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
+                + str(collection_id)
+            )
+            routine_child_rows = self._cur.fetchall()
+
+        # --- MainRoutineName from ext[0x01]'s own trailing footer ---
+        # NOT an object_id pointer -- the previous approach (ext[0x12D] read
+        # as a raw routine object_id) never actually fired for any real
+        # project checked: 0x12D was never present in any parsed extended
+        # record. The real mechanism, found by diffing a real Program's raw
+        # comps bytes between two saves of the same project differing by
+        # exactly one change (reassigning the Program's own Main Routine
+        # designation in Studio 5000 -- exactly 2 bytes changed, isolating
+        # this field precisely): ext[0x01] (the same blob already used below
+        # for the Disabled flag) has a small, fixed-size trailing footer
+        # whose u16 at byte offset `len(ext01) - 8` is a "local reference
+        # number" -- NOT the routine's own object_id -- that matches a u16
+        # field at raw offset 16 of the designated main routine's OWN comps
+        # record. Independently confirmed against a SECOND, unrelated real
+        # program (same absolute footer position despite completely
+        # different tag/routine content), and confirmed this per-routine
+        # "local reference number" is unique across all 37 routines of the
+        # real project's largest program (including one, `M100_Landing_Table`,
+        # whose own record otherwise fails to fully parse -- see CLAUDE.md's
+        # separate, still-open "routine silently dropped" investigation).
+        ext01 = exts.get(0x01, b"")
         main_routine_name: Union[str, None] = None
+        if len(ext01) >= 8:
+            main_local_ref = struct.unpack_from("<H", ext01, len(ext01) - 8)[0]
+            if main_local_ref:
+                for child in routine_child_rows:
+                    child_rec = bytes(child[3])
+                    if (
+                        len(child_rec) >= 18
+                        and struct.unpack_from("<H", child_rec, 16)[0] == main_local_ref
+                    ):
+                        main_routine_name = child[0]
+                        break
+
+        # --- FaultRoutineName ---
+        # NOT independently re-verified this session -- this still uses the
+        # same kind of "ext[0x066] as a raw object_id pointer" approach that
+        # turned out to never fire for MainRoutineName above, so it's likely
+        # wrong too, just not yet confirmed either way (every real program
+        # checked this session had FaultRoutineName unset, so there was no
+        # positive example to diff against). Left as the old, unverified
+        # code rather than guessing a fix with no real evidence -- revisit
+        # with a real before/after pair (a Program's FaultRoutineName
+        # explicitly set, then changed) the same way MainRoutineName was
+        # solved above.
         fault_routine_name: Union[str, None] = None
-        if 0x12D in exts and len(exts[0x12D]) >= 4:
-            main_oid = struct.unpack_from("<I", exts[0x12D], 0)[0]
-            if main_oid:
-                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(main_oid))
-                row = self._cur.fetchone()
-                main_routine_name = row[0] if row else None
         if 0x066 in exts and len(exts[0x066]) >= 4:
             fault_oid = struct.unpack_from("<I", exts[0x066], 0)[0]
             if fault_oid:
@@ -73,7 +130,6 @@ class ProgramBuilder(L5xElementBuilder):
 
         # --- Disabled flag from ext[0x01] at offset 0x24 ---
         # A u32 of 0xFFFFFFFF means the program is disabled; 0x00000000 means enabled.
-        ext01 = exts.get(0x01, b"")
         disabled_flag = (
             struct.unpack_from("<I", ext01, 0x24)[0] != 0
             if len(ext01) >= 0x28
@@ -81,22 +137,9 @@ class ProgramBuilder(L5xElementBuilder):
         )
         disabled = "true" if disabled_flag else "false"
 
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
-            + str(self._object_id)
-            + " AND comp_name='RxRoutineCollection'"
-        )
-        collection_results = self._cur.fetchall()
-
         routines = []
-        if collection_results:
-            collection_id = collection_results[0][1]
-            self._cur.execute(
-                "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
-                + str(collection_id)
-            )
-            routine_results = self._cur.fetchall()
-            for child in routine_results:
+        if collection_id is not None:
+            for child in routine_child_rows:
                 routine = RoutineBuilder(self._cur, child[1], collection_id).build()
                 if routine is not None:
                     routines.append(routine)

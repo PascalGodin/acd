@@ -72,6 +72,7 @@ from acd.api import (
     diff_routine as _diff_routine,
     export_aoi as _export_aoi,
     export_datatype as _export_datatype,
+    export_program as _export_program,
     export_routine as _export_routine,
     find_tag_references as _find_tag_references,
     get_project_summary as _get_project_summary,
@@ -1950,6 +1951,29 @@ class ProjectDB:
             raise KeyError(f"No AOI named {aoi_name!r}")
         _export_aoi(project, aoi, output_path, owner=owner, validate=validate)
 
+    def export_program(self, program_name: str, output_path,
+                        owner: Union[str, None] = None, validate: bool = True) -> None:
+        """`to_controller()` + Program lookup + the existing, unmodified
+        `acd.api.export_program()` in one call. `validate` defaults to
+        `True` here for the same reason as `export_routine()`/
+        `export_datatype()`/`export_aoi()` above.
+
+        See `acd.api.export_program()`'s own docstring for the wrapper
+        shape (calibrated against a real Studio 5000 "Export Program"
+        output) and its one known, deliberate gap (`<ChildPrograms>` /
+        Program-folder nesting is not detected or emitted -- a real
+        mechanism disproven by real data when first hypothesized, not
+        guessed at further).
+        """
+        project = self.to_controller()
+        program = next(
+            (p for p in project.controller.programs if p.name.upper() == program_name.upper()),
+            None,
+        )
+        if program is None:
+            raise KeyError(f"No program named {program_name!r}")
+        _export_program(project, program, output_path, owner=owner, validate=validate)
+
     # ---- read-only convenience (thin wrappers over acd.api, against a fresh rehydration) ----
 
     def list_tags(self, program_name: Union[str, None] = None) -> List[dict]:
@@ -2351,6 +2375,18 @@ def db_export_aoi(acd_path, aoi_name: str, output_path,
     real Studio 5000 import)."""
     _run(acd_path, project_dir, verbose, lambda db: db.export_aoi(
         aoi_name, output_path, owner=owner, validate=validate,
+    ))
+
+
+def db_export_program(acd_path, program_name: str, output_path,
+                       owner: Union[str, None] = None, validate: bool = True,
+                       project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.export_program()` -- see its
+    docstring (including the known `<ChildPrograms>` gap and the NOT YET
+    VERIFIED AGAINST A REAL STUDIO 5000 IMPORT caveat in
+    `acd.api.export_program()`)."""
+    _run(acd_path, project_dir, verbose, lambda db: db.export_program(
+        program_name, output_path, owner=owner, validate=validate,
     ))
 
 

@@ -29,6 +29,7 @@ from acd.l5x.elements import (
     DataType,
     DumpCompsRecords,
     Member,
+    Program,
     RSLogix5000Content,
     Routine,
     _AOI_ELEMENTARY_PARAM_TYPES,
@@ -1513,6 +1514,228 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
                     _validate_rll_rung_syntax(rung_text)
                 except ValueError as e:
                     raise ValueError(f"Rung {i} of routine {routine.name!r}: {e}") from e
+
+    Path(output_path).write_text(xml, encoding="utf-8")
+
+
+def export_program(project: RSLogix5000Content, program: Program, output_path,
+                    owner: str = None, validate: bool = False) -> None:
+    """Export a whole Program (every one of its own routines, in full) as a
+    standalone, partial L5X file, for Studio 5000's native "Import
+    Program..." command (a distinct native feature from "Import Routine" --
+    confirmed via the Studio 5000 help docs, see
+    `import-program-and-equipment-phase-considerations.html`) -- the same
+    "native-import escape hatch" strategy as `export_routine()`, just scoped
+    to an entire Program instead of one Routine within it.
+
+    Unlike `export_routine()`, the Program itself is the Target -- ALL of
+    its own routines and ALL of its own program-scope tags are rendered in
+    full (via `Program.to_xml()`, the same rendering already used for a
+    whole-project export), not filtered down to only what one routine's
+    text references. Dependency resolution (controller-scope tags, UDTs,
+    AOIs, Modules) is the union across every routine in the program, using
+    the exact same helper functions `export_routine()` already uses
+    (`_referenced_tag_names()`, `_referenced_modules()`,
+    `_resolve_type_closure()`) -- just fed the concatenation of every
+    routine's own lines instead of one routine's. No `Routine
+    Use="Reference"` stubs are needed for JSR calls the way `export_routine()`
+    emits them -- JSR can never cross a Program boundary in native ladder
+    logic (see `_referenced_called_routines()`'s own docstring), so every
+    possible JSR target within this Program is already included as part of
+    the Target itself.
+
+    Calibrated against a real Studio 5000 "Export Program" output (a large,
+    52-routine real program, `Motors`) supplied by the user -- confirmed
+    structurally, not guessed: `TargetType="Program"` (no `TargetSubType` --
+    unlike Routine/AOI targets, a Program has no sub-type), no leading
+    `<!--description-->` XML comment (unlike `export_routine()`'s routine
+    description comment), `<Program Use="Target" ...>` containing its own
+    `<Tags>`/`<Routines>` with NO `Use=` on any individual `<Tag>`/`<Routine>`
+    inside it (everything under the Target Program belongs to the target,
+    not Context), and the exact same `<Modules Use="Context">`/
+    `<AddOnInstructionDefinitions Use="Context">`/`<DataTypes Use="Context">`/
+    controller-scope `<Tags Use="Context">` shape already verified for
+    `export_routine()`.
+
+    KNOWN, DELIBERATE GAP -- NOT implemented: the real `Motors` export also
+    had a `<ChildPrograms><ChildProgram Name="Motor_Sequence"/></ChildPrograms>`
+    element (Rockwell "Program Folder" nesting -- a Program can contain
+    child Programs). This is real, not a guess -- but a first hypothesis
+    that it's a plain `parent_id` relationship in `Comps.Dat` (the same
+    mechanism used everywhere else in this codebase for object hierarchy)
+    was checked directly against the real source ACD and DISPROVEN: no
+    comps row named `Motor_Sequence` shares `Motors`' own `object_id` as its
+    `parent_id` at all -- in fact no comps row named exactly `Motor_Sequence`
+    exists in the current project (a *different*, unrelated top-level
+    program `VAB_Motor_Sequence` does, suggesting the real export may have
+    been taken at a moment before a rename, or that Program-folder nesting
+    is tracked through some other mechanism entirely, not `Comps.Dat`
+    `parent_id`). Rather than guess a mechanism real data just disproved,
+    `export_program()` does not detect or emit `<ChildPrograms>` at all. If
+    the target Program genuinely has child/nested programs in Studio, this
+    export will be missing that element -- check for a `UseAsFolder="true"`-
+    style Program in Studio's own Controller Organizer before relying on
+    this for such a Program, the same way FBD/SFC routine content is a
+    documented, known gap elsewhere in this codebase rather than a silent
+    wrong guess.
+
+    NOT YET VERIFIED AGAINST A REAL STUDIO 5000 IMPORT -- unlike
+    `export_routine()` (which needed several real import rounds to get
+    exactly right, see CLAUDE.md's "Partial/context L5X exports"), this has
+    only been checked against the real Motors export's structural shape,
+    never through an actual Studio 5000 import attempt. Test on a copy of
+    your project first, and expect this may need further real-import-driven
+    adjustment the same way every other `export_*()` function in this file
+    did before it became reliable.
+
+    Args:
+        project: The loaded project that owns `program`.
+        program: The Program to export -- must already be an element of
+            `project.controller.programs`.
+        output_path: Destination `.L5X` file path.
+        owner: Optional "Owner" attribute value, as in `export_routine()`.
+        validate: Before writing, run the same two checks `export_routine()`
+            offers, across every routine/tag in the whole program instead of
+            one: (1) every struct-typed name reachable from a referenced
+            controller tag's or a program tag's own DataType tree resolves;
+            (2) every RLL routine's every rung passes
+            `_validate_rll_rung_syntax()`. Off by default.
+
+    Raises:
+        ValueError: if `program` isn't found in `project.controller.programs`,
+            or (with `validate=True`) an unresolved type or malformed RLL
+            rung is found.
+
+    Example:
+        project = load_acd("MyController.ACD")
+        program = next(p for p in project.controller.programs if p.name == "Motors")
+        export_program(project, program, "Motors_export.L5X")
+        # Then, in Studio 5000: right-click the Programs folder ->
+        # Import Program... -> select Motors_export.L5X
+    """
+    import datetime
+
+    if not any(p is program for p in project.controller.programs):
+        raise ValueError(
+            "program not found in project.controller.programs -- pass the "
+            "same Program object obtained from project.controller.programs[i]"
+        )
+
+    _sync_data_types_map(project)
+
+    def _base_name(ref: str) -> str:
+        return re.split(r"[.\[]", ref, 1)[0]
+
+    all_lines: List[str] = []
+    for routine in program.routines:
+        all_lines.extend(_routine_lines(routine))
+
+    referenced_names = set(_referenced_tag_names(all_lines))
+    # Every program tag is rendered regardless of whether it's directly
+    # referenced (the whole program's own tag list is part of the Target),
+    # but an Alias program tag's own target still needs pulling in as its
+    # own context, same rule as export_routine().
+    for t in program.tags:
+        if t.tag_type == "Alias" and t.target:
+            referenced_names.add(_base_name(t.target))
+
+    while True:
+        controller_tags_all = [t for t in project.controller.tags if t.name in referenced_names]
+        new_names = set()
+        for t in controller_tags_all + list(program.tags):
+            if t.tag_type == "Alias" and t.target:
+                base = _base_name(t.target)
+                if base not in referenced_names:
+                    new_names.add(base)
+        if not new_names:
+            break
+        referenced_names |= new_names
+
+    alias_io_targets = [name for name in referenced_names if ":" in name]
+
+    # Standard Logix scoping: a program-scope tag shadows a same-named
+    # controller-scope tag -- same rule as export_routine(), just checked
+    # against every program tag (not just referenced ones), since every
+    # program tag is part of the Target here regardless.
+    program_tag_names = {t.name for t in program.tags if not t._l5x_exclude}
+    controller_tags = [
+        t for t in project.controller.tags
+        if t.name in referenced_names and t.name not in program_tag_names
+        and not t._l5x_exclude
+    ]
+
+    # Every program tag's own DataType needs to resolve/be included as
+    # context too, not just referenced controller tags -- the whole
+    # program's tag list is part of the Target.
+    referenced_type_names = {
+        t.data_type.upper() for t in controller_tags + list(program.tags) if t.data_type
+    }
+    referenced_data_types, referenced_aois = _resolve_type_closure(referenced_type_names, project)
+
+    data_types_xml = "".join(dt.to_xml() for dt in referenced_data_types)
+
+    referenced_modules = _referenced_modules(all_lines + alias_io_targets, project)
+    modules_xml = "".join(
+        f'<Module Use="Reference" Name="{_escape_xml_attr(m.name)}">\n</Module>\n'
+        for m in referenced_modules
+    )
+    modules_section = (
+        f'<Modules Use="Context">\n{modules_xml}</Modules>\n' if referenced_modules else ""
+    )
+
+    aois_xml = "".join(aoi.to_xml() for aoi in referenced_aois)
+    aois_section = (
+        f'<AddOnInstructionDefinitions Use="Context">\n{aois_xml}\n</AddOnInstructionDefinitions>\n'
+        if referenced_aois else ""
+    )
+
+    controller_tags_xml = "".join(t.to_xml() for t in controller_tags)
+
+    # The Program itself is the Target -- its own <Tags>/<Routines> render
+    # in full via Program.to_xml() (already used for whole-project export),
+    # with no Use= on any individual <Tag>/<Routine> inside it. Verified
+    # against the real Motors export's own shape.
+    program_xml = _inject_use_attr(program.to_xml(), "Program", "Target")
+
+    controller_name = project.controller.name
+    export_date = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    export_options = (
+        "References NoRawData L5KData DecoratedData Context Dependencies "
+        "ForceProtectedEncoding AllProjDocTrans"
+    )
+    owner_attr = f' Owner="{_escape_xml_attr(owner)}"' if owner else ""
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        f'<RSLogix5000Content SchemaRevision="{project.schema_revision}" '
+        f'SoftwareRevision="{project.software_revision}" '
+        f'TargetName="{_escape_xml_attr(program.name)}" '
+        f'TargetType="Program"'
+        f'{owner_attr} ContainsContext="true" ExportDate="{export_date}" '
+        f'ExportOptions="{export_options}">\n'
+        f'<Controller Use="Context" Name="{_escape_xml_attr(controller_name)}">\n'
+        f'<DataTypes Use="Context">\n{data_types_xml}\n</DataTypes>\n'
+        f'{modules_section}'
+        f'{aois_section}'
+        f'<Tags Use="Context">\n{controller_tags_xml}\n</Tags>\n'
+        f'<Programs Use="Context">\n'
+        f'{program_xml}\n'
+        f'</Programs>\n'
+        f'</Controller>\n'
+        f'</RSLogix5000Content>\n'
+    )
+
+    if validate:
+        _validate_tag_types_resolve(controller_tags + list(program.tags), project.controller._data_types_map)
+        for routine in program.routines:
+            if routine.type == "RLL":
+                for i, rung_text in enumerate(routine.rungs):
+                    try:
+                        _validate_rll_rung_syntax(rung_text)
+                    except ValueError as e:
+                        raise ValueError(
+                            f"Rung {i} of routine {routine.name!r}: {e}"
+                        ) from e
 
     Path(output_path).write_text(xml, encoding="utf-8")
 

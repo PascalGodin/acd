@@ -334,6 +334,23 @@ explicitly if you're confident it's unnecessary and want to skip the pass:
     real Studio 5000 import at all (built by symmetry with the other two
     ALREADY-verified wrappers, not from its own real-import evidence) --
     test on a copy of your project first.
+  - `db_export_program(acd_path, program_name, output_path, owner=None,
+    validate=True)` -- a standalone partial L5X for Studio's distinct
+    "Import Program..." feature (NOT "Import Routine"), exporting an ENTIRE
+    program (every one of its own routines and program-scope tags, in
+    full) in one file -- for when you've edited/added several routines in
+    the same program and don't want a separate Import Routine per one.
+    Unlike `db_export_routine()`, nothing is filtered by "referenced" for
+    the program's own routines/tags -- they're all part of the Target.
+    Wrapper shape WAS calibrated against a real Studio 5000 "Export
+    Program" output (not guessed), but has the same **CAUTION** as
+    `db_export_aoi()` -- never tried against a real Studio 5000 import
+    itself yet, test on a copy first. KNOWN GAP: a Program that itself
+    contains nested child/folder programs (`<ChildPrograms>` in a real
+    export) isn't detected or represented -- see
+    `acd.api.export_program()`'s own docstring for why a first hypothesis
+    about how to detect this was checked against real data and disproven,
+    not guessed further.
 
 COMPARING TWO PROJECTS/SAVES/ROUTINES -- READ THIS BEFORE WRITING YOUR OWN
 COMPARISON CODE. Do NOT fetch two routines via `db_get_routine()` and
@@ -408,6 +425,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_export_routine,
     db_export_datatype,
     db_export_aoi,
+    db_export_program,
     db_list_tags,
     db_list_routines,
     db_tag_exists,

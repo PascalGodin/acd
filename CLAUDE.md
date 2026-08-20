@@ -4009,6 +4009,100 @@ is unaffected), and updated assertions in `test_export_routine_validate_resolves
 inside the instance tag's own element, while the AOI's own `<Parameters>` definition is unaffected) —
 `test/test_api.py`/`test/test_project_db.py`.
 
+## `export_program()`/`db_export_program()` — exporting a whole Program (all its routines) in one file
+
+Added after a direct user question ("how hard would it be to export a whole program with multiple
+routines?") followed immediately by the user supplying real, decisive ground truth: a genuine Studio
+5000 "Export Program" output (`Motors_Program.L5X`, a real 52-routine production program from the same
+Bethel_Planer project used throughout this file's history). Unlike `export_routine()` (which took
+several real-import rounds of trial and error to get right — see "Partial/context L5X exports" above),
+having the real wrapper shape in hand up front meant this could be calibrated correctly from the start
+rather than guessed.
+
+**Confirmed real Studio 5000 feature, not assumed**: "Import Program..." is a distinct, native command
+from "Import Routine..." — verified via the local Studio 5000 help docs
+(`Help/ENU/rs5000/help/rs5000/import-and-export/import-program-and-equipment-phase-considerations.html`),
+not just inferred from the file's own `TargetType="Program"` attribute.
+
+**Wrapper shape, confirmed against the real `Motors_Program.L5X`**:
+- `TargetType="Program"` with **no `TargetSubType`** at all (unlike Routine (`RLL`/`ST`) or AOI targets,
+  a Program has no sub-type) and **no leading `<!--description-->` XML comment** (unlike
+  `export_routine()`'s own routine-description comment — a Program apparently gets no equivalent).
+- The Program itself is the Target: `<Programs Use="Context"><Program Use="Target" ...>` — and, critically,
+  **everything inside the target `<Program>` renders with NO individual `Use=` at all** — not on `<Tags>`/
+  `<Routines>`, not on any single `<Tag>`/`<Routine>` inside them. This differs from `export_routine()`'s
+  own wrapper, where the routine's *owning* Program is only `Use="Context"` and just the one target
+  routine gets `Use="Target"` — here the whole Program **is** the target, so every routine/tag under it
+  is part of the target too, exactly the same way `export_aoi()`'s own Parameters/LocalTags/Routines
+  render with no individual `Use=` once the AOI itself carries `Use="Target"`.
+- `Program.to_xml()` (already used unmodified for full-project export) turned out to render this exact
+  shape already — `<Tags>`/`<Routines>` wrapped in no `Use=`, individual `<Tag>`/`<Routine>` elements the
+  same way — so `export_program()` reuses it directly via the same `_inject_use_attr(program.to_xml(),
+  "Program", "Target")` pattern already used for Routine/DataType/AOI targets, rather than needing new
+  per-element rendering code.
+- No `<Routine Use="Reference">` stub is ever needed the way `export_routine()` emits one for a JSR-called
+  routine outside the exported set — a JSR call can never cross a Program boundary in native ladder logic
+  (already established elsewhere in this file, `_referenced_called_routines()`'s own docstring), so every
+  possible JSR target within the exported Program is already part of the Target itself.
+- `<Modules Use="Context">`/`<AddOnInstructionDefinitions Use="Context">`/`<DataTypes Use="Context">`/
+  controller-scope `<Tags Use="Context">` are the exact same shape `export_routine()` already produces —
+  just fed the UNION of every routine's own referenced names (via the same `_referenced_tag_names()`/
+  `_referenced_modules()`/`_resolve_type_closure()` helpers, unmodified, simply called with the
+  concatenation of every routine's `_routine_lines()` instead of one routine's) rather than one routine's.
+  Verified this union actually matters, not just theoretically: the small fixture's own `Branching`
+  program has two routines (`B001_Main` referencing `Branching`, `B002_Timers` referencing
+  `b_Timer`/`FaultCounter`/`FirstOutFault`, called from `B001_Main` via `JSR(B002_Timers,0)`) — all four
+  controller tags appear as context, and no `Routine Use="Reference"` stub is emitted for the JSR target
+  since it's already part of the Program's own routine list.
+- Every one of the Program's own tags renders unconditionally (not filtered to "referenced," unlike
+  `export_routine()`'s program-scope tag handling) since the whole Program is the Target — but the
+  alias-target-resolution and program-tag-shadows-controller-tag rules from `export_routine()` still
+  apply the same way, just checked against the FULL `program.tags` list instead of a referenced subset.
+
+**A real, deliberately UN-solved gap, found and correctly abandoned rather than guessed**: the real
+`Motors_Program.L5X` also has a `<ChildPrograms><ChildProgram Name="Motor_Sequence"/></ChildPrograms>`
+element (Rockwell "Program Folder" nesting — a Program containing other Programs). A first hypothesis —
+that this is a plain `parent_id` relationship in `Comps.Dat`, the same mechanism used everywhere else in
+this codebase for object hierarchy — was checked directly against the real source ACD (the exact same
+project) and **disproven**: no comps row named `Motor_Sequence` has `Motors`' own `object_id` as its
+`parent_id`; in fact no comps row named exactly `Motor_Sequence` exists in the current project at all (a
+*different*, unrelated top-level program `VAB_Motor_Sequence` does — the real export was very likely
+taken at a moment shortly before a rename, in an actively-edited project). Rather than guess a mechanism
+real data just disproved, `export_program()` does not attempt to detect or emit `<ChildPrograms>` at
+all — documented as a known, explicit gap (in both the function's own docstring and `acd/__init__.py`'s
+module docstring) rather than a silent wrong guess, the same treatment already given to FBD/SFC routine
+content elsewhere in this file.
+
+**NOT YET verified against a real Studio 5000 import** — only checked structurally against the real
+`Motors_Program.L5X`'s shape and via unit tests against the small fixture. Every other `export_*()`
+function in this file needed at least one real import round to find something the structural comparison
+alone couldn't — expect the same here.
+
+**A real, avoidable mistake made while building this, worth keeping as its own lesson**: the first smoke
+test for `export_program()` was run directly against the user's LIVE production project (via
+`db_to_controller()` on the real, in-use `.ACD`) instead of the small test fixture — it triggered a DB
+rebuild that discarded one or more `db_*` edits made since the last rebuild that had never been exported
+(the persistent DB's own `dirty` flag, see "Persistent project DB" above, correctly fired its warning).
+The user confirmed real in-progress work was lost, though tolerated it ("it's fine, we'll do it again").
+**The lesson, not really new but re-learned expensively**: this codebase's own established discipline of
+testing against `resources/CuteLogix.ACD` (or an explicit scratch copy) instead of a real, actively-edited
+project applies to informal smoke tests too, not just the checked-in test suite — a `db_to_controller()`/
+`open_project_db()` call is not read-only against the project's own working state the way `load_acd()` is,
+precisely because of the whole point of the persistent-DB feature (see "Persistent project DB" above:
+"an edit ... writes directly into the current project"). The DIRTY-flag rebuild warning existing at all is
+exactly the safety net that caught this — it did its job — but the right move is to never trigger it
+against real project state for a throwaway experiment in the first place.
+
+Covered by `test_export_program_produces_well_formed_target_xml`,
+`test_export_program_includes_every_routine_with_no_individual_use_attr`,
+`test_export_program_unions_tag_dependencies_across_every_routine`,
+`test_export_program_raises_if_not_in_project`,
+`test_export_program_validate_rejects_malformed_rll_syntax`,
+`test_export_program_validate_false_does_not_check_rll_syntax` (`test/test_api.py`, against the real
+`Branching` program in the small fixture) and `test_export_program_stateless_wrapper_includes_every_routine`,
+`test_export_program_raises_on_missing_program`, `test_export_program_instance_method`
+(`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

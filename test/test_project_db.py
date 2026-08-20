@@ -16,6 +16,7 @@ from acd import (
     db_diff_routine,
     db_export_aoi,
     db_export_datatype,
+    db_export_program,
     db_export_routine,
     db_find_tag_references,
     db_get_project_summary,
@@ -1056,6 +1057,32 @@ def test_db_new_aoi_local_tag_stateless_wrapper_and_export(acd_copy, tmp_path):
     assert 'TargetName="PDB_NEW_AOI"' in content
     assert '<LocalTags' in content
     assert 'Name="Scratch1"' in content
+
+
+def test_export_program_stateless_wrapper_includes_every_routine(acd_copy, tmp_path):
+    output_path = tmp_path / "branching.L5X"
+    db_export_program(str(acd_copy), "Branching", str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'TargetType="Program"' in content
+    assert '<Program Use="Target" Name="Branching"' in content
+    assert '<Routine Name="B001_Main" Type="RLL">' in content
+    assert '<Routine Name="B002_Timers" Type="RLL">' in content
+
+
+def test_export_program_raises_on_missing_program(acd_copy, tmp_path):
+    with pytest.raises(KeyError, match="No program named"):
+        db_export_program(str(acd_copy), "NoSuchProgram", str(tmp_path / "bad.L5X"))
+
+
+def test_export_program_instance_method(acd_copy, tmp_path):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        output_path = tmp_path / "branching.L5X"
+        db.export_program("Branching", str(output_path))
+        content = output_path.read_text(encoding="utf-8")
+        assert '<Program Use="Target" Name="Branching"' in content
+    finally:
+        db.close()
 
 
 def test_get_routine_does_not_rehydrate_full_controller(acd_copy, monkeypatch):

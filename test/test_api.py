@@ -13,6 +13,7 @@ from acd.api import (
     diff_lines,
     export_aoi,
     export_datatype,
+    export_program,
     export_routine,
     find_io_addresses,
     find_tag_references,
@@ -1642,6 +1643,95 @@ def test_export_routine_validate_false_does_not_check_rll_syntax(tmp_path):
     routine.rungs.append("[MOVE(A,B) FOR(C,D,E) ];")
 
     export_routine(project, routine, str(tmp_path / "bad.L5X"), validate=False)
+
+    assert (tmp_path / "bad.L5X").exists()
+
+
+def test_export_program_produces_well_formed_target_xml(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+
+    output_path = tmp_path / "program_export.L5X"
+    export_program(project, program, str(output_path), validate=True)
+    content = output_path.read_text(encoding="utf-8")
+    minidom.parse(str(output_path))  # well-formed
+
+    # Calibrated against a real Studio 5000 "Export Program" output: Program
+    # target, no TargetSubType (unlike Routine/AOI targets), no leading
+    # <!--description--> XML comment.
+    assert 'TargetType="Program"' in content
+    assert "TargetSubType" not in content
+    assert not content.split("\n", 2)[1].strip().startswith("<!--")
+    assert '<Program Use="Target" Name="Branching"' in content
+
+
+def test_export_program_includes_every_routine_with_no_individual_use_attr(tmp_path):
+    # "Branching" has two real routines (B001_Main, B002_Timers) -- both
+    # must be included in full, and neither the <Tags>/<Routines> wrapper
+    # nor any individual <Tag>/<Routine> inside the target <Program> may
+    # carry its own Use= (everything under the Target Program belongs to
+    # the target itself, verified against the real "Motors" export).
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+
+    output_path = tmp_path / "program_export.L5X"
+    export_program(project, program, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+
+    program_start = content.index('<Programs Use="Context">')
+    program_section = content[program_start:]
+    assert '<Routine Name="B001_Main" Type="RLL">' in program_section
+    assert '<Routine Name="B002_Timers" Type="RLL">' in program_section
+    assert "Tag Use=" not in program_section
+    assert "Routine Use=" not in program_section
+
+
+def test_export_program_unions_tag_dependencies_across_every_routine(tmp_path):
+    # B001_Main references "Branching"; B002_Timers (a SEPARATE routine in
+    # the same program) references "b_Timer"/"FaultCounter"/"FirstOutFault"
+    # -- all four must appear as context, not just the first routine's own
+    # references. Also exercises the "no Reference stub needed for a
+    # same-program JSR" case: B001_Main calls JSR(B002_Timers,0), and
+    # B002_Timers is already part of the Target, so no stub should appear.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+
+    output_path = tmp_path / "program_export.L5X"
+    export_program(project, program, str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+
+    controller_tags_start = content.index('<Tags Use="Context">')
+    controller_tags_end = content.index("</Tags>", controller_tags_start)
+    controller_tags_section = content[controller_tags_start:controller_tags_end]
+    for name in ("Branching", "b_Timer", "FaultCounter", "FirstOutFault"):
+        assert f'Tag Name="{name}"' in controller_tags_section
+    assert 'Routine Use="Reference" Name="B002_Timers"' not in content
+
+
+def test_export_program_raises_if_not_in_project(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    other_project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    foreign_program = other_project.controller.programs[0]
+
+    with pytest.raises(ValueError, match="not found in project.controller.programs"):
+        export_program(project, foreign_program, str(tmp_path / "bad.L5X"))
+
+
+def test_export_program_validate_rejects_malformed_rll_syntax(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+    program.routines[0].rungs.append("[MOVE(A,B) FOR(C,D,E) ];")
+
+    with pytest.raises(ValueError, match=r"Rung \d+ of routine .*only 1 member"):
+        export_program(project, program, str(tmp_path / "bad.L5X"), validate=True)
+
+
+def test_export_program_validate_false_does_not_check_rll_syntax(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+    program.routines[0].rungs.append("[MOVE(A,B) FOR(C,D,E) ];")
+
+    export_program(project, program, str(tmp_path / "bad.L5X"), validate=False)
 
     assert (tmp_path / "bad.L5X").exists()
 

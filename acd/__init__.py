@@ -206,6 +206,22 @@ EDITS -- durable the moment the call returns (see above), each raising
     `Input`/`Output` parameter is passed by value and may only be a single
     scalar elementary value; only `InOut` (passed by reference) may be an
     array OR a structured type (`STRING`/UDT/AOI).
+  - `db_edit_aoi_parameter(acd_path, aoi_name, name, data_type=None, usage=None,
+    dimension=None, description=None, required=None, visible=None,
+    external_access=None)` -- update an existing AOI parameter's fields in
+    place; only the fields actually passed (non-`None`) are changed. Re-runs
+    the same validation `db_new_aoi_parameter()` itself does against the
+    MERGED field set, so an edit can't sneak a parameter into a shape
+    Studio 5000 would reject that creating one directly never could.
+    CAVEAT: `dimension=None` means "leave unchanged," not "clear back to
+    scalar" -- delete and recreate the parameter instead if you need that.
+  - `db_delete_aoi_parameter(acd_path, aoi_name, name)` -- remove a
+    parameter from an AOI created via `db_new_aoi()`. Same real-`.ACD`
+    caveat as `db_delete_tag()` below (bookkeeping cleanup only, no
+    "un-import" of an already-accepted Studio import) -- pairs with
+    `db_edit_aoi_parameter()` above for "added with the wrong shape, no fix
+    short of Studio's own AOI editor" (delete + recreate instead of leaving
+    permanent clutter).
   - `db_new_aoi_local_tag(acd_path, aoi_name, name, data_type,
     dimension=None, description=None, index=None)` -- add a private/scratch
     LocalTag (internal AOI state that shouldn't be a public parameter) to
@@ -441,6 +457,8 @@ from acd.l5x.project_db import (  # noqa: F401
     db_new_member,
     db_new_aoi,
     db_new_aoi_parameter,
+    db_edit_aoi_parameter,
+    db_delete_aoi_parameter,
     db_new_aoi_local_tag,
     db_new_routine,
     db_insert_rung,

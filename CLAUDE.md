@@ -4340,6 +4340,80 @@ file's own existing convention for that fixture), `test_get_aoi_missing_raises_k
 `test_db_export_program_validate_accepts_in_bounds_array_index`, and
 `test_db_find_tag_references_include_text_false_returns_3_tuples`.
 
+## Fifth round: AOI parameter edit/delete, and repeated-warning noise throttled via `_log_once()`
+
+Two of the three "smaller frictions, not urgent" items from the fourth feedback round above,
+picked up on direct follow-up ("start with the first two"):
+
+**1. `db_edit_aoi_parameter()`/`db_delete_aoi_parameter()`.** Previously, a parameter added with
+the wrong shape (wrong data type, wrong `usage`, a typo in the description) had no fix short of
+Studio's own AOI editor after import — `db_new_aoi_parameter()` could create one, nothing could
+edit or remove it from this project DB's own bookkeeping.
+
+`ProjectDB.edit_aoi_parameter()`/`db_edit_aoi_parameter()` (`acd/l5x/project_db.py`) update only
+the fields actually passed (non-`None`), same "only what you pass" convention as `edit_tag()`.
+Rather than duplicating `new_aoi_parameter()`'s own validation (the array-only-on-`InOut` and
+elementary-type-only-on-`Input`/`Output` Rockwell constraints — see "AOI Input/Output parameters
+must be an elementary" above), the edit method fetches the parameter's CURRENT row, merges in
+whatever fields were actually passed, and re-runs the exact same `new_aoi_parameter()` pure
+constructor against the merged result — so an edit can never be used to sneak a parameter into a
+shape Studio 5000 would reject that creating one directly never could, and the constraint logic
+has exactly one place it lives. Same documented caveat as `edit_tag()`: `dimension=None` means
+"leave unchanged," not "clear back to scalar" (delete + recreate instead if that's genuinely
+needed).
+
+`ProjectDB.delete_aoi_parameter()`/`db_delete_aoi_parameter()` — a straightforward `DELETE` from
+`proj_aoi_parameters`, same real-`.ACD` caveat as `delete_tag()`/`delete_member()` (bookkeeping
+cleanup only; no "un-import" of an already-Studio-accepted parameter exists). Pairs with the edit
+method above: a parameter that should never have been added at all can now be deleted and
+recreated correctly instead of left as permanent clutter.
+
+**2. Repeated identical warnings across a long session.** The exact complaint: `_parse_records()`'s
+own "skipped N unparseable record(s)" summary and `open_project_db()`'s "rebuilding ... DISCARDS"
+warning are both genuinely useful, but print in full on EVERY triggering rebuild — not wrong
+content, just repetitive once a caller has already seen the identical message. Explicitly NOT a
+request for less information (verbose=True still shows everything).
+
+Added `_log_once(message)` (`acd/l5x/export_l5x.py`) — a tiny module-level dedup: the first
+occurrence of an exact message string in this process logs at `WARNING` (as before); a
+byte-identical repeat logs at `DEBUG` instead (invisible under the default `WARNING`-level quiet
+sink, but still there under `verbose=True`). A message that differs even slightly (a different
+failure count, a different `acd_path`) is treated as new and still warns in full — this only
+suppresses a literal repeat of something already shown, never a genuinely new problem. Wired into
+both `_parse_records()`'s summary warning and `open_project_db()`'s dirty-discard warning.
+
+**Deliberately per-process, not persisted across process boundaries** — a `db_*` stateless call is
+often its own short-lived process (see "Persistent project DB" above), so `_log_once()` mainly
+helps a long-running script that calls `open_project_db()`/`ControllerBuilder` many times itself
+(e.g. several edits in one session, or a retry loop that keeps re-triggering the same rebuild) —
+NOT the common case of many separate one-shot `db_*` process invocations across a session, where
+each process starts with an empty dedup cache. This is a real, known scope limit, stated plainly
+rather than overclaimed: persisting dedup state across process boundaries would need writing
+something to disk (a marker file, a `proj_meta` column) and deciding when that state should be
+considered stale (a genuinely new problem after a real re-save must never be silently suppressed)
+— judged more design work than this "easy, cheap, safe" round called for; revisit if the
+per-process version turns out not to be enough in practice.
+
+**Test-isolation pitfall found and fixed while adding tests for this**: `_WARNED_ONCE_MESSAGES` is
+real process-lifetime module state, and a full `pytest` run is one process — without resetting it,
+an early test's message could "use up" `_log_once()`'s one-time WARNING for a message a LATER,
+unrelated test also expects to see at WARNING level, silently downgrading it to DEBUG (invisible
+under the WARNING-level test sink) and producing a flaky, run-order-dependent failure with nothing
+to do with the code actually being tested. Fixed by adding an autouse, function-scoped
+`_reset_log_once_dedup` fixture (`test/conftest.py`) that clears `_WARNED_ONCE_MESSAGES` before
+(and after) every test — mirrors the same class of test-isolation issue already documented
+elsewhere in this file for loguru sinks (see the `configure_logging(True)` no-op pitfall under
+"Ingestion robustness" above), just for this new piece of shared state instead.
+
+Covered by `test_log_once_warns_first_time_then_debugs_on_exact_repeat`,
+`test_log_once_still_warns_for_a_genuinely_different_message`,
+`test_parse_records_repeated_identical_failure_only_warns_once` (`test/test_database.py`);
+`test_open_project_db_dirty_warning_only_fires_once_per_identical_message` (`test/test_project_db.py`);
+and, for the AOI parameter edit/delete methods, `test_edit_aoi_parameter_updates_only_passed_fields`,
+`test_edit_aoi_parameter_revalidates_merged_shape`, `test_edit_aoi_parameter_missing_raises_key_error`,
+`test_delete_aoi_parameter_removes_it`, `test_delete_aoi_parameter_missing_raises_key_error`, and
+`test_db_edit_aoi_parameter_and_delete_aoi_parameter_stateless_wrappers` (`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

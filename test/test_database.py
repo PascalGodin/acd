@@ -12,6 +12,7 @@ from acd.l5x.export_l5x import (
     _dedupe_comps_records,
     _iter_region_map_entries_v38,
     _iter_region_map_entries_v_pre38,
+    _log_once,
     _MAX_INLINE_FAILURE_DETAILS,
     _parse_records,
     configure_logging,
@@ -726,3 +727,46 @@ def test_parse_records_per_record_detail_visible_under_verbose(monkeypatch, caps
             assert f"record {i} " in captured.err
     finally:
         configure_logging(False)
+
+
+def test_log_once_warns_first_time_then_debugs_on_exact_repeat(capsys):
+    configure_logging(False)  # WARNING-level sink -- DEBUG repeats won't show
+    _log_once("UNIQUE_MESSAGE_A")
+    first = capsys.readouterr()
+    assert "UNIQUE_MESSAGE_A" in first.err
+
+    _log_once("UNIQUE_MESSAGE_A")
+    second = capsys.readouterr()
+    assert "UNIQUE_MESSAGE_A" not in second.err  # downgraded to DEBUG, filtered by the sink
+
+
+def test_log_once_still_warns_for_a_genuinely_different_message(capsys):
+    configure_logging(False)
+    _log_once("UNIQUE_MESSAGE_B1")
+    capsys.readouterr()
+
+    _log_once("UNIQUE_MESSAGE_B2")
+    second = capsys.readouterr()
+    assert "UNIQUE_MESSAGE_B2" in second.err
+
+
+def test_parse_records_repeated_identical_failure_only_warns_once(monkeypatch, capsys):
+    # Regression test for a real report: the "skipped N unparseable
+    # record(s)" summary is genuinely useful but repeats in full on every
+    # triggering rebuild across a long session -- a second, byte-identical
+    # occurrence within the same process should log at DEBUG (invisible
+    # under the default WARNING-level sink), not WARNING again.
+    configure_logging(False)
+    records = [_FakeRecord(64250, 50)]
+    _patch_fake_dat(monkeypatch, records)
+
+    def parse_one(record):
+        raise ValueError("UNIQUE_REPEATED_FAILURE")
+
+    _parse_records("fake.Dat", parse_one, "FakeLabel")
+    first = capsys.readouterr()
+    assert "UNIQUE_REPEATED_FAILURE" in first.err
+
+    _parse_records("fake.Dat", parse_one, "FakeLabel")
+    second = capsys.readouterr()
+    assert "UNIQUE_REPEATED_FAILURE" not in second.err

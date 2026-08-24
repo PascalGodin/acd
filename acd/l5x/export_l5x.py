@@ -57,6 +57,40 @@ def _dedupe_comps_records(tuples: List[tuple]) -> Dict[tuple, tuple]:
     return comps_by_id
 
 
+_WARNED_ONCE_MESSAGES: set = set()
+
+
+def _log_once(message: str) -> None:
+    """`log.warning()` the first time this exact message is seen in this
+    process; every identical repeat after that logs at DEBUG instead (same
+    content, just quieter) rather than WARNING again.
+
+    Added after a real report: `_parse_records()`'s own "skipped N
+    unparseable record(s)" summary, and `open_project_db()`'s "rebuilding
+    ... discards edits" warning (see `project_db.py`), are both genuinely
+    useful but were firing in full on EVERY triggering rebuild across a
+    long session -- not wrong content, just repetitive once a caller has
+    already seen the exact same message once. Not a request for less
+    information (the report was explicit about that), just to stop the
+    literal repetition.
+
+    Deliberately per-process only, not persisted across process boundaries
+    (a `db_*` stateless call is often its own short-lived process, so this
+    mainly helps a long-running script that calls `open_project_db()`/
+    `ControllerBuilder` many times itself, or hits the same rebuild path
+    repeatedly in a retry loop) -- a fresh process has no way to know a
+    prior, unrelated process already logged something, and shouldn't
+    pretend to. A message that differs even slightly (e.g. a different
+    failure count) is treated as new content and still warns in full --
+    this only suppresses a byte-for-byte repeat of something already shown.
+    """
+    if message in _WARNED_ONCE_MESSAGES:
+        log.debug(message)
+        return
+    _WARNED_ONCE_MESSAGES.add(message)
+    log.warning(message)
+
+
 # A summary WARNING inlines the concrete (index, exception) detail for each
 # failure only up to this many -- see _parse_records()'s own docstring for
 # why: for the common case (one or two genuinely dropped real objects) this
@@ -121,12 +155,12 @@ def _parse_records(dat_path: str, parse_one, label: str) -> List[tuple]:
             out.append(t)
     if failures:
         if len(failures) <= _MAX_INLINE_FAILURE_DETAILS:
-            log.warning(
+            _log_once(
                 f"{label}: skipped {len(failures)} unparseable record(s) of {len(records)} -- "
                 + "; ".join(failures)
             )
         else:
-            log.warning(
+            _log_once(
                 f"{label}: skipped {len(failures)} unparseable record(s) of {len(records)} "
                 f"(re-run with verbose=True to see each one)"
             )

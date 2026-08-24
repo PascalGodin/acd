@@ -106,7 +106,7 @@ from acd.l5x.elements import (
     new_routine as _new_routine,
     new_tag as _new_tag,
 )
-from acd.l5x.export_l5x import configure_logging, ExportL5x
+from acd.l5x.export_l5x import _log_once, configure_logging, ExportL5x
 
 _DB_FILENAME = "acd.db"
 
@@ -655,7 +655,14 @@ def open_project_db(acd_path, project_dir=None, rebuild: bool = False,
 
         if needs_rebuild:
             if was_dirty:
-                log.warning(
+                # _log_once(): the first occurrence in this process logs at
+                # WARNING (as before); an identical repeat (e.g. a retry
+                # loop, or many open_project_db() calls in one long-running
+                # script) logs at DEBUG instead -- same real content, just
+                # not repeated in full every single time. See its own
+                # docstring (export_l5x.py) for why this is per-process,
+                # not persisted.
+                _log_once(
                     f"open_project_db(): rebuilding {db_file} from {acd_path} -- this DISCARDS "
                     "one or more edits made since the last rebuild that were never exported via "
                     "db_export_routine()/db_export_datatype() (the source .ACD changed, or "
@@ -1227,6 +1234,86 @@ class ProjectDB:
             self._conn.commit()
         return local_tag_id
 
+    def edit_aoi_parameter(self, aoi_name: str, name: str,
+                            data_type: Union[str, None] = None,
+                            usage: Union[str, None] = None,
+                            dimension: Union[int, None] = None,
+                            description: Union[str, None] = None,
+                            required: Union[str, None] = None,
+                            visible: Union[str, None] = None,
+                            external_access: Union[str, None] = None) -> None:
+        """Update an existing AOI parameter's fields in place -- only the
+        fields actually passed (non-`None`) are changed, same "only what
+        you pass" convention as `edit_tag()`. Added after a real report: a
+        parameter added with the wrong shape previously had no fix short of
+        Studio's own AOI editor after import (see `delete_aoi_parameter()`
+        below for the sibling gap this closes).
+
+        Re-runs `new_aoi_parameter()`'s own validation/default-derivation
+        logic against the MERGED (existing + overridden) field set -- an
+        edit can't be used to sneak a parameter into a shape Studio 5000
+        would reject that creating one directly never could (an array on
+        `usage="Input"`/`"Output"`, or a `STRING`/UDT/AOI `data_type` with
+        that same usage -- see `new_aoi_parameter()`'s own docstring for
+        both real Studio import rejections these guard against).
+
+        CAVEAT, same shape as `edit_tag()`'s own documented one:
+        `dimension=None` means "leave the current dimension unchanged," NOT
+        "clear it back to scalar" -- there's no way to explicitly un-array a
+        parameter through this method (delete and recreate it instead if
+        you genuinely need that). The same applies to `required`/`visible`/
+        `external_access`: passing `None` keeps the CURRENT stored value,
+        not the usage-derived default `new_aoi_parameter()` would compute
+        for a brand-new parameter.
+
+        Raises `KeyError` if `aoi_name`/`name` doesn't resolve to an
+        existing AOI parameter created in THIS project DB (same v1 scope
+        limit as `new_aoi_parameter()`), or `ValueError` if the merged
+        field set violates a constraint `new_aoi_parameter()` itself would
+        also reject.
+        """
+        aoi_id = self._aoi_id(aoi_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id, data_type_name, dimensions, usage, required, visible, "
+            "external_access, description FROM proj_aoi_parameters "
+            "WHERE aoi_id=? AND name=? COLLATE NOCASE",
+            (aoi_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No parameter named {name!r} on AOI {aoi_name!r}")
+        (param_id, cur_dtype, cur_dims, cur_usage, cur_required, cur_visible,
+         cur_ext_access, cur_description) = row
+
+        effective_dtype = data_type if data_type is not None else cur_dtype
+        effective_usage = usage if usage is not None else cur_usage
+        effective_dimension = (
+            dimension if dimension is not None
+            else (int(cur_dims) if cur_dims is not None else None)
+        )
+        effective_description = description if description is not None else cur_description
+        effective_required = required if required is not None else cur_required
+        effective_visible = visible if visible is not None else cur_visible
+        effective_external_access = (
+            external_access if external_access is not None else cur_ext_access
+        )
+
+        param = _new_aoi_parameter(
+            name, effective_dtype, usage=effective_usage, dimension=effective_dimension,
+            description=effective_description, required=effective_required,
+            visible=effective_visible, external_access=effective_external_access,
+        )
+        cur.execute(
+            "UPDATE proj_aoi_parameters SET data_type_name=?, dimensions=?, radix=?, usage=?, "
+            "required=?, visible=?, external_access=?, constant=?, description=? WHERE id=?",
+            (param.data_type, param.dimensions, param.radix, param.usage, param.required,
+             param.visible, param.external_access, param.constant, param._description,
+             param_id),
+        )
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
     def new_routine(self, routine_name: str, routine_type: str,
                      program_name: Union[str, None] = None,
                      description: Union[str, None] = None,
@@ -1644,6 +1731,35 @@ class ProjectDB:
         if row is None:
             raise KeyError(f"No member named {member_name!r} in DataType {data_type_name!r}")
         cur.execute("DELETE FROM proj_members WHERE id=?", (row[0],))
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def delete_aoi_parameter(self, aoi_name: str, name: str) -> None:
+        """Remove a parameter from an AOI created via `new_aoi()`/
+        `db_new_aoi()` in THIS project DB. Same real-`.ACD` caveat as
+        `delete_tag()` -- this only cleans up this project DB's own
+        bookkeeping, not a real Studio project (there's no "un-import" for
+        an AOI parameter Studio has already accepted). Pairs with
+        `edit_aoi_parameter()` above for the "added with the wrong shape,
+        no fix short of Studio's own AOI editor" gap this closes -- a
+        parameter that should never have been added at all can now just be
+        deleted and recreated correctly, rather than left as permanent
+        clutter.
+
+        Raises `KeyError` if `aoi_name`/`name` doesn't resolve to an
+        existing AOI parameter created in THIS project DB (same v1 scope
+        limit as `new_aoi_parameter()`).
+        """
+        aoi_id = self._aoi_id(aoi_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM proj_aoi_parameters WHERE aoi_id=? AND name=? COLLATE NOCASE",
+            (aoi_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No parameter named {name!r} on AOI {aoi_name!r}")
+        cur.execute("DELETE FROM proj_aoi_parameters WHERE id=?", (row[0],))
         cur.execute("UPDATE proj_meta SET dirty=1")
         if not self._in_transaction:
             self._conn.commit()
@@ -2419,6 +2535,28 @@ def db_new_aoi_parameter(acd_path, aoi_name: str, name: str, data_type: str,
         description=description, index=index, required=required, visible=visible,
         external_access=external_access,
     ))
+
+
+def db_edit_aoi_parameter(acd_path, aoi_name: str, name: str,
+                           data_type: Union[str, None] = None,
+                           usage: Union[str, None] = None,
+                           dimension: Union[int, None] = None,
+                           description: Union[str, None] = None,
+                           required: Union[str, None] = None, visible: Union[str, None] = None,
+                           external_access: Union[str, None] = None,
+                           project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.edit_aoi_parameter()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.edit_aoi_parameter(
+        aoi_name, name, data_type=data_type, usage=usage, dimension=dimension,
+        description=description, required=required, visible=visible,
+        external_access=external_access,
+    ))
+
+
+def db_delete_aoi_parameter(acd_path, aoi_name: str, name: str,
+                             project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.delete_aoi_parameter()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.delete_aoi_parameter(aoi_name, name))
 
 
 def db_new_aoi_local_tag(acd_path, aoi_name: str, name: str, data_type: str,

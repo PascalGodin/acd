@@ -248,6 +248,34 @@ def test_open_project_db_warns_when_rebuild_discards_dirty_edits(acd_copy, capsy
     assert "DISCARDS" in captured.err
 
 
+def test_open_project_db_dirty_warning_only_fires_once_per_identical_message(acd_copy, capsys):
+    # Regression test for a real report: this exact warning (message text
+    # unchanged -- same acd_path/db_file each time) fired in full on every
+    # triggering rebuild across a long session. A second, byte-identical
+    # occurrence in the same process should log at DEBUG (invisible under
+    # the default WARNING-level sink _log_once() relies on), not WARNING
+    # again -- see _log_once()'s own docstring (export_l5x.py).
+    db1 = open_project_db(str(acd_copy), verbose=False)
+    db1.new_tag("PDB_DIRTY_TAG_1", "DINT")
+    db1.close()
+    future = time.time() + 5
+    os.utime(acd_copy, (future, future))
+    capsys.readouterr()
+    open_project_db(str(acd_copy), verbose=False).close()
+    first = capsys.readouterr()
+    assert "DISCARDS" in first.err
+
+    db2 = open_project_db(str(acd_copy), verbose=False)
+    db2.new_tag("PDB_DIRTY_TAG_2", "DINT")
+    db2.close()
+    future2 = time.time() + 10
+    os.utime(acd_copy, (future2, future2))
+    capsys.readouterr()
+    open_project_db(str(acd_copy), verbose=False).close()
+    second = capsys.readouterr()
+    assert "DISCARDS" not in second.err
+
+
 def test_open_project_db_does_not_warn_when_rebuild_has_nothing_to_discard(acd_copy, capsys):
     db1 = open_project_db(str(acd_copy), verbose=False)
     db1.close()  # no edits made -- nothing dirty
@@ -882,6 +910,95 @@ def test_new_aoi_parameter_missing_aoi_raises_key_error(acd_copy):
     try:
         with pytest.raises(KeyError):
             db.new_aoi_parameter("NO_SUCH_AOI", "In1", "DINT")
+    finally:
+        db.close()
+
+
+def test_edit_aoi_parameter_updates_only_passed_fields(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_EAP_AOI")
+        db.new_aoi_parameter("PDB_EAP_AOI", "In1", "DINT", usage="Input",
+                              description="original")
+
+        db.edit_aoi_parameter("PDB_EAP_AOI", "In1", description="updated")
+
+        aoi = db.get_aoi("PDB_EAP_AOI")
+        param = next(p for p in aoi["parameters"] if p["name"] == "In1")
+        assert param["description"] == "updated"
+        assert param["data_type"] == "DINT"  # untouched
+        assert param["usage"] == "Input"  # untouched
+    finally:
+        db.close()
+
+
+def test_edit_aoi_parameter_revalidates_merged_shape(acd_copy):
+    # Switching usage from Input (elementary-only) to Output while ALSO
+    # setting a STRING data_type must be rejected the same way
+    # new_aoi_parameter() itself would reject it -- an edit can't be used
+    # to sneak a parameter into a shape creation never could.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_EAP_AOI2")
+        db.new_aoi_parameter("PDB_EAP_AOI2", "In1", "DINT", usage="Input")
+
+        with pytest.raises(ValueError):
+            db.edit_aoi_parameter("PDB_EAP_AOI2", "In1", data_type="STRING")
+    finally:
+        db.close()
+
+
+def test_edit_aoi_parameter_missing_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_EAP_AOI3")
+        with pytest.raises(KeyError):
+            db.edit_aoi_parameter("PDB_EAP_AOI3", "NoSuchParam", description="x")
+    finally:
+        db.close()
+
+
+def test_delete_aoi_parameter_removes_it(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_DAP_AOI")
+        db.new_aoi_parameter("PDB_DAP_AOI", "In1", "DINT")
+        db.new_aoi_parameter("PDB_DAP_AOI", "In2", "DINT")
+
+        db.delete_aoi_parameter("PDB_DAP_AOI", "In1")
+
+        aoi = db.get_aoi("PDB_DAP_AOI")
+        assert [p["name"] for p in aoi["parameters"]] == ["In2"]
+    finally:
+        db.close()
+
+
+def test_delete_aoi_parameter_missing_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_DAP_AOI2")
+        with pytest.raises(KeyError):
+            db.delete_aoi_parameter("PDB_DAP_AOI2", "NoSuchParam")
+    finally:
+        db.close()
+
+
+def test_db_edit_aoi_parameter_and_delete_aoi_parameter_stateless_wrappers(acd_copy, tmp_path):
+    from acd import db_delete_aoi_parameter, db_edit_aoi_parameter
+
+    db_new_aoi(str(acd_copy), "PDB_EAP_WRAP_AOI")
+    db_new_aoi_parameter(str(acd_copy), "PDB_EAP_WRAP_AOI", "In1", "DINT",
+                          description="original")
+    db_new_aoi_parameter(str(acd_copy), "PDB_EAP_WRAP_AOI", "In2", "DINT")
+
+    db_edit_aoi_parameter(str(acd_copy), "PDB_EAP_WRAP_AOI", "In1", description="edited")
+    db_delete_aoi_parameter(str(acd_copy), "PDB_EAP_WRAP_AOI", "In2")
+
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        aoi = db.get_aoi("PDB_EAP_WRAP_AOI")
+        assert [p["name"] for p in aoi["parameters"]] == ["In1"]
+        assert aoi["parameters"][0]["description"] == "edited"
     finally:
         db.close()
 

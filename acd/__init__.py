@@ -88,6 +88,21 @@ step, so a call never returns more than actually asked for:
     at all, see CLAUDE.md).
   - `db_tag_exists(acd_path, name, program_name=None)` -- pre-creation
     collision check in a given scope (controller by default).
+  - `db_get_tag_comment(acd_path, name, path=None, program_name=None)` --
+    the comment at `path` on tag `name`; `path=None`/`""` is the tag's own
+    whole-tag description, otherwise the FULL tag-qualified address (tag
+    name included, e.g. `"HTV_BStatus_Status[0].2"`, not just `"[0].2"`) --
+    same convention as `db_set_tag_comment()`. Returns `None` if no comment
+    is stored there (normal, not an error). A real project's per-bit
+    comments often resolve ambiguity plain rung text/tag names alone don't
+    (e.g. a bit commented `"Tray 1 Full"` changing how a branch should be
+    read) -- there was previously a write path (`db_set_tag_comment()`) but
+    no way to read one back at all.
+  - `db_list_tag_comments(acd_path, name, program_name=None)` -- every
+    comment on tag `name` at once, as `{path: text}` (whole-tag description
+    under key `""`) -- the bulk counterpart to `db_get_tag_comment()`, for
+    a routine that references a few dozen distinct bits without needing a
+    separate round trip per address.
   - `db_find_tag_references(acd_path, name, regex=False, include_text=True)`
     -- every (program, routine, line_index, text) where a tag/member name is
     referenced, project-wide, in ONE call -- e.g. to check whether a name
@@ -470,6 +485,8 @@ from acd.l5x.project_db import (  # noqa: F401
     db_new_tag,
     db_edit_tag,
     db_set_tag_comment,
+    db_get_tag_comment,
+    db_list_tag_comments,
     db_set_tag_element_value,
     db_new_datatype,
     db_new_member,

@@ -4481,6 +4481,49 @@ motivating case), `test_set_tag_element_value_second_call_preserves_first_edit`,
 tests (missing tag/member, out-of-bounds index, index required/forbidden, multi-dim tag rejected)
 plus `test_db_set_tag_element_value_stateless_wrapper`.
 
+## Seventh round: `db_get_tag_comment()`/`db_list_tag_comments()` — a write path with no read path
+
+A real, confirmed gap, medium severity (not a correctness bug on real equipment like some earlier
+rounds, but a real blocker for legacy-code analysis): `db_set_tag_comment()` had existed for
+several rounds, but there was no way to READ a tag/element comment back at all. Checked both
+plausible places first: `Tag` (from `db_to_controller()`) only exposes the whole-tag `description`
+property, nothing per-element; and `db_get_tag_comment()`/anything similar simply didn't exist in
+`help(acd)`. The concrete motivating case: tracing `Tray01_MC`'s accumulation logic, a bit address
+(`HTV_BStatus_Status[0].2`) turned out to be commented `"Tray 1 Full"` directly in Studio — context
+that changes how a branch of the logic should be read (a full-tray edge case, not the normal
+trigger path), invisible to a trace done through rung text and tag names alone. Before this, the
+only way to get it was asking a human to relay each comment by hand from Studio.
+
+Added `ProjectDB.get_tag_comment(name, path=None, program_name=None)` / `db_get_tag_comment()` —
+the direct read counterpart to `set_tag_comment()`, same `path` convention (`path=None`/`""` = the
+tag's own whole-tag description; otherwise the FULL tag-qualified address, tag name included, e.g.
+`"HTV_BStatus_Status[0].2"`, matching `Tag._comments`'s own convention already documented above).
+Returns the RAW stored text (multi-line preserved, unlike the collapsing `Tag.description`
+property) — `None` if nothing is stored at `path`, which is the normal case for most addresses,
+not an error; `KeyError` only if the TAG itself doesn't exist in scope. Backed by a plain
+`SELECT ... FROM proj_tag_comments WHERE tag_id=? AND path=?` — `proj_tag_comments` has no DB-level
+`UNIQUE(tag_id, path)` constraint, but `set_tag_comment()`'s own DELETE-then-INSERT and
+`_materialize()`'s decode-time dedup (see the extensive comment-resolution work documented
+elsewhere in this file) both keep it effectively unique in practice, so a plain `fetchone()` is
+safe without an explicit `LIMIT`/ordering guard.
+
+Also added `ProjectDB.list_tag_comments(name, program_name=None)` / `db_list_tag_comments()` — the
+bulk counterpart, returning EVERY comment on one tag as `{path: text}` (whole-tag description under
+key `""`) in one call, addressing the report's own explicit "ideally also... reading them one
+address at a time is a lot of round trips for a routine that references a few dozen distinct bits"
+ask. Judged sufficient on its own without a separate `db_get_routine(..., include_comments=True)`
+routine-annotation feature (the other option floated in the report): a routine referencing a few
+dozen distinct BIT ADDRESSES typically only touches a handful of distinct TAGS, so
+`list_tag_comments()` once per referenced tag (not once per bit) already collapses the round-trip
+count the report was concerned about, without the extra design surface a routine-level annotation
+feature would add.
+
+Covered by `test_get_tag_comment_element_path`, `test_get_tag_comment_whole_tag_description_via_none_or_empty_path`
+(confirms `path` omitted, `""`, and `None` are all equivalent), `test_get_tag_comment_returns_none_when_no_comment_stored`,
+`test_get_tag_comment_missing_tag_raises_key_error`, `test_list_tag_comments_returns_all_at_once`,
+`test_list_tag_comments_empty_when_no_comments`, `test_list_tag_comments_missing_tag_raises_key_error`,
+and `test_db_get_tag_comment_and_list_tag_comments_stateless_wrappers` (`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

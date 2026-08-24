@@ -1172,6 +1172,76 @@ class ProjectDB:
         if not self._in_transaction:
             self._conn.commit()
 
+    def get_tag_comment(self, name: str, path: Union[str, None] = None,
+                         program_name: Union[str, None] = None) -> Union[str, None]:
+        """The comment at `path` on tag `name` -- the read counterpart to
+        `set_tag_comment()` (same `path` convention: `path=None`/`""` is
+        the tag's own whole-tag description; otherwise the FULL
+        tag-qualified address, tag name included, e.g.
+        `"HTV_BStatus_Status[0].2"`, not just `"[0].2"`).
+
+        Added after a real report: there was no read path anywhere for a
+        comment `db_set_tag_comment()` had a write path for -- a real
+        project's per-bit comments (e.g. `HTV_BStatus_Status[0].2`
+        commented `"Tray 1 Full"` in Studio) resolve real ambiguity in
+        legacy ladder logic that rung text and tag names alone don't, and
+        the only way to get them before this was asking a human to relay
+        each one by hand from Studio.
+
+        Returns the RAW stored text as-is (multi-line preserved, NOT
+        collapsed to one line the way the convenience `Tag.description`
+        Python property does for the whole-tag case -- see CLAUDE.md's
+        "Whole-project L5X fidelity" section for why that collapsing exists
+        and is deliberately NOT applied here). Returns `None` if no comment
+        is stored at `path` -- this is a normal, common state (most
+        addresses have no comment at all), not an error. Raises `KeyError`
+        only if tag `name` itself doesn't exist in this scope.
+        """
+        program_id = self._program_id(program_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM proj_tags WHERE program_id=? AND name=? COLLATE NOCASE",
+            (program_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No tag named {name!r} in this scope")
+        tag_id = row[0]
+        comment_row = cur.execute(
+            "SELECT text FROM proj_tag_comments WHERE tag_id=? AND path=?",
+            (tag_id, path or ""),
+        ).fetchone()
+        return comment_row[0] if comment_row is not None else None
+
+    def list_tag_comments(self, name: str, program_name: Union[str, None] = None) -> Dict[str, str]:
+        """Every comment stored on tag `name`, as `{path: text}` -- the
+        bulk counterpart to `get_tag_comment()`, for reading every
+        element/bit comment on one tag in a single call instead of one
+        round trip per address (added for the exact case that motivated
+        this: tracing a routine that references a few dozen distinct bits
+        of a handful of tags, where fetching each comment individually
+        would mean a few dozen separate `get_tag_comment()` calls).
+
+        The whole-tag description, if set, is included under the key `""`
+        (matching `get_tag_comment()`'s own `path=None`/`""` convention) --
+        filter it out yourself (`{p: t for p, t in comments.items() if p}`)
+        if you only want per-element comments. Returns `{}` if the tag has
+        no comments at all (not an error). Raises `KeyError` if tag `name`
+        doesn't exist in this scope.
+        """
+        program_id = self._program_id(program_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM proj_tags WHERE program_id=? AND name=? COLLATE NOCASE",
+            (program_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No tag named {name!r} in this scope")
+        tag_id = row[0]
+        rows = cur.execute(
+            "SELECT path, text FROM proj_tag_comments WHERE tag_id=? ORDER BY id", (tag_id,)
+        ).fetchall()
+        return {p: t for p, t in rows}
+
     def new_datatype(self, name: str, description: Union[str, None] = None) -> int:
         """Create a new, empty UDT in this project's DB -- the SQL
         equivalent of appending `new_datatype(...)`
@@ -2705,6 +2775,21 @@ def db_set_tag_comment(acd_path, name: str, path: str, text: str,
     _run(acd_path, project_dir, verbose, lambda db: db.set_tag_comment(
         name, path, text, program_name=program_name,
     ))
+
+
+def db_get_tag_comment(acd_path, name: str, path: Union[str, None] = None,
+                        program_name: Union[str, None] = None,
+                        project_dir=None, verbose: bool = False) -> Union[str, None]:
+    """Stateless equivalent of `ProjectDB.get_tag_comment()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose,
+                lambda db: db.get_tag_comment(name, path, program_name=program_name))
+
+
+def db_list_tag_comments(acd_path, name: str, program_name: Union[str, None] = None,
+                          project_dir=None, verbose: bool = False) -> Dict[str, str]:
+    """Stateless equivalent of `ProjectDB.list_tag_comments()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose,
+                lambda db: db.list_tag_comments(name, program_name=program_name))
 
 
 def db_set_tag_element_value(acd_path, tag_name: str, path: str, value,

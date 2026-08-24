@@ -668,6 +668,98 @@ def test_set_tag_comment_empty_text_clears_it(acd_copy):
         db.close()
 
 
+def test_get_tag_comment_element_path(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_tag("PDB_GETCOMMENT_TAG", "DINT")
+        db.set_tag_comment("PDB_GETCOMMENT_TAG", "PDB_GETCOMMENT_TAG[0]", "Tray 1 Full")
+
+        assert db.get_tag_comment("PDB_GETCOMMENT_TAG", "PDB_GETCOMMENT_TAG[0]") == "Tray 1 Full"
+    finally:
+        db.close()
+
+
+def test_get_tag_comment_whole_tag_description_via_none_or_empty_path(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_tag("PDB_GETCOMMENT_TAG2", "DINT")
+        db.edit_tag("PDB_GETCOMMENT_TAG2", description="the whole tag description")
+
+        assert db.get_tag_comment("PDB_GETCOMMENT_TAG2") == "the whole tag description"
+        assert db.get_tag_comment("PDB_GETCOMMENT_TAG2", "") == "the whole tag description"
+        assert db.get_tag_comment("PDB_GETCOMMENT_TAG2", None) == "the whole tag description"
+    finally:
+        db.close()
+
+
+def test_get_tag_comment_returns_none_when_no_comment_stored(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_tag("PDB_GETCOMMENT_TAG3", "DINT")
+        assert db.get_tag_comment("PDB_GETCOMMENT_TAG3", "PDB_GETCOMMENT_TAG3[5]") is None
+        assert db.get_tag_comment("PDB_GETCOMMENT_TAG3") is None  # no description either
+    finally:
+        db.close()
+
+
+def test_get_tag_comment_missing_tag_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.get_tag_comment("NO_SUCH_TAG", "NO_SUCH_TAG[0]")
+    finally:
+        db.close()
+
+
+def test_list_tag_comments_returns_all_at_once(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_tag("PDB_LISTCOMMENT_TAG", "DINT", dimensions="8")
+        db.edit_tag("PDB_LISTCOMMENT_TAG", description="whole tag desc")
+        db.set_tag_comment("PDB_LISTCOMMENT_TAG", "PDB_LISTCOMMENT_TAG[0]", "Tray 1 Full")
+        db.set_tag_comment("PDB_LISTCOMMENT_TAG", "PDB_LISTCOMMENT_TAG[1]", "Tray 2 Full")
+
+        comments = db.list_tag_comments("PDB_LISTCOMMENT_TAG")
+        assert comments == {
+            "": "whole tag desc",
+            "PDB_LISTCOMMENT_TAG[0]": "Tray 1 Full",
+            "PDB_LISTCOMMENT_TAG[1]": "Tray 2 Full",
+        }
+    finally:
+        db.close()
+
+
+def test_list_tag_comments_empty_when_no_comments(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_tag("PDB_LISTCOMMENT_TAG2", "DINT")
+        assert db.list_tag_comments("PDB_LISTCOMMENT_TAG2") == {}
+    finally:
+        db.close()
+
+
+def test_list_tag_comments_missing_tag_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.list_tag_comments("NO_SUCH_TAG")
+    finally:
+        db.close()
+
+
+def test_db_get_tag_comment_and_list_tag_comments_stateless_wrappers(acd_copy):
+    from acd import db_get_tag_comment, db_list_tag_comments, db_set_tag_comment as _db_set_tag_comment
+
+    db_new_tag(str(acd_copy), "PDB_GETCOMMENT_WRAP", "DINT")
+    _db_set_tag_comment(str(acd_copy), "PDB_GETCOMMENT_WRAP", "PDB_GETCOMMENT_WRAP[0]", "hi")
+
+    assert db_get_tag_comment(str(acd_copy), "PDB_GETCOMMENT_WRAP",
+                               "PDB_GETCOMMENT_WRAP[0]") == "hi"
+    assert db_list_tag_comments(str(acd_copy), "PDB_GETCOMMENT_WRAP") == {
+        "PDB_GETCOMMENT_WRAP[0]": "hi",
+    }
+
+
 def test_new_datatype_creates_empty_udt(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:

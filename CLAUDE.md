@@ -4573,6 +4573,82 @@ edit leaves `data_type` untouched), `test_edit_member_changes_data_type_and_dime
 `test_edit_member_missing_data_type_raises_key_error`, `test_edit_member_missing_member_raises_key_error`,
 and `test_db_edit_member_stateless_wrapper` (`test/test_project_db.py`).
 
+## Ninth round: module I/O tag comments resolved to an opaque double-hex-OID key instead of a real address
+
+A real, medium-severity bug report on the just-shipped `db_get_tag_comment()`/`db_list_tag_comments()`
+(see the seventh round above): for a module-mapped I/O tag (`Remote_Moulder046:1:I`, a real rack's
+input image), `db_list_tag_comments()` DID find all 14 real comments (E-stops, permissives, safety
+switches — genuinely safety-relevant), but every key came back as an opaque, unresolved
+`".!02CA91B5.!0794E8EC"`-shaped string instead of the readable `".Pt15.Data"`-style address the same
+functions already return correctly for plain array/bit-indexed tags (`HTV_BStatus_Status[0].2`,
+`TRAY_BITS[0].0`, ...). Not wrong data — just impossible to attribute to a specific point, which
+makes the comment lookup effectively useless for exactly the tag class (module I/O) where per-point
+comments are often the ONLY thing identifying what a bit physically is (no separate description-
+carrying UDT member to fall back on, unlike a `Bin_Sequence.Action_N`-style field).
+
+**Root cause, traced precisely through the existing, already-documented comment-resolution
+machinery** (see "Hex-OID resolution" under "Comment / description resolution" above): a
+`.!HEXOID` reference is an object-ID pointer resolved via `_build_hex_oid_map()` (built once,
+globally, from every `RxTypeMemberCollection` child in the whole project) — already proven, working
+code for REGULAR (non-I/O) tags, including chains of MULTIPLE references
+(`.!06DC4E61.!0751B500` → `.Member1.Member2`, already documented). `TagBuilder.build()`
+(`builders_tag.py`) DELIBERATELY skips this resolution for every I/O tag (tag name containing `:`),
+per its own existing comment: `"I/O tags keep their !HEXOID refs for ControllerBuilder resolution"`.
+`ControllerBuilder.build()`'s own I/O-specific resolution block, however, only ever handled a
+`.!HEXOID[N]`-SHAPED path — one where a literal array index digit is physically present in the raw
+path text (the hex OID itself is never even looked up for that shape; only the bracketed digits
+matter, via a "guess which member is the array data member" heuristic already documented as one of
+this codebase's two deliberate name-based heuristics). A path with NO bracket at all — two (or
+more) chained `.!HEXOID` references and nothing else — fell through every branch unhandled,
+returned completely raw.
+
+**Fix**: added `_resolve_hex_oid_chain(path, hex_oid_map)` (`acd/l5x/elements/builders_controller.py`)
+— applies the SAME `hex_oid_map` lookup already proven for regular tags to an I/O tag's own
+bracket-free `.!HEXOID` chain, resolving each segment independently and joining with dots (e.g.
+`.!02CA91B5.!0794E8EC` → `.Pt15.Data` when the map resolves both OIDs). Wired in as a fallback for
+exactly the "no bracket in the path" case the existing bracket-index branch doesn't cover — the
+existing, already-working bracket-shaped resolution is completely untouched. **Deliberately does
+NOT depend on the "guess the data member" heuristic (`_dm`) the bracket-index case needs** — a real
+correctness bug caught by this fix's OWN first test attempt: the bracket branch's `if not _dm:
+continue` guard sat BEFORE the new fallback in the original code layout, so a synthetic I/O
+DataType with no decoded members at all (a real, non-hypothetical shape — module metadata is often
+incompletely decoded, see "Known limitations") never even reached the new resolution attempt.
+Restructured so the `_dm`/bracket-index logic and the bracket-free chain-resolution fallback are
+independent siblings, not nested — the chain case resolves directly from real member names via
+`hex_oid_map`, with no member-guessing involved at all.
+
+**Honesty about verification, stated plainly since this touches safety-relevant real comments**:
+this is a STRUCTURAL generalization of an already-proven mechanism (chained hex-OID resolution is
+real, working, documented code for other tags), not a guess at a brand-new byte format — but it has
+NOT been independently verified at the byte level against the reporting project's own raw
+`Remote_Moulder046:1:I` comps records (no access to that real file this session). If a resolved
+result ever looks wrong (a comment attributed to the wrong point), the fallback path — leave the
+original raw key unresolved, `log.warning()` so it's visible — is unconditionally what happens for
+ANY OID that fails to resolve via `hex_oid_map`; a PARTIAL resolution (one real name, one still-
+opaque hex OID) is deliberately never emitted, since that would be more misleading than an obviously
+still-broken key, not less. Recommend the user spot-check at least one resolved point (e.g. confirm
+`db_get_tag_comment(path, "Remote_Moulder046:1:I", "Remote_Moulder046:1:I.Pt15.Data")` really is
+"Tray 1 Full"-equivalent per Studio) before trusting every one of the 14 for anything safety-critical.
+
+**Refactor alongside the fix, for testability**: extracted `ControllerBuilder.build()`'s whole
+inline I/O-tag comment-resolution loop into a standalone `_resolve_io_tag_comments(tags,
+data_types_map, hex_oid_map)` function (same file) — this is what let the fix (and the pre-existing,
+previously-untested behavior it sits alongside) get direct, fast unit-test coverage against plain
+`Tag`/`DataType`/`Member` objects, with no synthetic Comps.Dat/comments-table setup needed at all
+(a bar the existing "inject rows into a real `ExportL5x`'s SQLite cursor" test pattern used
+elsewhere in this file would have made significantly heavier for this specific case). Behavior-
+preserving for every path shape already covered by existing behavior — confirmed via a dedicated
+regression test for the bracket-shaped case specifically.
+
+Covered by `TestResolveHexOidChain` (two/single-segment chain resolution, partial-failure and
+malformed-segment both return `None`, empty path, lowercase hex digits) and
+`test_resolve_io_tag_comments_resolves_double_hex_oid_chain` (the literal reported bug),
+`test_resolve_io_tag_comments_leaves_unresolvable_chain_unchanged_and_warns` (confirms the safe
+fallback AND that a warning fires), `test_resolve_io_tag_comments_still_resolves_bracket_shaped_array_index`
+(regression coverage for the pre-existing, unaffected behavior — this is the test that caught the
+`_dm`-guard-ordering bug in the first draft of this fix), and
+`test_resolve_io_tag_comments_skips_non_io_tags` (`test/test_database.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

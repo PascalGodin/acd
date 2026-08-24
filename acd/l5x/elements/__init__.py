@@ -134,5 +134,7 @@ from .builders_controller import (
     ProjectBuilder,
     DumpCompsRecords,
     _TASK_TYPE_MAP,
+    _resolve_hex_oid_chain,
+    _resolve_io_tag_comments,
 )  # noqa: F401
 

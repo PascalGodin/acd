@@ -35,6 +35,175 @@ from .model import (
 )
 
 
+def _resolve_hex_oid_chain(path: str, hex_oid_map: Dict[int, str]) -> Union[str, None]:
+    """Resolve a chain of one or more `.!HEXOID` references, with NO
+    literal array-index anywhere in the path (e.g. `".!02CA91B5.!0794E8EC"`)
+    into a dotted member path (e.g. `".Pt15.Data"`), the same
+    `hex_oid_map`-based lookup a regular (non-I/O) tag's own equivalent
+    chain already resolves through (`TagBuilder.build()`'s `re.sub(r'!([0-9A-F]{8})',
+    ...)`, see CLAUDE.md's "Hex-OID resolution" section -- a real,
+    already-verified pattern for OTHER tags, e.g. `.!06DC4E61.!0751B500`
+    resolving to `.Member1.Member2`).
+
+    `TagBuilder.build()` deliberately skips that resolution for EVERY I/O
+    tag (tag name containing `:`), leaving `.!HEXOID`-shaped paths for
+    `ControllerBuilder` to resolve instead -- but `ControllerBuilder`'s own
+    I/O-specific resolution (see `_resolve_io_tag_comments()` below) only
+    ever handled a `.!HEXOID[N]`-shaped path (a literal array index
+    physically present in the raw path text, where the hex OID itself is
+    never even looked up -- only the bracketed digits matter). A path with
+    NO bracket at all -- two (or more) chained `.!HEXOID` references and
+    nothing else -- fell through completely unresolved, a real reported
+    bug: `db_list_tag_comments()` returned the raw, opaque
+    `".!02CA91B5.!0794E8EC"` as the key instead of a real, addressable
+    path, for every I/O tag whose comments use this shape.
+
+    This function is the missing piece: apply the SAME `hex_oid_map`
+    lookup already built for regular tags to an I/O tag's own chain, on
+    the theory (not independently verified at the byte level, but strongly
+    suggested by the requested/expected shape matching exactly -- see the
+    caller's own comment) that at least some I/O module-defined types DO
+    have their own members recorded under `RxTypeMemberCollection` the
+    same way a real UDT's do, even though `TagBuilder.build()`'s exclusion
+    assumed otherwise for every I/O tag uniformly.
+
+    Returns `None` -- caller leaves the path exactly as unresolved as
+    before this fallback existed -- if the path doesn't match the "chain of
+    `.!HEXOID` segments and nothing else" shape at all, or if ANY segment
+    fails to resolve (a PARTIAL resolution, e.g. one real name and one
+    still-opaque hex OID, would be more misleading than an obviously-still-
+    unresolved path, not less).
+    """
+    segments = [s for s in path.split(".") if s]
+    if not segments:
+        return None
+    names = []
+    for seg in segments:
+        m = re.fullmatch(r"!([0-9A-Fa-f]{8})", seg)
+        if not m:
+            return None
+        oid = int(m.group(1), 16)
+        name = hex_oid_map.get(oid)
+        if not name:
+            return None
+        names.append(name)
+    return "." + ".".join(names)
+
+
+def _resolve_io_tag_comments(tags: List[Tag], data_types_map: Dict[str, "DataType"],
+                              hex_oid_map: Dict[int, str]) -> None:
+    """Resolve every I/O tag's (a tag whose name contains `:`) own comment
+    paths from their raw, hex-OID-based storage form into full Studio 5000
+    addresses (e.g. `"Remote_Moulder046:1:I.Pt15.Data"`), mutating each
+    tag's `_comments` list in place. Extracted out of `ControllerBuilder.build()`
+    as its own function so it's independently unit-testable against plain
+    `Tag`/`DataType`/`Member` objects, without needing a full synthetic
+    Comps.Dat/comments-table setup.
+
+    `data_member`/`array_member` are found via the same narrow, explicitly-
+    scoped name heuristic documented at the top of this file ("excludes
+    members literally named Fault/Status when guessing which member of an
+    I/O module's UDT is 'the data member'") -- the ONE other name-based
+    heuristic in this codebase's whole parsing pipeline besides the
+    connection-type fallback.
+    """
+    for tag in tags:
+        if ":" not in tag.name:
+            continue
+        if not tag._comments:
+            continue
+        dt = data_types_map.get(tag.data_type.upper())
+        data_member = None
+        if dt:
+            for m in dt.members:
+                if m.bit_number is None and m.name.upper() not in ("FAULT", "STATUS"):
+                    data_member = m
+                    break
+            if data_member is None:
+                for m in dt.members:
+                    if m.bit_number is None:
+                        data_member = m
+                        break
+        resolved = []
+        for path, text in tag._comments:
+            if not path:
+                resolved.append((path, text))
+            elif path.startswith(".!"):
+                inner = path[2:]
+                if "[" in inner:
+                    # A literal array index is physically present in the
+                    # raw path text (type 16/17 bit-level I/O comments) --
+                    # find the first array member (dimension > 0) since
+                    # these references always target array elements like
+                    # Data[N]. The hex OID itself is never even looked up
+                    # for this shape -- only the bracketed digits matter.
+                    array_member = None
+                    if dt:
+                        for m in dt.members:
+                            if m.bit_number is None and m.dimension > 0:
+                                array_member = m
+                                break
+                    _dm = array_member or data_member
+                    if not _dm:
+                        resolved.append((path, text))
+                        continue
+                    if "." in inner and inner.index("[") < inner.rindex("."):
+                        hex_oid, bracket_part = inner.split("[", 1)
+                        array_idx, bit_part = bracket_part.rsplit(".", 1)
+                        array_idx = array_idx.rstrip("]")
+                        resolved.append((f"{tag.name}.{_dm.name}[{array_idx}].{bit_part}", text))
+                    else:
+                        hex_oid, suffix = inner.split("[", 1)
+                        suffix = suffix.rstrip("]")
+                        resolved.append((f"{tag.name}.{_dm.name}[{suffix}]", text))
+                else:
+                    # No literal array index anywhere in the path -- try
+                    # resolving it as a plain chain of member-name
+                    # references instead (see _resolve_hex_oid_chain's own
+                    # docstring for why this case exists and its
+                    # real-world discovery). Deliberately does NOT need
+                    # `_dm` at all -- unlike the bracket-shaped case above,
+                    # the chain resolves directly to real member names via
+                    # hex_oid_map, with no "guess which member is the data
+                    # member" heuristic involved. Falls back to leaving the
+                    # path exactly as unresolved as before if this doesn't
+                    # pan out, with a warning so an unresolved I/O tag
+                    # comment path is visible rather than silently opaque.
+                    chain = _resolve_hex_oid_chain(path, hex_oid_map)
+                    if chain:
+                        resolved.append((f"{tag.name}{chain}", text))
+                    else:
+                        log.warning(
+                            f"Tag {tag.name!r}: could not resolve I/O comment path "
+                            f"{path!r} to a real address -- left unresolved"
+                        )
+                        resolved.append((path, text))
+            elif path.startswith("!"):
+                if not data_member:
+                    resolved.append((path, text))
+                    continue
+                rest = path[1:]
+                if "." in rest:
+                    hex_oid, suffix = rest.split(".", 1)
+                    if data_member.dimension > 0:
+                        resolved.append((f"{tag.name}.{data_member.name}[{suffix}]", text))
+                    else:
+                        resolved.append((f"{tag.name}.{data_member.name}.{suffix}", text))
+                elif "[" in rest:
+                    hex_oid, suffix = rest.split("[", 1)
+                    suffix = suffix.rstrip("]")
+                    resolved.append((f"{tag.name}.{data_member.name}[{suffix}]", text))
+                else:
+                    resolved.append((path, text))
+            elif path.endswith("]"):
+                resolved.append((f"{tag.name}[{path}", text))
+            elif path.isdigit():
+                resolved.append((f"{tag.name}.{path}", text))
+            else:
+                resolved.append((path, text))
+        tag._comments = resolved
+
+
 @dataclass
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -476,77 +645,7 @@ class ControllerBuilder(L5xElementBuilder):
                 tags.append(tag)
 
         # Resolve comment paths to full Studio 5000 addresses for I/O tags
-        for tag in tags:
-            if ":" not in tag.name:
-                continue
-            if not tag._comments:
-                continue
-            dt = data_types_map.get(tag.data_type.upper())
-            data_member = None
-            if dt:
-                for m in dt.members:
-                    if m.bit_number is None and m.name.upper() not in ("FAULT", "STATUS"):
-                        data_member = m
-                        break
-                if data_member is None:
-                    for m in dt.members:
-                        if m.bit_number is None:
-                            data_member = m
-                            break
-            resolved = []
-            for path, text in tag._comments:
-                if not path:
-                    resolved.append((path, text))
-                elif path.startswith(".!"):
-                    # For .! references (type 16/17 bit-level I/O comments),
-                    # find the first array member (dimension > 0) since these
-                    # references always target array elements like Data[N].
-                    array_member = None
-                    if dt:
-                        for m in dt.members:
-                            if m.bit_number is None and m.dimension > 0:
-                                array_member = m
-                                break
-                    _dm = array_member or data_member
-                    if not _dm:
-                        resolved.append((path, text))
-                        continue
-                    inner = path[2:]
-                    if "[" in inner and "." in inner and inner.index("[") < inner.rindex("."):
-                        hex_oid, bracket_part = inner.split("[", 1)
-                        array_idx, bit_part = bracket_part.rsplit(".", 1)
-                        array_idx = array_idx.rstrip("]")
-                        resolved.append((f"{tag.name}.{_dm.name}[{array_idx}].{bit_part}", text))
-                    elif "[" in inner:
-                        hex_oid, suffix = inner.split("[", 1)
-                        suffix = suffix.rstrip("]")
-                        resolved.append((f"{tag.name}.{_dm.name}[{suffix}]", text))
-                    else:
-                        resolved.append((path, text))
-                elif path.startswith("!"):
-                    if not data_member:
-                        resolved.append((path, text))
-                        continue
-                    rest = path[1:]
-                    if "." in rest:
-                        hex_oid, suffix = rest.split(".", 1)
-                        if data_member.dimension > 0:
-                            resolved.append((f"{tag.name}.{data_member.name}[{suffix}]", text))
-                        else:
-                            resolved.append((f"{tag.name}.{data_member.name}.{suffix}", text))
-                    elif "[" in rest:
-                        hex_oid, suffix = rest.split("[", 1)
-                        suffix = suffix.rstrip("]")
-                        resolved.append((f"{tag.name}.{data_member.name}[{suffix}]", text))
-                    else:
-                        resolved.append((path, text))
-                elif path.endswith("]"):
-                    resolved.append((f"{tag.name}[{path}", text))
-                elif path.isdigit():
-                    resolved.append((f"{tag.name}.{path}", text))
-                else:
-                    resolved.append((path, text))
-            tag._comments = resolved
+        _resolve_io_tag_comments(tags, data_types_map, hex_oid_map)
 
         # Get the Program Collection and get the programs
         self._cur.execute(

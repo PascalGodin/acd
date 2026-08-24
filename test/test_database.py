@@ -6,7 +6,17 @@ import pytest
 from loguru import logger as loguru_logger
 
 from acd.database.dbextract import DbExtract
-from acd.l5x.elements import ControllerBuilder, ModuleBuilder, ProgramBuilder, RoutineBuilder
+from acd.l5x.elements import (
+    ControllerBuilder,
+    DataType,
+    Member,
+    ModuleBuilder,
+    ProgramBuilder,
+    RoutineBuilder,
+    Tag,
+    _resolve_hex_oid_chain,
+    _resolve_io_tag_comments,
+)
 from acd.l5x.export_l5x import (
     ExportL5x,
     _dedupe_comps_records,
@@ -770,3 +780,98 @@ def test_parse_records_repeated_identical_failure_only_warns_once(monkeypatch, c
     _parse_records("fake.Dat", parse_one, "FakeLabel")
     second = capsys.readouterr()
     assert "UNIQUE_REPEATED_FAILURE" not in second.err
+
+
+class TestResolveHexOidChain:
+    def test_resolves_two_segment_chain(self):
+        hex_oid_map = {0x02CA91B5: "Pt15", 0x0794E8EC: "Data"}
+        assert _resolve_hex_oid_chain(".!02CA91B5.!0794E8EC", hex_oid_map) == ".Pt15.Data"
+
+    def test_resolves_single_segment_chain(self):
+        hex_oid_map = {0x02CA91B5: "Pt15"}
+        assert _resolve_hex_oid_chain(".!02CA91B5", hex_oid_map) == ".Pt15"
+
+    def test_returns_none_when_a_segment_is_unresolvable(self):
+        # Only the first segment resolves -- a PARTIAL resolution is more
+        # misleading than leaving the whole thing unresolved.
+        hex_oid_map = {0x02CA91B5: "Pt15"}
+        assert _resolve_hex_oid_chain(".!02CA91B5.!0794E8EC", hex_oid_map) is None
+
+    def test_returns_none_for_malformed_segment(self):
+        hex_oid_map = {0x02CA91B5: "Pt15"}
+        assert _resolve_hex_oid_chain(".!02CA91B5.NotAHexOid", hex_oid_map) is None
+
+    def test_returns_none_for_empty_path(self):
+        assert _resolve_hex_oid_chain("", {}) is None
+
+    def test_returns_none_for_lowercase_hex_still_resolves(self):
+        # Lowercase hex digits must resolve the same as uppercase -- the raw
+        # path text case isn't guaranteed one way or the other.
+        hex_oid_map = {0x02CA91B5: "Pt15"}
+        assert _resolve_hex_oid_chain(".!02ca91b5", hex_oid_map) == ".Pt15"
+
+
+def _io_tag(name="Remote_Moulder046:1:I", data_type="AB:Generic:I:0", comments=None):
+    return Tag(name, name, "Base", data_type, None, "Read/Write", None, None,
+               _comments=comments or [])
+
+
+def test_resolve_io_tag_comments_resolves_double_hex_oid_chain():
+    # The literal reported bug: a module I/O tag's comment path stored as
+    # two chained ".!HEXOID" references (no literal array index anywhere)
+    # came back completely unresolved from db_list_tag_comments() --
+    # ".!02CA91B5.!0794E8EC" instead of a real, addressable
+    # "Remote_Moulder046:1:I.Pt15.Data" path.
+    data_type = DataType("AB:Generic:I:0", "AB:Generic:I:0", "ProductDefined", "IO", [])
+    tag = _io_tag(comments=[(".!02CA91B5.!0794E8EC", "SORTER STOP AT MOULDER")])
+    data_types_map = {"AB:GENERIC:I:0": data_type}
+    hex_oid_map = {0x02CA91B5: "Pt15", 0x0794E8EC: "Data"}
+
+    _resolve_io_tag_comments([tag], data_types_map, hex_oid_map)
+
+    assert tag._comments == [
+        ("Remote_Moulder046:1:I.Pt15.Data", "SORTER STOP AT MOULDER"),
+    ]
+
+
+def test_resolve_io_tag_comments_leaves_unresolvable_chain_unchanged_and_warns(capsys):
+    from acd.l5x.export_l5x import configure_logging as _configure_logging
+    _configure_logging(False)
+
+    data_type = DataType("AB:Generic:I:0", "AB:Generic:I:0", "ProductDefined", "IO", [])
+    tag = _io_tag(comments=[(".!02CA91B5.!0794E8EC", "SORTER STOP AT MOULDER")])
+    data_types_map = {"AB:GENERIC:I:0": data_type}
+    hex_oid_map = {}  # neither OID resolves
+
+    _resolve_io_tag_comments([tag], data_types_map, hex_oid_map)
+
+    assert tag._comments == [(".!02CA91B5.!0794E8EC", "SORTER STOP AT MOULDER")]
+    captured = capsys.readouterr()
+    assert "could not resolve I/O comment path" in captured.err
+
+
+def test_resolve_io_tag_comments_still_resolves_bracket_shaped_array_index():
+    # Regression coverage for the ALREADY-working case (unaffected by
+    # extracting this into its own function): a ".!HEXOID[N]" path, where
+    # only the literal bracketed digits matter -- the hex OID itself is
+    # never even looked up for this shape.
+    data_member = Member("Data", "Data", "DINT", 16, "Decimal", False, None, None, "Read/Write")
+    data_type = DataType("AB:Generic:I:0", "AB:Generic:I:0", "ProductDefined", "IO",
+                          [data_member])
+    tag = _io_tag(comments=[(".!02CA91B5[15]", "Some point comment")])
+    data_types_map = {"AB:GENERIC:I:0": data_type}
+
+    _resolve_io_tag_comments([tag], data_types_map, {})
+
+    assert tag._comments == [
+        ("Remote_Moulder046:1:I.Data[15]", "Some point comment"),
+    ]
+
+
+def test_resolve_io_tag_comments_skips_non_io_tags():
+    tag = Tag("MyRegularTag", "MyRegularTag", "Base", "DINT", "Decimal", "Read/Write", None, None,
+              _comments=[(".!02CA91B5.!0794E8EC", "should be left alone")])
+
+    _resolve_io_tag_comments([tag], {}, {})
+
+    assert tag._comments == [(".!02CA91B5.!0794E8EC", "should be left alone")]

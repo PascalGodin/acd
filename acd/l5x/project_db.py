@@ -2002,6 +2002,197 @@ class ProjectDB:
         """
         return _list_routines(self.to_controller(), program_name)
 
+    def get_datatype(self, name: str) -> dict:
+        """The current shape of one UDT -- name/family/cls/description plus
+        every member (name/data_type/dimension/radix/hidden/target/
+        bit_number/external_access/description), in declaration order.
+        Returns a plain dict, not a `DataType` object, matching
+        `get_routine()`'s own "self-contained, no rehydration needed by the
+        caller" convention.
+
+        Sourced DIRECTLY from `proj_data_types`/`proj_members` via SQL, NOT
+        via `to_controller()` -- unlike an AOI (see `get_aoi()`),
+        `proj_data_types` always holds EVERY real DataType in the project
+        (`_materialize()` walks `ctrl.data_types` in full, no v1 scope
+        limit the way `proj_aois` has), so there's no real-vs-DB-only split
+        to fall back for here. Added after a real report: inspecting a
+        single UDT's members (to disambiguate near-identical sibling array
+        types, or just check one member's shape) previously required a full
+        `to_controller()` rehydration -- every tag's value, every routine,
+        every AOI -- decoded just to answer "what members does this ONE
+        type have," repeated 10+ times in one real session.
+
+        Raises `KeyError` if no DataType named `name` exists.
+        """
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id, name, family, cls, description FROM proj_data_types "
+            "WHERE name=? COLLATE NOCASE",
+            (name,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No DataType named {name!r}")
+        dt_id, real_name, family, cls, description = row
+        member_rows = cur.execute(
+            "SELECT name, data_type_name, dimension, radix, hidden, target, bit_number, "
+            "external_access, description FROM proj_members WHERE data_type_id=? ORDER BY seq",
+            (dt_id,),
+        ).fetchall()
+        return {
+            "name": real_name,
+            "family": family,
+            "cls": cls,
+            "description": description,
+            "members": [
+                {
+                    "name": mname,
+                    "data_type": mdtype,
+                    "dimension": dim,
+                    "radix": radix,
+                    "hidden": bool(hidden),
+                    "target": target,
+                    "bit_number": bit_number,
+                    "external_access": ext_access,
+                    "description": mdesc,
+                }
+                for (mname, mdtype, dim, radix, hidden, target, bit_number, ext_access, mdesc)
+                in member_rows
+            ],
+        }
+
+    def list_datatypes(self) -> List[dict]:
+        """Name/family/cls/description/member_count for EVERY DataType in
+        the project, WITHOUT each one's own member list -- the
+        `get_datatype()` counterpart to `list_tags()`/`list_routines()`, for
+        a quick "does this exist, what's its shape at a glance" pass (e.g.
+        disambiguating several similarly-named UDTs) before fetching one in
+        full. SQL-direct, same reasoning as `get_datatype()` -- no
+        `to_controller()` rehydration needed.
+        """
+        rows = self._conn.execute(
+            "SELECT dt.name, dt.family, dt.cls, dt.description, COUNT(m.id) "
+            "FROM proj_data_types dt LEFT JOIN proj_members m ON m.data_type_id = dt.id "
+            "GROUP BY dt.id ORDER BY dt.name COLLATE NOCASE"
+        ).fetchall()
+        return [
+            {"name": name, "family": family, "cls": cls, "description": description,
+             "member_count": count}
+            for (name, family, cls, description, count) in rows
+        ]
+
+    def get_aoi(self, name: str) -> dict:
+        """The current shape of one AOI -- name/description/revision plus
+        every parameter (name/data_type/dimensions/usage/radix/required/
+        visible/external_access/description) and every local tag, in
+        declaration order. Returns a plain dict, not an `AOI` object, same
+        convention as `get_datatype()`/`get_routine()`.
+
+        Tries `proj_aois` first (an AOI created via `new_aoi()`/
+        `db_new_aoi()` in THIS project DB) -- cheap, SQL-direct, no
+        rehydration. FALLS BACK to a full `to_controller()` rehydration ONLY
+        when not found there, which covers a REAL, pre-existing project
+        AOI (never stored in `proj_aois` at all, see `_load_aois()`'s own
+        docstring for why) -- the same fast-path/fallback shape
+        `get_routine()` already uses for the equivalent Program-routine vs.
+        AOI-routine split.
+
+        Raises `KeyError` if no AOI named `name` exists either way.
+        """
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id, name, description, revision FROM proj_aois WHERE name=? COLLATE NOCASE",
+            (name,),
+        ).fetchone()
+        if row is None:
+            project = self.to_controller()
+            aoi = next(
+                (a for a in (project.controller.aois or []) if a.name.upper() == name.upper()),
+                None,
+            )
+            if aoi is None:
+                raise KeyError(f"No AOI named {name!r}")
+            return {
+                "name": aoi.name,
+                "description": aoi._description,
+                "revision": aoi.revision,
+                "parameters": [
+                    {
+                        "name": p.name, "data_type": p.data_type, "dimensions": p.dimensions,
+                        "usage": p.usage, "radix": p.radix, "required": p.required,
+                        "visible": p.visible, "external_access": p.external_access,
+                        "description": p._description,
+                    }
+                    for p in aoi.parameters
+                ],
+                "local_tags": [
+                    {
+                        "name": lt.name, "data_type": lt.data_type, "dimensions": lt.dimensions,
+                        "radix": lt.radix, "external_access": lt.external_access,
+                        "description": lt._description,
+                    }
+                    for lt in aoi.local_tags
+                ],
+            }
+        aoi_id, real_name, description, revision = row
+        param_rows = cur.execute(
+            "SELECT name, data_type_name, dimensions, radix, usage, required, visible, "
+            "external_access, constant, description FROM proj_aoi_parameters "
+            "WHERE aoi_id=? ORDER BY seq",
+            (aoi_id,),
+        ).fetchall()
+        lt_rows = cur.execute(
+            "SELECT name, data_type_name, dimensions, radix, external_access, description "
+            "FROM proj_aoi_local_tags WHERE aoi_id=? ORDER BY seq",
+            (aoi_id,),
+        ).fetchall()
+        return {
+            "name": real_name,
+            "description": description,
+            "revision": revision,
+            "parameters": [
+                {
+                    "name": pname, "data_type": dtype, "dimensions": dims, "usage": usage,
+                    "radix": radix, "required": required, "visible": visible,
+                    "external_access": ext_access, "description": pdesc,
+                }
+                for (pname, dtype, dims, radix, usage, required, visible, ext_access, _constant,
+                     pdesc) in param_rows
+            ],
+            "local_tags": [
+                {
+                    "name": ltname, "data_type": dtype, "dimensions": dims, "radix": radix,
+                    "external_access": ext_access, "description": ltdesc,
+                }
+                for (ltname, dtype, dims, radix, ext_access, ltdesc) in lt_rows
+            ],
+        }
+
+    def list_aois(self) -> List[dict]:
+        """Name/description/revision/parameter_count for EVERY AOI in the
+        project (both real, pre-existing ones AND any created via
+        `new_aoi()`/`db_new_aoi()` in this project DB) -- the `get_aoi()`
+        counterpart to `list_datatypes()`.
+
+        Unlike `list_datatypes()`, this DOES pay for a full
+        `to_controller()` rehydration -- same reasoning as `list_routines()`
+        (see its own docstring): `proj_aois` never holds a real project's
+        own pre-existing AOIs (v1 scope limit), so a SQL-only listing here
+        would silently omit every real AOI, which is worse for a "what AOIs
+        exist" call than the one-time decode cost. Prefer `get_aoi()`
+        directly (or `db_get_project_summary()`'s own AOI name list) over
+        looping this.
+        """
+        project = self.to_controller()
+        return [
+            {
+                "name": a.name,
+                "description": a._description,
+                "revision": a.revision,
+                "parameter_count": len(a.parameters),
+            }
+            for a in (project.controller.aois or [])
+        ]
+
     def tag_exists(self, name: str, program_name: Union[str, None] = None) -> bool:
         return _tag_exists(self.to_controller(), name, program_name)
 
@@ -2102,8 +2293,9 @@ class ProjectDB:
                        offset: int = 0, limit: int = 50) -> dict:
         return _get_tag_value(self.to_controller(), tag_name, program_name, offset, limit)
 
-    def find_tag_references(self, name: str, regex: bool = False) -> List[tuple]:
-        return _find_tag_references(self.to_controller(), name, regex)
+    def find_tag_references(self, name: str, regex: bool = False,
+                             include_text: bool = True) -> List[tuple]:
+        return _find_tag_references(self.to_controller(), name, regex, include_text)
 
     def io_addresses_by_routine(self) -> dict:
         return _io_addresses_by_routine(self.to_controller())
@@ -2402,6 +2594,26 @@ def db_list_routines(acd_path, program_name: Union[str, None] = None, project_di
     return _run(acd_path, project_dir, verbose, lambda db: db.list_routines(program_name))
 
 
+def db_get_datatype(acd_path, name: str, project_dir=None, verbose: bool = False) -> dict:
+    """Stateless equivalent of `ProjectDB.get_datatype()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose, lambda db: db.get_datatype(name))
+
+
+def db_list_datatypes(acd_path, project_dir=None, verbose: bool = False) -> List[dict]:
+    """Stateless equivalent of `ProjectDB.list_datatypes()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose, lambda db: db.list_datatypes())
+
+
+def db_get_aoi(acd_path, name: str, project_dir=None, verbose: bool = False) -> dict:
+    """Stateless equivalent of `ProjectDB.get_aoi()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose, lambda db: db.get_aoi(name))
+
+
+def db_list_aois(acd_path, project_dir=None, verbose: bool = False) -> List[dict]:
+    """Stateless equivalent of `ProjectDB.list_aois()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose, lambda db: db.list_aois())
+
+
 def db_tag_exists(acd_path, name: str, program_name: Union[str, None] = None,
                    project_dir=None, verbose: bool = False) -> bool:
     """Stateless equivalent of `ProjectDB.tag_exists()` -- see its docstring."""
@@ -2437,10 +2649,13 @@ def db_get_tag_value(acd_path, tag_name: str, program_name: Union[str, None] = N
                 lambda db: db.get_tag_value(tag_name, program_name, offset, limit))
 
 
-def db_find_tag_references(acd_path, name: str, regex: bool = False, project_dir=None,
-                            verbose: bool = False) -> List[tuple]:
-    """Stateless equivalent of `ProjectDB.find_tag_references()` -- see its docstring."""
-    return _run(acd_path, project_dir, verbose, lambda db: db.find_tag_references(name, regex))
+def db_find_tag_references(acd_path, name: str, regex: bool = False, include_text: bool = True,
+                            project_dir=None, verbose: bool = False) -> List[tuple]:
+    """Stateless equivalent of `ProjectDB.find_tag_references()` -- see its
+    docstring, and `acd.api.find_tag_references()`'s own docstring for the
+    `include_text=False` shape (returns 3-tuples instead of 4-tuples)."""
+    return _run(acd_path, project_dir, verbose,
+                lambda db: db.find_tag_references(name, regex, include_text))
 
 
 def db_io_addresses_by_routine(acd_path, project_dir=None, verbose: bool = False) -> dict:

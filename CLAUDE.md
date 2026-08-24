@@ -4230,6 +4230,116 @@ direct confirmation). Caught quickly here because the user could check Studio di
 file's own history as a reminder rather than quietly deleted, per this project's existing convention of
 retracting wrong conclusions in place rather than erasing them.
 
+## Fourth `db_*` API feedback round: scoped DataType/AOI lookups, `include_text=False`, array-bounds validation
+
+A downstream agent gave direct, unprompted feedback on `db_*` token efficiency and a couple of
+real bugs after a real session (10+ scoped-lookup pain points, a broad-search token cost, and two
+real out-of-bounds array bugs neither `validate=True` check caught). Four items, three addressed:
+
+**1. No scoped lookup for a single AOI or DataType — biggest token cost.** `db_get_routine(name)`
+already exists and is cheap (SQL-direct, see "Persistent project DB" above), but there was no
+equivalent for one AOI or one UDT: the only way to inspect `SomeUDT`'s members or `SomeAOI`'s
+parameters was `db_to_controller()`, decoding the ENTIRE project (every tag, every routine, every
+AOI/UDT — ~30,000 Comps records in the reporting project) to answer one narrow question. The
+agent hit this 10+ times in one session disambiguating near-identical sibling UDT array types and
+checking individual AOI parameter lists.
+
+Added `db_get_datatype(acd_path, name)` / `ProjectDB.get_datatype(name)` and `db_list_datatypes(acd_path)`
+/ `ProjectDB.list_datatypes()` (`acd/l5x/project_db.py`) — both SQL-direct against
+`proj_data_types`/`proj_members`, no `to_controller()` call at all. Unlike `get_aoi()` below, there
+is no fast-path/fallback split needed here: `proj_data_types` already holds EVERY real DataType in
+the project (`_materialize()` walks `ctrl.data_types` in full, with no v1 scope limit the way
+`proj_aois` has — see "Persistent project DB"'s own schema notes). `get_datatype()` returns a plain
+dict (`name`/`family`/`cls`/`description`/`members`, each member a dict), matching `get_routine()`'s
+own "self-contained, no rehydration needed by the caller" convention. `list_datatypes()` is the
+`list_tags()`/`list_routines()`-shaped summary counterpart — name/family/cls/description/
+`member_count`, no member list — for a "does this exist, what's its shape at a glance" pass before
+committing to a full `get_datatype()` call.
+
+Added `db_get_aoi(acd_path, name)` / `ProjectDB.get_aoi(name)` and `db_list_aois(acd_path)` /
+`ProjectDB.list_aois()` the same way, but with the fast-path/fallback split `get_routine()` already
+established for the equivalent Program-vs-AOI-routine case: `get_aoi()` tries `proj_aois` first
+(SQL-direct, an AOI created via `new_aoi()`/`db_new_aoi()` in THIS project DB), and falls back to a
+full `to_controller()` rehydration ONLY when not found there — which covers a REAL, pre-existing
+project AOI (never stored in `proj_aois` at all, per its own v1-scope docstring). `list_aois()`
+always pays the full-rehydration cost, same reasoning as `list_routines()`'s own docstring: a
+SQL-only listing would silently omit every real AOI, which is a worse failure mode for a
+"what exists" call than the one-time decode cost.
+
+**2. `db_find_tag_references()` always returns full line text.** For a broad exploratory search
+(the agent's own example: searching "horn" project-wide) where the caller only wants a count or a
+list of locations to decide where to look closer, paying for full rung/ST text on every hit — text
+about to be discarded immediately — is pure waste. Added `include_text: bool = True` to
+`find_tag_references()` (`acd/api.py`), `ProjectDB.find_tag_references()`, and
+`db_find_tag_references()` — `include_text=False` returns `(program, routine, line_index)` 3-tuples
+instead of the default `(program, routine, line_index, text)` 4-tuples. Same underlying search
+(the compiled regex still has to scan every line's text either way — this saves on what's
+returned/serialized to the caller, not the search itself), so the two modes report exactly the same
+hits, just with or without the text field.
+
+**3. Array-bounds mismatches weren't caught anywhere — real bugs, not just token cost.** Two real
+bugs in the same session: `Tray_Accum_Motor`/`Tray_Storage_Motor` sized `[11]` while routines
+already referenced index `11` (valid range 0-10, so this was a genuine one-past-the-end bug caught
+only by a human), and a separate manual resize of `Bin_Tipple_Advance` (48 -> 50) needed to match a
+sibling array. Neither was caught by `validate=True` on export — `_validate_rll_rung_syntax()`
+checks bracket/branch-group syntax, and `_validate_tag_types_resolve()` checks struct-typed name
+resolution; neither has anything to do with whether a literal array index is actually in range for
+the tag's own declared size.
+
+Added `_validate_array_bounds(lines, tags)` (`acd/api.py`), wired into `validate=True` for both
+`export_routine()` and `export_program()` (and therefore `db_export_routine()`/`db_export_program()`,
+which default `validate=True`). Deliberately narrow, matching `_validate_rll_rung_syntax()`'s own
+"syntax lint, not a real interpreter" framing — NOT a full ladder-logic evaluator:
+- Only a LITERAL integer index (`MyArray[5]`) is checked; a variable/expression index
+  (`MyArray[i]`, `MyArray[SomeOtherTag]`) is silently skipped, since its runtime value can't be
+  known from static text alone.
+- Only checks a reference against a tag whose own `.dimensions` was supplied (the referenced
+  controller-scope/program-scope tags already collected for the rest of `validate=True` — a UDT
+  member's own array bound isn't checked, since that needs the member's own `Dimension`, not the
+  top-level tag's).
+- `TagName[N]` only matches when `[` immediately follows the tag name with nothing in between —
+  `MyTag.Member[5]` is a member's own array index, correctly NOT checked against `MyTag`'s own
+  bounds at all (the same "immediately-adjacent-`[`" convention `_validate_rll_rung_syntax()`
+  already uses to distinguish an array index from a branch group).
+- A multi-dimensional reference (`MyArray[2,3]`) is only checked when the reference supplies the
+  same number of comma-separated indices as the tag declares dimensions — a mismatched count is
+  silently skipped rather than guessed at.
+
+Raises `ValueError` naming the tag, the offending index, and the valid range on the first
+out-of-bounds reference found — e.g. `"Tag 'Tray_Accum_Motor' is indexed at 11 in
+'Tray_Accum_Motor[11]', but its declared Dimensions='11' only allows indices 0..10..."`.
+
+**4. Smaller frictions, deliberately left as-is this round** (per the report's own "not urgent"
+framing): no `db_edit_aoi_parameter()`/`db_delete_aoi_parameter()` (a parameter added wrong today
+can only be fixed via Studio's own AOI editor after import — a real, known gap, not addressed
+here); no documented way to set a nested initial value for one element of an array-of-struct tag at
+creation time (`StartFaultTimer.PRE` per motor, for an `[11]`/`[12]`/`[50]`-element array of
+structs) — left at the type default for manual tuning, same as the reporting agent's own workaround;
+the rebuild-warning log noise (`"skipped N unparseable records"`, the dirty-discard warning) printing
+in full on every triggering rebuild across a long session, not just once — genuinely useful content,
+just repetitive, not addressed here either. None of these three are forgotten; they just didn't rise
+to "worth a code change" this round per the report's own framing.
+
+Covered by, in `test/test_api.py`: `TestValidateArrayBounds` (the pure `_validate_array_bounds()`
+function — in-bounds/out-of-bounds/negative-or-zero-dimension/variable-index/scalar-tag/
+member-array-index/multi-dim in-bounds/multi-dim out-of-bounds/mismatched-index-count/no-array-tags/
+empty-lines cases), `test_export_program_validate_rejects_out_of_bounds_array_index`,
+`test_export_program_validate_accepts_in_bounds_array_index`,
+`test_export_routine_validate_rejects_out_of_bounds_array_index`,
+`test_export_program_validate_false_does_not_check_array_bounds`, and
+`test_find_tag_references_include_text_false_returns_3_tuples`. In `test/test_project_db.py`:
+`test_get_datatype_returns_members_without_full_rehydration` (spies on `ControllerBuilder.build` to
+confirm it's never called — same technique as `test_get_routine_does_not_rehydrate_full_controller`),
+`test_get_datatype_missing_raises_key_error`, `test_list_datatypes_includes_real_and_new_types_with_member_counts`,
+`test_db_get_datatype_and_list_datatypes_stateless_wrappers`, `test_get_aoi_fast_path_for_db_created_aoi`,
+`test_get_aoi_falls_back_to_rehydration_for_real_pre_existing_aoi` (against the real AOI in the
+`ACDTestsWithAOI.ACD` fixture, name resolved dynamically rather than hardcoded — matching this
+file's own existing convention for that fixture), `test_get_aoi_missing_raises_key_error`,
+`test_list_aois_includes_real_and_new_aois`, `test_db_get_aoi_and_list_aois_stateless_wrappers`,
+`test_db_export_program_validate_rejects_out_of_bounds_array_index`,
+`test_db_export_program_validate_accepts_in_bounds_array_index`, and
+`test_db_find_tag_references_include_text_false_returns_3_tuples`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

@@ -31,6 +31,7 @@ from acd.api import (
     replace_st_line_safe,
     tag_exists,
     _sync_data_types_map,
+    _validate_array_bounds,
 )
 from acd.l5x.elements import (
     DataType,
@@ -1387,6 +1388,16 @@ def test_find_tag_references_regex_mode():
     assert keys == {("ProgA", "Main"), ("ProgA", "Sub")}
 
 
+def test_find_tag_references_include_text_false_returns_3_tuples():
+    project = _mock_project()
+    with_text = find_tag_references(project, "Foo")
+    without_text = find_tag_references(project, "Foo", include_text=False)
+    assert all(len(r) == 4 for r in with_text)
+    assert all(len(r) == 3 for r in without_text)
+    # Same hits, just the text dropped -- not a different search.
+    assert {(p, r, i) for p, r, i, _ in with_text} == set(without_text)
+
+
 def test_get_project_summary_is_names_and_counts_only():
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
     summary = get_project_summary(project)
@@ -1734,6 +1745,100 @@ def test_export_program_validate_false_does_not_check_rll_syntax(tmp_path):
     export_program(project, program, str(tmp_path / "bad.L5X"), validate=False)
 
     assert (tmp_path / "bad.L5X").exists()
+
+
+def test_export_program_validate_rejects_out_of_bounds_array_index(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+    array_tag = new_tag("SmallArray", "DINT", dimensions="3")
+    program.tags.append(array_tag)
+    program.routines[0].rungs.append("MOV(SmallArray[3],1);")
+
+    with pytest.raises(ValueError, match=r"'SmallArray'.*indexed at 3.*0\.\.2"):
+        export_program(project, program, str(tmp_path / "bad.L5X"), validate=True)
+
+
+def test_export_program_validate_accepts_in_bounds_array_index(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+    array_tag = new_tag("SmallArray", "DINT", dimensions="3")
+    program.tags.append(array_tag)
+    program.routines[0].rungs.append("MOV(SmallArray[2],1);")
+
+    export_program(project, program, str(tmp_path / "ok.L5X"), validate=True)
+    assert (tmp_path / "ok.L5X").exists()
+
+
+def test_export_routine_validate_rejects_out_of_bounds_array_index(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+    routine = program.routines[0]
+    array_tag = new_tag("SmallArray2", "DINT", dimensions="3")
+    program.tags.append(array_tag)
+    routine.rungs.append("MOV(SmallArray2[3],1);")
+
+    with pytest.raises(ValueError, match=r"'SmallArray2'.*indexed at 3.*0\.\.2"):
+        export_routine(project, routine, str(tmp_path / "bad.L5X"), validate=True)
+
+
+def test_export_program_validate_false_does_not_check_array_bounds(tmp_path):
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    program = next(p for p in project.controller.programs if p.name == "Branching")
+    array_tag = new_tag("SmallArray3", "DINT", dimensions="3")
+    program.tags.append(array_tag)
+    program.routines[0].rungs.append("MOV(SmallArray3[99],1);")
+
+    export_program(project, program, str(tmp_path / "bad.L5X"), validate=False)
+    assert (tmp_path / "bad.L5X").exists()
+
+
+class TestValidateArrayBounds:
+    def _tag(self, name, dimensions):
+        from types import SimpleNamespace
+        return SimpleNamespace(name=name, dimensions=dimensions)
+
+    def test_in_bounds_index_is_a_noop(self):
+        _validate_array_bounds(["MOV(MyArray[2],X);"], [self._tag("MyArray", "3")])
+
+    def test_out_of_bounds_index_raises(self):
+        with pytest.raises(ValueError, match=r"'MyArray'.*indexed at 3.*0\.\.2"):
+            _validate_array_bounds(["MOV(MyArray[3],X);"], [self._tag("MyArray", "3")])
+
+    def test_negative_dimension_is_never_flagged(self):
+        # Dimensions="0" (or unparsable) means no real declared size --
+        # skip entirely rather than flag every index as out of bounds.
+        _validate_array_bounds(["MOV(MyArray[0],X);"], [self._tag("MyArray", "0")])
+
+    def test_variable_index_is_silently_skipped(self):
+        _validate_array_bounds(["MOV(MyArray[SomeOtherTag],X);"], [self._tag("MyArray", "3")])
+
+    def test_scalar_tag_no_dimensions_is_skipped(self):
+        _validate_array_bounds(["MOV(MyScalar,X);"], [self._tag("MyScalar", None)])
+
+    def test_member_array_index_not_checked_against_tag_own_bounds(self):
+        # "MyTag.Member[5]" is Member's own array index, not MyTag's --
+        # must not be checked against MyTag's declared Dimensions at all.
+        _validate_array_bounds(["MOV(MyTag.Member[5],X);"], [self._tag("MyTag", "1")])
+
+    def test_multidim_in_bounds(self):
+        _validate_array_bounds(
+            ["MOV(MyArray[1,2],X);"], [self._tag("MyArray", "3,3")]
+        )
+
+    def test_multidim_out_of_bounds_second_dimension(self):
+        with pytest.raises(ValueError, match=r"'MyArray'.*indexed at 3.*0\.\.2"):
+            _validate_array_bounds(["MOV(MyArray[1,3],X);"], [self._tag("MyArray", "3,3")])
+
+    def test_mismatched_index_count_is_silently_skipped(self):
+        # Reference supplies 1 index, tag declares 2 dimensions -- don't
+        # guess, just skip.
+        _validate_array_bounds(["MOV(MyArray[5],X);"], [self._tag("MyArray", "3,3")])
+
+    def test_no_array_tags_is_a_fast_noop(self):
+        _validate_array_bounds(["MOV(AnythingAtAll[999],X);"], [])
+
+    def test_empty_lines_are_skipped(self):
+        _validate_array_bounds([None, "", "MOV(MyArray[2],X);"], [self._tag("MyArray", "3")])
 
 
 class TestValidateRllRungSyntax:

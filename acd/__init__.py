@@ -66,15 +66,41 @@ step, so a call never returns more than actually asked for:
     `db_get_tag_value()` for one tag's value, only when actually needed.
   - `db_get_tag_value(acd_path, tag_name, program_name=None, offset=0,
     limit=50)` -- one tag's value, paginated if it's a large array.
+  - `db_list_datatypes(acd_path)` -- name/family/cls/description/
+    member_count for EVERY UDT, WITHOUT each one's own member list -- then
+    `db_get_datatype(acd_path, name)` for one type's actual members
+    (name/data_type/dimension/radix/hidden/target/bit_number/
+    external_access/description, in declaration order). Both are
+    SQL-direct, no full-project rehydration -- added after a real report
+    that inspecting a single UDT's members (e.g. disambiguating several
+    near-identical sibling array types) previously forced a full
+    `db_to_controller()` decode every time, repeated 10+ times in one real
+    session.
+  - `db_list_aois(acd_path)` -- name/description/revision/parameter_count
+    for EVERY AOI (real, pre-existing ones AND any created via
+    `db_new_aoi()`) -- then `db_get_aoi(acd_path, name)` for one AOI's
+    actual parameters + local tags. `db_get_aoi()` is cheap/SQL-direct for
+    an AOI created via `db_new_aoi()` in this project DB, falling back to a
+    full rehydration only for a real, pre-existing project AOI (same
+    fast-path/fallback shape as `db_get_routine()`); `db_list_aois()`
+    itself always pays the full-rehydration cost, same reasoning as
+    `db_list_routines()` (a real AOI isn't tracked in the DB's own tables
+    at all, see CLAUDE.md).
   - `db_tag_exists(acd_path, name, program_name=None)` -- pre-creation
     collision check in a given scope (controller by default).
-  - `db_find_tag_references(acd_path, name, regex=False)` -- every
-    (program, routine, line_index, text) where a tag/member name is
+  - `db_find_tag_references(acd_path, name, regex=False, include_text=True)`
+    -- every (program, routine, line_index, text) where a tag/member name is
     referenced, project-wide, in ONE call -- e.g. to check whether a name
     is already used before reusing it, or to find every place a tag/routine
     is referenced before converting/renaming it. `regex=True` matches a
     substring/family of names (e.g. `name=r"Str_Pad"` to match
     `Str_Pad_A`/`Str_Pad_B`/...) instead of the default whole-token match.
+    Pass `include_text=False` for a broad exploratory "how many, where"
+    pass (e.g. searching a common word across a whole project) -- returns
+    (program, routine, line_index) 3-tuples instead of paying for full
+    rung/ST text on every hit you're about to discard anyway; fetch the
+    actual text afterward (`db_get_routine()`) only for the handful of
+    hits you actually want to look at closer.
     **Prefer this over hand-looping `db_get_routine()`/`db_list_routines()`
     over every routine yourself** -- see "SCANNING EVERY ROUTINE" below.
   - `db_io_addresses_by_routine(acd_path)` -- every routine's I/O
@@ -298,17 +324,22 @@ EXPORTING TO REAL STUDIO 5000 -- the only durable write path (see above).
 they run is cheap relative to a full edit -> export -> Studio-import round
 trip, and the failure modes they catch (a struct-typed name that doesn't
 resolve, silently rendered as a bare zero instead of a real nested
-structure; for `db_export_routine`, malformed RLL rung syntax -- see
-`db_insert_rung` above) are silent/late, not loud errors up front, which
-is the wrong kind of thing to leave opt-in. Pass `validate=False`
-explicitly if you're confident it's unnecessary and want to skip the pass:
+structure; for `db_export_routine`/`db_export_program`, malformed RLL rung
+syntax and an out-of-bounds literal array index -- see `db_insert_rung`
+above) are silent/late, not loud errors up front, which is the wrong kind
+of thing to leave opt-in. Pass `validate=False` explicitly if you're
+confident it's unnecessary and want to skip the pass:
   - `db_export_routine(acd_path, routine_name, output_path,
     program_name=None, aoi_name=None, owner=None, validate=True)` -- a
     standalone partial L5X for Studio's "Import Routine" feature, covering
     both rung edits and any tag this routine's logic references. Validates
     every struct-typed name reachable from a referenced tag's own DataType
-    tree, AND (for an RLL routine) every rung's syntax via
-    `_validate_rll_rung_syntax()`. `aoi_name` is accepted for signature
+    tree, every rung's syntax via `_validate_rll_rung_syntax()` (RLL only),
+    AND every literal-indexed array reference (`MyArray[5]`) against the
+    referenced tag's own declared `Dimensions` -- a variable/expression
+    index (`MyArray[i]`) is silently skipped, not flagged; found after two
+    real reports of a sized-too-small array only a human happened to catch.
+    `aoi_name` is accepted for signature
     symmetry with the routine-content functions above but ALWAYS raises --
     Studio has no "Import Routine" mechanism for a routine living inside an
     AddOnInstructionDefinition; use `db_export_aoi()` for an AOI's routine
@@ -428,6 +459,10 @@ from acd.l5x.project_db import (  # noqa: F401
     db_export_program,
     db_list_tags,
     db_list_routines,
+    db_get_datatype,
+    db_list_datatypes,
+    db_get_aoi,
+    db_list_aois,
     db_tag_exists,
     db_get_project_summary,
     db_to_controller,

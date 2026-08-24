@@ -490,8 +490,8 @@ def tag_exists(project: RSLogix5000Content, name: str, program_name: str = None)
 
 
 def find_tag_references(
-    project: RSLogix5000Content, name: str, regex: bool = False
-) -> List[Tuple[str, str, int, str]]:
+    project: RSLogix5000Content, name: str, regex: bool = False, include_text: bool = True
+) -> Union[List[Tuple[str, str, int, str]], List[Tuple[str, str, int]]]:
     """Find every place a tag/member name is referenced in rung (RLL) or
     line (ST) text, project-wide -- instead of hand-writing the nested
     programs -> routines -> rungs substring scan every time you need to
@@ -510,14 +510,27 @@ def find_tag_references(
     ".MyTag_Old". Pass `regex=True` to supply your own pattern instead (e.g.
     a family of names, or an address suffix like `r"\\.MemberName\\b"`) --
     `name` is then used as a raw `re` pattern, not escaped.
+
+    Pass `include_text=False` for an exploratory "how many, where" pass
+    (e.g. a broad substring/regex search across a whole project) where the
+    caller only needs a count or a list of locations to decide where to look
+    closer, not the full line text of every hit -- returns
+    (program_name, routine_name, line_index) 3-tuples instead of the default
+    4-tuples, so a broad hit doesn't come with full rung/ST text the caller
+    was about to discard anyway. Added after a real report: a broad search
+    (e.g. "horn") across a large project returned full text for every match
+    when only a location list was actually needed for that first pass.
     """
     pattern = name if regex else r"\b" + re.escape(name) + r"\b"
     compiled = re.compile(pattern)
-    results: List[Tuple[str, str, int, str]] = []
+    results: List[tuple] = []
     for (program_name, routine_name), routine in _all_routines(project).items():
         for i, text in enumerate(_routine_lines(routine) or []):
             if text and compiled.search(text):
-                results.append((program_name, routine_name, i, text))
+                if include_text:
+                    results.append((program_name, routine_name, i, text))
+                else:
+                    results.append((program_name, routine_name, i))
     return results
 
 
@@ -949,6 +962,82 @@ def _referenced_tag_names(rung_texts) -> set:
     return names
 
 
+def _validate_array_bounds(lines, tags) -> None:
+    """Flag a literal, compile-time-constant-indexed array reference
+    (`SomeArray[11]`) whose index is out of bounds for the referenced tag's
+    own declared `Dimensions` -- e.g. `Tray_Accum_Motor[11]` when
+    `Tray_Accum_Motor` is only declared `Dimensions="11"` (valid indices are
+    0..10, so index 11 is one past the end).
+
+    Added after two real, reported bugs that neither `_validate_rll_rung_syntax()`
+    nor `_validate_tag_types_resolve()` catches (see CLAUDE.md's "AOI
+    parameter order"/array-bounds feedback round): an array sized one too
+    small for routines that already reference its last (out-of-bounds) index,
+    and a sibling array that fell out of sync in size with a related one --
+    both only caught by a human noticing, not by `validate=True`.
+
+    This is a narrow syntax-level lint, like `_validate_rll_rung_syntax()` --
+    NOT a real ladder-logic interpreter:
+    - Only a LITERAL integer index (`MyArray[5]`) is checked; a
+      variable/expression index (`MyArray[i]`, `MyArray[SomeTag]`) is
+      silently skipped, since its runtime value can't be known here.
+    - A reference is only checked against a tag whose own `.dimensions` this
+      call was given (top-level tags only -- a UDT member's own array bound
+      isn't checked, since that needs the member's own Dimension, not the
+      top-level tag's).
+    - A multi-dimensional reference (`MyArray[2,3]`) is only checked when
+      the number of comma-separated indices in the reference matches the
+      number of comma-separated dimensions the tag declares -- a mismatched
+      count is silently skipped rather than guessed at.
+    - `TagName[N]` only matches when `[` immediately follows the tag name
+      (no `.Member` in between) -- `MyTag.Member[5]` is a member's own array
+      index, not `MyTag`'s, and is correctly not checked against `MyTag`'s
+      own dimensions at all.
+
+    Raises ValueError naming the tag, the offending index, and the valid
+    range on the first out-of-bounds reference found.
+    """
+    dim_by_name: Dict[str, List[int]] = {}
+    for t in tags:
+        if not t.dimensions:
+            continue
+        try:
+            dims = [int(d.strip()) for d in t.dimensions.split(",")]
+        except ValueError:
+            continue
+        if dims and all(d > 0 for d in dims):
+            dim_by_name[t.name] = dims
+
+    if not dim_by_name:
+        return
+
+    ref_re = re.compile(
+        r"\b(" + "|".join(re.escape(n) for n in dim_by_name) + r")\[([\d,\s]+)\]"
+    )
+    for text in lines:
+        if not text:
+            continue
+        for m in ref_re.finditer(text):
+            name = m.group(1)
+            dims = dim_by_name[name]
+            try:
+                indices = [int(x.strip()) for x in m.group(2).split(",")]
+            except ValueError:
+                continue
+            if len(indices) != len(dims):
+                continue
+            for idx, size in zip(indices, dims):
+                if idx < 0 or idx >= size:
+                    raise ValueError(
+                        f"Tag {name!r} is indexed at {idx} in {m.group(0)!r}, but its "
+                        f"declared Dimensions={','.join(str(d) for d in dims)!r} only "
+                        f"allows indices 0..{size - 1} -- this looks like a real "
+                        f"out-of-bounds array reference (only literal integer indices "
+                        f"are checked, so this is not a false positive from a variable "
+                        f"index)."
+                    )
+
+
 def _referenced_modules(rung_texts, project: RSLogix5000Content) -> list:
     """Resolve which Module dependencies a routine's rung text needs, the
     same way Studio's own "Export Routine" does (confirmed against a real
@@ -1293,10 +1382,15 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
             one-member `"[...]"` branch group left over after an edit
             removed its sibling) -- this is a narrow syntax lint, NOT a
             real ladder-logic grammar checker, and has nothing to do with
-            check (1); a rung can pass one and fail the other independently.
-            Off by default (matches every existing caller's behavior
-            unchanged) since both are an extra pass over the routine/type
-            graph on every call.
+            check (1); a rung can pass one and fail the other independently;
+            (3) every LITERAL-indexed array reference (`MyArray[5]`) among
+            the referenced tags is checked against that tag's own declared
+            `Dimensions` via `_validate_array_bounds()` -- catches a sized-
+            too-small array a routine already indexes past the end of. A
+            variable/expression index (`MyArray[i]`) is silently skipped,
+            not flagged. Off by default (matches every existing caller's
+            behavior unchanged) since all three are an extra pass over the
+            routine/type graph on every call.
 
     Raises:
         ValueError: if `routine` isn't found in any program of `project`, or
@@ -1514,6 +1608,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
                     _validate_rll_rung_syntax(rung_text)
                 except ValueError as e:
                     raise ValueError(f"Rung {i} of routine {routine.name!r}: {e}") from e
+        _validate_array_bounds(routine_lines, controller_tags + program_tags)
 
     Path(output_path).write_text(xml, encoding="utf-8")
 
@@ -1594,12 +1689,15 @@ def export_program(project: RSLogix5000Content, program: Program, output_path,
             `project.controller.programs`.
         output_path: Destination `.L5X` file path.
         owner: Optional "Owner" attribute value, as in `export_routine()`.
-        validate: Before writing, run the same two checks `export_routine()`
+        validate: Before writing, run the same checks `export_routine()`
             offers, across every routine/tag in the whole program instead of
             one: (1) every struct-typed name reachable from a referenced
             controller tag's or a program tag's own DataType tree resolves;
             (2) every RLL routine's every rung passes
-            `_validate_rll_rung_syntax()`. Off by default.
+            `_validate_rll_rung_syntax()`; (3) every literal-indexed array
+            reference among the program's tags is in bounds for that tag's
+            declared `Dimensions` (`_validate_array_bounds()`). Off by
+            default.
 
     Raises:
         ValueError: if `program` isn't found in `project.controller.programs`,
@@ -1736,6 +1834,7 @@ def export_program(project: RSLogix5000Content, program: Program, output_path,
                         raise ValueError(
                             f"Rung {i} of routine {routine.name!r}: {e}"
                         ) from e
+        _validate_array_bounds(all_lines, controller_tags + list(program.tags))
 
     Path(output_path).write_text(xml, encoding="utf-8")
 

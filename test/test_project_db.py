@@ -19,12 +19,16 @@ from acd import (
     db_export_program,
     db_export_routine,
     db_find_tag_references,
+    db_get_aoi,
+    db_get_datatype,
     db_get_project_summary,
     db_get_routine,
     db_get_tag_value,
     db_insert_rung,
     db_insert_st_line,
     db_io_addresses_by_routine,
+    db_list_aois,
+    db_list_datatypes,
     db_list_routines,
     db_new_aoi,
     db_new_aoi_local_tag,
@@ -447,6 +451,157 @@ def test_new_datatype_duplicate_name_raises(acd_copy):
             db.new_datatype("PDB_NEW_UDT")
     finally:
         db.close()
+
+
+def test_get_datatype_returns_members_without_full_rehydration(acd_copy, monkeypatch):
+    # Regression test for a real report: inspecting one UDT's members
+    # previously forced a full to_controller() rehydration (every tag's
+    # value, every routine, every AOI) just to answer "what members does
+    # this ONE type have" -- get_datatype() must go SQL-direct instead.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_GD_UDT", description="a test type")
+        db.new_member("PDB_GD_UDT", "Field1", "DINT")
+        db.new_member("PDB_GD_UDT", "Flag1", "BIT")
+
+        calls = []
+        original = project_db_module.ControllerBuilder.build
+
+        def _spy(self):
+            calls.append(1)
+            return original(self)
+
+        monkeypatch.setattr(project_db_module.ControllerBuilder, "build", _spy)
+
+        dt = db.get_datatype("PDB_GD_UDT")
+
+        assert calls == []
+        assert dt["name"] == "PDB_GD_UDT"
+        assert dt["description"] == "a test type"
+        assert dt["family"] == "NoFamily"
+        assert dt["cls"] == "User"
+        # "Flag1" (a BIT member) allocates its own hidden backing field
+        # (see new_bit_member()), so the member list also has a
+        # "ZZZZZZZZZZ..."-named hidden SINT alongside Field1/Flag1.
+        names = [m["name"] for m in dt["members"]]
+        assert "Field1" in names
+        assert "Flag1" in names
+        field1 = next(m for m in dt["members"] if m["name"] == "Field1")
+        assert field1["data_type"] == "DINT"
+        bit_member = next(m for m in dt["members"] if m["name"] == "Flag1")
+        assert bit_member["target"] is not None
+        assert bit_member["bit_number"] == 0
+    finally:
+        db.close()
+
+
+def test_get_datatype_missing_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.get_datatype("NO_SUCH_TYPE")
+    finally:
+        db.close()
+
+
+def test_list_datatypes_includes_real_and_new_types_with_member_counts(acd_copy):
+    reference = load_acd(str(acd_copy), verbose=False)
+    real_names = {dt.name for dt in reference.controller.data_types}
+
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_LD_UDT")
+        db.new_member("PDB_LD_UDT", "Field1", "DINT")
+        db.new_member("PDB_LD_UDT", "Field2", "DINT")
+
+        listing = {d["name"]: d for d in db.list_datatypes()}
+        assert real_names <= set(listing)
+        assert listing["PDB_LD_UDT"]["member_count"] == 2
+        # No "members" key at all -- this is the summary-only listing.
+        assert "members" not in listing["PDB_LD_UDT"]
+    finally:
+        db.close()
+
+
+def test_db_get_datatype_and_list_datatypes_stateless_wrappers(acd_copy):
+    db_new_tag(str(acd_copy), "PDB_UNUSED_TAG", "DINT")  # ensure DB exists
+    from acd import db_new_datatype as _db_new_datatype, db_new_member as _db_new_member
+    _db_new_datatype(str(acd_copy), "PDB_GD2_UDT")
+    _db_new_member(str(acd_copy), "PDB_GD2_UDT", "Field1", "DINT")
+
+    dt = db_get_datatype(str(acd_copy), "PDB_GD2_UDT")
+    assert dt["name"] == "PDB_GD2_UDT"
+    assert [m["name"] for m in dt["members"]] == ["Field1"]
+
+    listing = db_list_datatypes(str(acd_copy))
+    assert any(d["name"] == "PDB_GD2_UDT" and d["member_count"] == 1 for d in listing)
+
+
+def test_get_aoi_fast_path_for_db_created_aoi(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_GA_AOI", description="a test AOI")
+        db.new_aoi_parameter("PDB_GA_AOI", "In1", "DINT", usage="Input")
+        db.new_aoi_local_tag("PDB_GA_AOI", "Scratch1", "DINT")
+
+        aoi = db.get_aoi("PDB_GA_AOI")
+        assert aoi["name"] == "PDB_GA_AOI"
+        assert aoi["description"] == "a test AOI"
+        assert [p["name"] for p in aoi["parameters"]] == ["In1"]
+        assert aoi["parameters"][0]["usage"] == "Input"
+        assert [lt["name"] for lt in aoi["local_tags"]] == ["Scratch1"]
+    finally:
+        db.close()
+
+
+def test_get_aoi_falls_back_to_rehydration_for_real_pre_existing_aoi(aoi_acd_copy):
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    real_aoi = reference.controller.aois[0]
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        aoi = db.get_aoi(real_aoi.name)
+        assert aoi["name"] == real_aoi.name
+        assert [p["name"] for p in aoi["parameters"]] == [p.name for p in real_aoi.parameters]
+        assert [lt["name"] for lt in aoi["local_tags"]] == [lt.name for lt in real_aoi.local_tags]
+    finally:
+        db.close()
+
+
+def test_get_aoi_missing_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.get_aoi("NO_SUCH_AOI")
+    finally:
+        db.close()
+
+
+def test_list_aois_includes_real_and_new_aois(aoi_acd_copy):
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    real_names = {a.name for a in reference.controller.aois}
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_LA_AOI")
+        db.new_aoi_parameter("PDB_LA_AOI", "In1", "DINT", usage="Input")
+
+        listing = {a["name"]: a for a in db.list_aois()}
+        assert real_names <= set(listing)
+        assert listing["PDB_LA_AOI"]["parameter_count"] == 1
+    finally:
+        db.close()
+
+
+def test_db_get_aoi_and_list_aois_stateless_wrappers(acd_copy):
+    from acd import db_new_aoi as _db_new_aoi
+    _db_new_aoi(str(acd_copy), "PDB_GA2_AOI")
+
+    aoi = db_get_aoi(str(acd_copy), "PDB_GA2_AOI")
+    assert aoi["name"] == "PDB_GA2_AOI"
+
+    listing = db_list_aois(str(acd_copy))
+    assert any(a["name"] == "PDB_GA2_AOI" for a in listing)
 
 
 def test_db_new_datatype_stateless_wrapper_and_export(acd_copy, tmp_path):
@@ -1085,6 +1240,25 @@ def test_export_program_instance_method(acd_copy, tmp_path):
         db.close()
 
 
+def test_db_export_program_validate_rejects_out_of_bounds_array_index(acd_copy, tmp_path):
+    db_new_tag(str(acd_copy), "PDB_ARR_TAG", "DINT", dimensions="3", program_name="Branching")
+    db_insert_rung(str(acd_copy), "B001_Main", 0, "MOV(PDB_ARR_TAG[3],1);",
+                    program_name="Branching")
+
+    with pytest.raises(ValueError, match=r"'PDB_ARR_TAG'.*indexed at 3.*0\.\.2"):
+        db_export_program(str(acd_copy), "Branching", str(tmp_path / "bad.L5X"))
+
+
+def test_db_export_program_validate_accepts_in_bounds_array_index(acd_copy, tmp_path):
+    db_new_tag(str(acd_copy), "PDB_ARR_TAG2", "DINT", dimensions="3", program_name="Branching")
+    db_insert_rung(str(acd_copy), "B001_Main", 0, "MOV(PDB_ARR_TAG2[2],1);",
+                    program_name="Branching")
+
+    output_path = tmp_path / "ok.L5X"
+    db_export_program(str(acd_copy), "Branching", str(output_path))
+    assert output_path.exists()
+
+
 def test_get_routine_does_not_rehydrate_full_controller(acd_copy, monkeypatch):
     # Regression test for a real report: looping db_get_routine() (or even
     # ProjectDB.get_routine() on a single reused connection) over every
@@ -1649,6 +1823,19 @@ def test_db_find_tag_references_locates_usage(acd_copy):
 
     matches = db_find_tag_references(str(acd_copy), "PDB_REFERENCED_TAG")
     assert any(routine_name in m for m in matches)
+
+
+def test_db_find_tag_references_include_text_false_returns_3_tuples(acd_copy):
+    program_name, routine_name = _first_routine_via_path(acd_copy)
+    db_new_tag(str(acd_copy), "PDB_REFERENCED_TAG2", "DINT", program_name=program_name)
+    db_insert_rung(str(acd_copy), routine_name, 0, "XIC(Always_Off)OTE(PDB_REFERENCED_TAG2);",
+                    program_name=program_name)
+
+    with_text = db_find_tag_references(str(acd_copy), "PDB_REFERENCED_TAG2")
+    without_text = db_find_tag_references(str(acd_copy), "PDB_REFERENCED_TAG2", include_text=False)
+    assert all(len(m) == 4 for m in with_text)
+    assert all(len(m) == 3 for m in without_text)
+    assert {m[:3] for m in with_text} == set(without_text)
 
 
 def test_db_io_addresses_by_routine_returns_dict(acd_copy):

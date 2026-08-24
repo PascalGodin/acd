@@ -158,6 +158,23 @@ EDITS -- durable the moment the call returns (see above), each raising
     `"MyTag.Member[4].5"`, not `"Member[4].5"`). `text=""` clears the
     comment at that path (it's filtered out at export time, never raises
     or renders an empty comment).
+  - `db_set_tag_element_value(acd_path, tag_name, path, value,
+    program_name=None)` -- set ONE leaf value inside a tag's (possibly
+    array-of-struct) value, instead of hand-building the whole nested
+    value just to change one field of one element. `path`:
+    an optional leading `[N]` (required iff `tag_name` is a declared 1-D
+    array; not yet supported: multi-dimensional or member-level array
+    indices) followed by zero or more `.MemberName` segments, e.g.
+    `"[3].PRE"` (`StartFaultTimer[3].PRE` for element 3 of an `[11]`-motor
+    array), `"PRE"` (a scalar struct tag), `"[3]"` (a plain primitive
+    array element). If the tag has no stored value yet, the WHOLE value is
+    zero-filled first (Studio-consistent, via the same mechanism CLAUDE.md's
+    "Mutating a UDT with live tag instances" section documents), then the
+    one leaf is set -- no separate "seed a default first" step needed. Same
+    zero-fill applies to any missing intermediate member found while
+    navigating an existing value. Raises `KeyError` for an unknown tag or
+    member, `ValueError` for an out-of-range/mismatched index or an
+    unsupported `path` shape.
   - `db_new_datatype(acd_path, name, description=None)` -- create a new,
     empty UDT. Use `db_new_member()` afterward to populate it, the same
     way you already would for an existing UDT.
@@ -453,6 +470,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_new_tag,
     db_edit_tag,
     db_set_tag_comment,
+    db_set_tag_element_value,
     db_new_datatype,
     db_new_member,
     db_new_aoi,

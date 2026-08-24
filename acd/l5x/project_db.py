@@ -58,6 +58,7 @@ held lock).
 import contextlib
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -97,6 +98,7 @@ from acd.l5x.elements import (
     Routine,
     Tag,
     _validate_rll_rung_syntax,
+    _zero_value_for_member,
     new_aoi as _new_aoi,
     new_aoi_local_tag as _new_aoi_local_tag,
     new_aoi_parameter as _new_aoi_parameter,
@@ -682,6 +684,52 @@ def open_project_db(acd_path, project_dir=None, rebuild: bool = False,
     return ProjectDB(acd_path, project_dir, conn, lock)
 
 
+_ELEMENT_PATH_INDEX_RE = re.compile(r"^\[(\d+)\]")
+_ELEMENT_PATH_MEMBER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _parse_tag_element_path(path: str):
+    """Parse a `set_tag_element_value()` path into `(index_or_None,
+    [member_name, ...])`.
+
+    Deliberately narrow, matching a single-dimension array element plus a
+    dotted member chain -- the exact shape the motivating real report
+    described (`"[3].PRE"` for `StartFaultTimer[3].PRE`, one motor out of
+    an `[11]`-element array of structs): an OPTIONAL leading `[N]` (a
+    literal top-level array index -- required if and only if the tag
+    itself is declared as a 1-D array), followed by zero or more
+    `.MemberName` segments (a leading `.` is optional and stripped either
+    way). NOT supported, and raises `ValueError` naming the gap rather than
+    guessing: a multi-dimensional index (`[2,2]`), an index on a MEMBER
+    rather than the top-level tag (`.Times[2]`), or a completely empty path
+    (use `edit_tag(value=...)` to set a tag's whole value instead).
+    """
+    index = None
+    rest = path
+    m = _ELEMENT_PATH_INDEX_RE.match(rest)
+    if m:
+        index = int(m.group(1))
+        rest = rest[m.end():]
+    if "[" in rest or "]" in rest:
+        raise ValueError(
+            f"Tag element path {path!r}: only a single, single-dimension leading "
+            f"'[N]' index is supported -- a multi-dimensional or member-level array "
+            f"index is not."
+        )
+    rest = rest.lstrip(".")
+    members = [seg for seg in rest.split(".") if seg] if rest else []
+    for seg in members:
+        if not _ELEMENT_PATH_MEMBER_RE.match(seg):
+            raise ValueError(f"Tag element path {path!r}: invalid member segment {seg!r}")
+    if index is None and not members:
+        raise ValueError(
+            f"Tag element path {path!r} is empty -- must name at least a leading array "
+            f"index ('[N]') or a member ('MemberName' / '[N].MemberName'); use "
+            f"edit_tag(value=...) to set a tag's WHOLE value instead."
+        )
+    return index, members
+
+
 class ProjectDB:
     """A handle onto one project's persistent, directly-editable DB --
     returned by `open_project_db()`, not constructed directly.
@@ -928,6 +976,169 @@ class ProjectDB:
             cur.execute("DELETE FROM proj_tag_comments WHERE tag_id=? AND path=''", (tag_id,))
             cur.execute("INSERT INTO proj_tag_comments (tag_id, path, text) VALUES (?, '', ?)",
                         (tag_id, description))
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def set_tag_element_value(self, tag_name: str, path: str, value,
+                               program_name: Union[str, None] = None) -> None:
+        """Set ONE leaf value inside a tag's (possibly nested, possibly
+        array-of-struct) `_initial_value`, without requiring the caller to
+        reconstruct the whole nested value by hand.
+
+        Added after a real report: a UDT array tag (e.g. an `[11]`-element
+        array of a `Motor`-shaped struct) needed one member set per element
+        (`StartFaultTimer.PRE` per motor) at creation time -- the only
+        existing option, `edit_tag(value=...)`, replaces the tag's ENTIRE
+        value, so setting one member for one element meant hand-building
+        the full nested list-of-dicts structure (all 11 motors, every
+        member of each) just to change one field of one of them. The
+        reporting agent's own workaround was to leave it at the type
+        default and flag it for manual tuning instead.
+
+        `path` addresses the target leaf: an OPTIONAL leading `[N]` (a
+        literal top-level array index -- required if and only if `tag_name`
+        is itself declared as a 1-D array; `N` must be in range for its
+        declared `Dimensions`), followed by zero or more `.MemberName`
+        segments (dot-separated, arbitrarily deep through nested structs).
+        Examples: `"[3].PRE"` (element 3's `PRE` member),
+        `"[3].Sub.PRE"` (a nested struct member), `"PRE"` (a scalar struct
+        tag, no array), `"[3]"` (the whole element of a primitive array,
+        e.g. a plain `DINT[N]` tag -- no member chain at all). See
+        `_parse_tag_element_path()` for the exact grammar and its NOT-YET-
+        supported cases (multi-dimensional index, an index on a member
+        rather than the top-level tag) -- both raise `ValueError` naming
+        the gap rather than guessing.
+
+        If the tag has no stored value at all yet (`initial_value IS NULL`
+        -- e.g. a tag just created via `new_tag()`/`db_new_tag()` with no
+        `value=`), the WHOLE value is zero-filled first (via the same
+        `_zero_value_for_member()` Studio-consistent zero-fill this
+        codebase already uses at export-render time for a stale/incomplete
+        decoded value -- see CLAUDE.md's "Mutating a UDT with live tag
+        instances" section), THEN the one leaf this call targets is set --
+        so a caller never has to separately seed a default value before
+        patching one field of it. The same zero-fill is applied to any
+        individual intermediate member found MISSING while navigating an
+        already-existing value (the identical "member added to a type with
+        existing instances" gap that section documents), so a partially-
+        populated value from an earlier `set_tag_element_value()` call, or
+        a real decoded value that's one member short, is patched rather
+        than rejected.
+
+        Raises `KeyError` if `tag_name` doesn't exist in scope, or if a
+        member named in `path` doesn't exist on the resolved type at that
+        point in the chain. Raises `ValueError` for an out-of-range index,
+        an index given for a non-array tag (or omitted for an array one),
+        or a `path` this function doesn't support (see above).
+        """
+        program_id = self._program_id(program_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id, data_type_name, dimensions, initial_value FROM proj_tags "
+            "WHERE program_id=? AND name=? COLLATE NOCASE",
+            (program_id, tag_name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No tag named {tag_name!r} in this scope")
+        tag_id, data_type_name, dims, iv_json = row
+
+        index, members = _parse_tag_element_path(path)
+
+        dim = None
+        if dims is not None:
+            if "," in dims:
+                raise ValueError(
+                    f"set_tag_element_value() only supports a single-dimension array tag "
+                    f"(tag {tag_name!r} has Dimensions={dims!r}, which is multi-dimensional)"
+                )
+            dim = int(dims)
+            if index is None:
+                raise ValueError(
+                    f"Tag {tag_name!r} is an array (Dimensions={dims!r}) -- path {path!r} "
+                    f"must start with a literal index, e.g. '[0].{members[0] if members else '...'}'"
+                )
+            if not (0 <= index < dim):
+                raise ValueError(
+                    f"Index {index} out of bounds for tag {tag_name!r} "
+                    f"(Dimensions={dims!r}, valid range 0..{dim - 1})"
+                )
+        elif index is not None:
+            raise ValueError(
+                f"Tag {tag_name!r} is not an array (no Dimensions) -- path {path!r} must "
+                f"not start with an index"
+            )
+
+        data_types_map: Dict[str, DataType] = {}
+        self._load_data_types(data_types_map)
+
+        if iv_json is None:
+            root_member = Member(tag_name, tag_name, data_type_name, dim or 0, None, False,
+                                  None, None, "Read/Write")
+            value_tree = _zero_value_for_member(root_member, data_types_map)
+        else:
+            value_tree = json.loads(iv_json)
+
+        container = value_tree
+        if index is not None:
+            if not isinstance(container, list) or not (0 <= index < len(container)):
+                got = len(container) if isinstance(container, list) else "no"
+                raise ValueError(
+                    f"Tag {tag_name!r}'s current stored value doesn't have a real element "
+                    f"at index {index} (has {got} elements) -- this shouldn't happen for a "
+                    f"tag whose Dimensions matches its own stored value; investigate before "
+                    f"trusting this edit."
+                )
+            if not members:
+                container[index] = value
+            else:
+                container = container[index]
+
+        current_type_name = data_type_name
+        for i, member_name in enumerate(members):
+            dt_row = cur.execute(
+                "SELECT id FROM proj_data_types WHERE name=? COLLATE NOCASE",
+                (current_type_name,),
+            ).fetchone()
+            if dt_row is None:
+                raise ValueError(
+                    f"Type {current_type_name!r} does not resolve to a known DataType in "
+                    f"this project DB -- cannot navigate to member {member_name!r} of "
+                    f"path {path!r} for tag {tag_name!r}"
+                )
+            member_row = cur.execute(
+                "SELECT name, data_type_name, dimension, radix, hidden, target, bit_number, "
+                "external_access, description FROM proj_members WHERE data_type_id=? "
+                "AND name=? COLLATE NOCASE",
+                (dt_row[0], member_name),
+            ).fetchone()
+            if member_row is None:
+                raise KeyError(
+                    f"No member named {member_name!r} on type {current_type_name!r} "
+                    f"(navigating path {path!r} for tag {tag_name!r})"
+                )
+            (real_name, m_dtype, m_dim, m_radix, m_hidden, m_target, m_bit_number,
+             m_ext_access, m_desc) = member_row
+
+            if not isinstance(container, dict):
+                raise ValueError(
+                    f"Cannot navigate to member {member_name!r} of path {path!r} for tag "
+                    f"{tag_name!r} -- the value at this point is a {type(container).__name__}, "
+                    f"not a struct"
+                )
+            if i == len(members) - 1:
+                container[real_name] = value
+            else:
+                if real_name not in container:
+                    m_wrapper = Member(real_name, real_name, m_dtype, m_dim, m_radix,
+                                        bool(m_hidden), m_target, m_bit_number, m_ext_access,
+                                        _description=m_desc)
+                    container[real_name] = _zero_value_for_member(m_wrapper, data_types_map)
+                container = container[real_name]
+                current_type_name = m_dtype
+
+        cur.execute("UPDATE proj_tags SET initial_value=? WHERE id=?",
+                    (json.dumps(value_tree), tag_id))
         cur.execute("UPDATE proj_meta SET dirty=1")
         if not self._in_transaction:
             self._conn.commit()
@@ -2493,6 +2704,17 @@ def db_set_tag_comment(acd_path, name: str, path: str, text: str,
     """Stateless equivalent of `ProjectDB.set_tag_comment()` -- see its docstring."""
     _run(acd_path, project_dir, verbose, lambda db: db.set_tag_comment(
         name, path, text, program_name=program_name,
+    ))
+
+
+def db_set_tag_element_value(acd_path, tag_name: str, path: str, value,
+                              program_name: Union[str, None] = None,
+                              project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.set_tag_element_value()` -- see
+    its docstring for the `path` grammar and the zero-fill-on-first-use
+    behavior."""
+    _run(acd_path, project_dir, verbose, lambda db: db.set_tag_element_value(
+        tag_name, path, value, program_name=program_name,
     ))
 
 

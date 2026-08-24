@@ -38,6 +38,7 @@ from acd import (
     db_new_routine,
     db_new_tag,
     db_set_rung_comment,
+    db_set_tag_element_value,
     db_tag_exists,
     db_transaction,
     open_project_db,
@@ -45,7 +46,12 @@ from acd import (
 from acd.api import get_routine, load_acd
 from acd.l5x.elements import DataType, Routine, new_tag
 from acd.l5x import project_db as project_db_module
-from acd.l5x.project_db import _materialize, _ProjectLock, _TEMPORARY_IMPORT_DATATYPE_PREFIX
+from acd.l5x.project_db import (
+    _materialize,
+    _parse_tag_element_path,
+    _ProjectLock,
+    _TEMPORARY_IMPORT_DATATYPE_PREFIX,
+)
 
 
 @pytest.fixture
@@ -384,6 +390,231 @@ def test_edit_tag_missing_raises_key_error(acd_copy):
     try:
         with pytest.raises(KeyError):
             db.edit_tag("NO_SUCH_TAG", description="x")
+    finally:
+        db.close()
+
+
+class TestParseTagElementPath:
+    def test_index_and_single_member(self):
+        assert _parse_tag_element_path("[3].PRE") == (3, ["PRE"])
+
+    def test_index_and_nested_member_chain(self):
+        assert _parse_tag_element_path("[3].Sub.PRE") == (3, ["Sub", "PRE"])
+
+    def test_scalar_member_only_no_index(self):
+        assert _parse_tag_element_path("PRE") == (None, ["PRE"])
+
+    def test_scalar_member_with_leading_dot(self):
+        assert _parse_tag_element_path(".PRE") == (None, ["PRE"])
+
+    def test_bare_index_no_members(self):
+        assert _parse_tag_element_path("[7]") == (7, [])
+
+    def test_multidim_index_rejected(self):
+        with pytest.raises(ValueError, match="single, single-dimension"):
+            _parse_tag_element_path("[2,2]")
+
+    def test_member_level_array_index_rejected(self):
+        with pytest.raises(ValueError, match="single, single-dimension"):
+            _parse_tag_element_path("[0].Times[2]")
+
+    def test_empty_path_rejected(self):
+        with pytest.raises(ValueError, match="empty"):
+            _parse_tag_element_path("")
+
+    def test_invalid_member_segment_rejected(self):
+        with pytest.raises(ValueError, match="invalid member segment"):
+            _parse_tag_element_path("[0].1BadName")
+
+
+def _build_motor_udt_pair(db):
+    """PDB_Timer{PRE, ACC} and PDB_Motor{Run, StartFaultTimer: PDB_Timer} --
+    the exact real shape from the motivating report (a Motor-shaped struct
+    with a nested Timer-shaped struct member, used as an array-of-struct
+    tag's own element type).
+    """
+    db.new_datatype("PDB_Timer")
+    db.new_member("PDB_Timer", "PRE", "DINT")
+    db.new_member("PDB_Timer", "ACC", "DINT")
+    db.new_datatype("PDB_Motor")
+    db.new_member("PDB_Motor", "Run", "BOOL")
+    db.new_member("PDB_Motor", "StartFaultTimer", "PDB_Timer")
+
+
+def test_set_tag_element_value_zero_fills_then_sets_one_leaf_of_array_of_struct(acd_copy):
+    # The literal motivating case: StartFaultTimer.PRE for motor index 1 of
+    # an 11-element array of Motor-shaped structs, with no other field
+    # touched. Also confirms element 0/2 stay at their zero-filled default.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("Motors", "PDB_Motor", dimensions="3")
+
+        db.set_tag_element_value("Motors", "[1].StartFaultTimer.PRE", 5000)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "Motors")
+        iv = tag._initial_value
+        assert len(iv) == 3
+        assert iv[1]["StartFaultTimer"]["PRE"] == 5000
+        assert iv[1]["StartFaultTimer"]["ACC"] == 0
+        assert iv[1]["Run"] == 0
+        assert iv[0] == {"Run": 0, "StartFaultTimer": {"PRE": 0, "ACC": 0}}
+        assert iv[2] == {"Run": 0, "StartFaultTimer": {"PRE": 0, "ACC": 0}}
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_second_call_preserves_first_edit(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("Motors2", "PDB_Motor", dimensions="2")
+
+        db.set_tag_element_value("Motors2", "[0].StartFaultTimer.PRE", 111)
+        db.set_tag_element_value("Motors2", "[1].StartFaultTimer.PRE", 222)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "Motors2")
+        assert tag._initial_value[0]["StartFaultTimer"]["PRE"] == 111
+        assert tag._initial_value[1]["StartFaultTimer"]["PRE"] == 222
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_scalar_struct_tag_no_index(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("SingleMotor", "PDB_Motor")  # no dimensions -- scalar
+
+        db.set_tag_element_value("SingleMotor", "StartFaultTimer.PRE", 42)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "SingleMotor")
+        assert tag._initial_value["StartFaultTimer"]["PRE"] == 42
+        assert tag._initial_value["Run"] == 0
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_bare_index_on_primitive_array(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_tag("PDB_PrimArray", "DINT", dimensions="5")
+
+        db.set_tag_element_value("PDB_PrimArray", "[2]", 777)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "PDB_PrimArray")
+        assert tag._initial_value == [0, 0, 777, 0, 0]
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_zero_fills_missing_member_on_existing_value(acd_copy):
+    # Simulates the real "mutating a UDT with live tag instances" gap this
+    # method reuses _zero_value_for_member() to patch around: an existing
+    # stored value that's missing a member entirely (e.g. added to the type
+    # after the value was first decoded/set).
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("Motors3", "PDB_Motor", dimensions="2", value=[
+            {"Run": 1},  # StartFaultTimer entirely missing on purpose
+            {"Run": 0, "StartFaultTimer": {"PRE": 9, "ACC": 9}},
+        ])
+
+        db.set_tag_element_value("Motors3", "[0].StartFaultTimer.PRE", 55)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "Motors3")
+        assert tag._initial_value[0]["Run"] == 1  # untouched
+        assert tag._initial_value[0]["StartFaultTimer"]["PRE"] == 55
+        assert tag._initial_value[0]["StartFaultTimer"]["ACC"] == 0  # zero-filled
+        assert tag._initial_value[1]["StartFaultTimer"]["PRE"] == 9  # untouched
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_missing_tag_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.set_tag_element_value("NO_SUCH_TAG", "[0].X", 1)
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_missing_member_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("Motors4", "PDB_Motor", dimensions="1")
+        with pytest.raises(KeyError):
+            db.set_tag_element_value("Motors4", "[0].NoSuchMember", 1)
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_out_of_bounds_index_raises(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("Motors5", "PDB_Motor", dimensions="3")
+        with pytest.raises(ValueError, match="out of bounds"):
+            db.set_tag_element_value("Motors5", "[3].Run", 1)
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_index_required_for_array_tag(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("Motors6", "PDB_Motor", dimensions="3")
+        with pytest.raises(ValueError, match="must start with"):
+            db.set_tag_element_value("Motors6", "Run", 1)
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_index_forbidden_for_scalar_tag(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("Motors7", "PDB_Motor")  # scalar
+        with pytest.raises(ValueError, match="not an array"):
+            db.set_tag_element_value("Motors7", "[0].Run", 1)
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_multidim_tag_rejected(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_udt_pair(db)
+        db.new_tag("Motors8", "PDB_Motor", dimensions="2,2")
+        with pytest.raises(ValueError, match="single-dimension"):
+            db.set_tag_element_value("Motors8", "[0].Run", 1)
+    finally:
+        db.close()
+
+
+def test_db_set_tag_element_value_stateless_wrapper(acd_copy):
+    db_new_datatype(str(acd_copy), "PDB_Timer2")
+    db_new_member(str(acd_copy), "PDB_Timer2", "PRE", "DINT")
+    db_new_datatype(str(acd_copy), "PDB_Motor2")
+    db_new_member(str(acd_copy), "PDB_Motor2", "StartFaultTimer", "PDB_Timer2")
+    db_new_tag(str(acd_copy), "MotorsWrap", "PDB_Motor2", dimensions="2")
+
+    db_set_tag_element_value(str(acd_copy), "MotorsWrap", "[1].StartFaultTimer.PRE", 321)
+
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "MotorsWrap")
+        assert tag._initial_value[1]["StartFaultTimer"]["PRE"] == 321
     finally:
         db.close()
 

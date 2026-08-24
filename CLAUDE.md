@@ -4414,6 +4414,73 @@ and, for the AOI parameter edit/delete methods, `test_edit_aoi_parameter_updates
 `test_delete_aoi_parameter_removes_it`, `test_delete_aoi_parameter_missing_raises_key_error`, and
 `test_db_edit_aoi_parameter_and_delete_aoi_parameter_stateless_wrappers` (`test/test_project_db.py`).
 
+## Sixth round: `set_tag_element_value()` — the last "smaller friction" item
+
+The third, harder item from the fourth feedback round's "smaller frictions" list: no way to set
+a nested initial value for ONE element of an array-of-struct tag at creation time — the reporting
+agent's concrete example was `StartFaultTimer.PRE` per motor, on an `[11]`/`[12]`/`[50]`-element
+array of `Motor`-shaped structs, with the only existing tool (`edit_tag(value=...)`) replacing
+the tag's ENTIRE value. The workaround at the time was leaving it at the type default and flagging
+it for manual tuning — real data loss of intent, not just inconvenience.
+
+Added `ProjectDB.set_tag_element_value(tag_name, path, value, program_name=None)` /
+`db_set_tag_element_value(acd_path, tag_name, path, value, program_name=None)`
+(`acd/l5x/project_db.py`) — patches ONE leaf into a tag's `initial_value`, creating/zero-filling
+whatever structure is needed to reach it, rather than requiring the caller to reconstruct the
+whole nested value by hand.
+
+**`path` grammar** (`_parse_tag_element_path()`), deliberately narrow — an optional leading `[N]`
+(a literal single-dimension array index, required if and only if the tag itself is declared as a
+1-D array) followed by zero or more `.MemberName` segments: `"[3].PRE"`, `"[3].Sub.PRE"` (nested
+struct), `"PRE"` (a scalar struct tag, no array), `"[3]"` (a plain primitive array element, no
+member chain at all). Explicitly NOT supported, raising `ValueError` naming the gap rather than
+guessing: a multi-dimensional tag index (`[2,2]`) or an index on a MEMBER rather than the
+top-level tag (`.Times[2]`, since a `Member`'s own `.dimension` is a single int in this codebase's
+object model — there's no existing shape to represent a member-level multi-dim array to zero-fill
+against anyway).
+
+**Zero-fill mechanism — reused, not reinvented.** Two related but distinct gaps both resolve to
+the SAME existing helper, `_zero_value_for_member()` (`acd/l5x/elements/rendering.py`, see
+"Mutating a UDT with live tag instances" above for its original real-world motivation): (1) a tag
+with NO stored value at all (`initial_value IS NULL` — the exact case of a freshly `new_tag()`/
+`db_new_tag()`-created array-of-struct tag with no `value=`) has its WHOLE value zero-filled
+first, via a throwaway `Member` wrapper (`Member(tag_name, tag_name, data_type_name, dim or 0,
+None, False, None, None, "Read/Write")`) fed into `_zero_value_for_member()` — its own existing
+"dimension > 0 -> list of zero-filled elements" recursion handles the array-of-struct shape with
+no new logic; (2) navigating an EXISTING value and finding an intermediate member genuinely
+missing from the dict (the identical "member added to a type with live instances" scenario that
+section documents, now also reachable by a value `set_tag_element_value()` itself previously wrote
+before a schema change) zero-fills just that one member the same way, using a `Member` built from
+its own `proj_members` row. Requires the project's full `data_types_map` (`ProjectDB._load_data_types()`
+— cheaper than a full `to_controller()`, since it skips tags/routines/programs/AOIs, but not as
+cheap as the pure-SQL `get_datatype()`/`get_aoi()` lookups added in the fourth round; a real,
+deliberate trade-off, since correctly zero-filling an arbitrarily-nested struct tree needs the
+whole type graph in hand, not just one type's own direct members).
+
+**Verified**: the exact motivating shape (an `[N]`-element array of a `Motor`-shaped struct with a
+nested `Timer`-shaped struct member, one leaf set on one element) zero-fills every other element
+and every other member to their real Studio-consistent defaults (`0`/`0.0`/`{"LEN":0,"DATA":""}`
+depending on type, matching `_zero_value_for_member()`'s own established behavior) while leaving
+the ONE targeted leaf set correctly; a second `set_tag_element_value()` call on a different element
+of the same tag preserves the first call's edit (patches, doesn't re-zero-fill from scratch); a
+hand-constructed value missing an intermediate member entirely gets that member zero-filled while
+every OTHER already-present field (including sibling elements) is left untouched. Not yet verified
+against a real Studio 5000 import (this only writes `proj_tags.initial_value` — the same JSON
+column every other tag-value edit already writes to and that `export_routine()`/`export_datatype()`
+already render correctly from, per the existing `Tag.to_xml()`/`_l5k_udt_literal()` machinery, so no
+NEW rendering path is introduced here to separately verify).
+
+Covered by `TestParseTagElementPath` (the pure path parser — index+member, nested chain, scalar
+member-only, leading-dot tolerance, bare index, multi-dim rejected, member-level array index
+rejected, empty path rejected, invalid member name rejected) and, in `test/test_project_db.py`:
+`test_set_tag_element_value_zero_fills_then_sets_one_leaf_of_array_of_struct` (the literal
+motivating case), `test_set_tag_element_value_second_call_preserves_first_edit`,
+`test_set_tag_element_value_scalar_struct_tag_no_index`,
+`test_set_tag_element_value_bare_index_on_primitive_array`,
+`test_set_tag_element_value_zero_fills_missing_member_on_existing_value`, and six error-path
+tests (missing tag/member, out-of-bounds index, index required/forbidden, multi-dim tag rejected)
+plus `test_db_set_tag_element_value_stateless_wrapper`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

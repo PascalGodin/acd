@@ -619,6 +619,109 @@ def test_db_set_tag_element_value_stateless_wrapper(acd_copy):
         db.close()
 
 
+def _build_motor_with_real_timer_udt(db):
+    """PDB_MotorRealTimer{Run, StartFaultTimer: TIMER} -- the exact real
+    reported shape: a UDT member typed as Rockwell's own BUILT-IN TIMER
+    struct (not a project-defined stand-in), the same as every real
+    project's StartFaultTimer/Delay_1..9/etc. members.
+    """
+    db.new_datatype("PDB_MotorRealTimer")
+    db.new_member("PDB_MotorRealTimer", "Run", "BOOL")
+    db.new_member("PDB_MotorRealTimer", "StartFaultTimer", "TIMER")
+
+
+def test_set_tag_element_value_navigates_into_builtin_timer_member(acd_copy):
+    # The literal reported bug: TIMER is a Rockwell built-in structured
+    # type, never a row in proj_data_types -- navigating into one of its
+    # members (PRE/ACC/EN/TT/DN) used to raise "Type 'TIMER' does not
+    # resolve to a known DataType in this project DB".
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_with_real_timer_udt(db)
+        db.new_tag("Tray_Accum_Motor", "PDB_MotorRealTimer", dimensions="3")
+
+        db.set_tag_element_value("Tray_Accum_Motor", "[1].StartFaultTimer.PRE", 1000)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "Tray_Accum_Motor")
+        timer = tag._initial_value[1]["StartFaultTimer"]
+        assert timer["PRE"] == 1000
+        # Every other TIMER status member zero-filled correctly (not a
+        # bare 0 -- the deeper bug this fix also closes, see
+        # _zero_value_for_member()'s own history).
+        assert timer["ACC"] == 0
+        assert timer["EN"] == 0
+        assert timer["TT"] == 0
+        assert timer["DN"] == 0
+        assert tag._initial_value[1]["Run"] == 0
+        # Untouched sibling elements also zero-fill their own TIMER member
+        # correctly, not as a bare int.
+        assert tag._initial_value[0]["StartFaultTimer"] == {
+            "PRE": 0, "ACC": 0, "EN": 0, "TT": 0, "DN": 0,
+        }
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_builtin_counter_member(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_HasCounter")
+        db.new_member("PDB_HasCounter", "Cnt", "COUNTER")
+        db.new_tag("PDB_CounterTag", "PDB_HasCounter")
+
+        db.set_tag_element_value("PDB_CounterTag", "Cnt.PRE", 50)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "PDB_CounterTag")
+        assert tag._initial_value["Cnt"]["PRE"] == 50
+        assert tag._initial_value["Cnt"]["CU"] == 0
+        assert tag._initial_value["Cnt"]["UN"] == 0
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_builtin_timer_unknown_member_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_with_real_timer_udt(db)
+        db.new_tag("Tray_Accum_Motor2", "PDB_MotorRealTimer", dimensions="3")
+        with pytest.raises(KeyError):
+            db.set_tag_element_value("Tray_Accum_Motor2", "[1].StartFaultTimer.NoSuchField", 1)
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_cannot_navigate_past_builtin_timer_leaf(acd_copy):
+    # PRE is itself a plain DINT, never a struct -- a path trying to
+    # navigate further through it must raise a clear error, not silently
+    # zero-fill something nonsensical.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        _build_motor_with_real_timer_udt(db)
+        db.new_tag("Tray_Accum_Motor3", "PDB_MotorRealTimer", dimensions="3")
+        with pytest.raises(ValueError, match="not a struct"):
+            db.set_tag_element_value("Tray_Accum_Motor3", "[1].StartFaultTimer.PRE.Bogus", 1)
+    finally:
+        db.close()
+
+
+def test_db_set_tag_element_value_builtin_timer_stateless_wrapper(acd_copy):
+    db_new_datatype(str(acd_copy), "PDB_MotorRealTimerWrap")
+    db_new_member(str(acd_copy), "PDB_MotorRealTimerWrap", "StartFaultTimer", "TIMER")
+    db_new_tag(str(acd_copy), "MotorsTimerWrap", "PDB_MotorRealTimerWrap", dimensions="2")
+
+    db_set_tag_element_value(str(acd_copy), "MotorsTimerWrap", "[0].StartFaultTimer.PRE", 777)
+
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "MotorsTimerWrap")
+        assert tag._initial_value[0]["StartFaultTimer"]["PRE"] == 777
+    finally:
+        db.close()
+
+
 def test_set_tag_comment_element_path(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:

@@ -370,6 +370,45 @@ def test_zero_value_for_member_nested_struct():
     assert _zero_value_for_member(_member("Nested", "Inner"), data_types_map) == {"Val": 0}
 
 
+def test_zero_value_for_member_builtin_timer():
+    # Regression test for a real report: a member typed as Rockwell's own
+    # built-in TIMER struct (never a row in data_types_map -- it's not a
+    # project UDT at all) used to fall through to the generic "unknown
+    # type" fallback and zero-fill as a bare 0 instead of the real
+    # {"PRE": 0, "ACC": 0, "EN": 0, "TT": 0, "DN": 0} shape -- which then
+    # broke navigating INTO it one level up the call stack
+    # (db_set_tag_element_value()).
+    assert _zero_value_for_member(_member("StartFaultTimer", "TIMER"), {}) == {
+        "PRE": 0, "ACC": 0, "EN": 0, "TT": 0, "DN": 0,
+    }
+
+
+def test_zero_value_for_member_builtin_counter():
+    assert _zero_value_for_member(_member("Cnt", "COUNTER"), {}) == {
+        "PRE": 0, "ACC": 0, "CU": 0, "CD": 0, "DN": 0, "OV": 0, "UN": 0,
+    }
+
+
+def test_zero_value_for_member_builtin_timer_array():
+    result = _zero_value_for_member(_member("Timers", "TIMER", dimension=2), {})
+    assert result == [
+        {"PRE": 0, "ACC": 0, "EN": 0, "TT": 0, "DN": 0},
+        {"PRE": 0, "ACC": 0, "EN": 0, "TT": 0, "DN": 0},
+    ]
+
+
+def test_zero_value_for_member_struct_containing_builtin_timer_member():
+    # The exact shape from the real report: a project UDT with a member
+    # typed as the built-in TIMER struct, nested inside the recursion.
+    motor_dt = DataType("Motor", "Motor", "NoFamily", "User",
+                         [_member("Run", "BOOL"), _member("StartFaultTimer", "TIMER")])
+    data_types_map = {"MOTOR": motor_dt}
+    assert _zero_value_for_member(_member("M", "Motor"), data_types_map) == {
+        "Run": 0,
+        "StartFaultTimer": {"PRE": 0, "ACC": 0, "EN": 0, "TT": 0, "DN": 0},
+    }
+
+
 def test_validate_tag_types_resolve_raises_on_unresolved_type():
     # This is the exact failure signature the stale-Tag._data_types_map bug
     # (see CLAUDE.md "Mutating a UDT with live tag instances...") produced

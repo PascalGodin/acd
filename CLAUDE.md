@@ -4649,6 +4649,63 @@ fallback AND that a warning fires), `test_resolve_io_tag_comments_still_resolves
 `_dm`-guard-ordering bug in the first draft of this fix), and
 `test_resolve_io_tag_comments_skips_non_io_tags` (`test/test_database.py`).
 
+## Tenth round: `set_tag_element_value()` couldn't navigate into TIMER/COUNTER/CONTROL members
+
+A real, medium-severity bug on `db_set_tag_element_value()` (added earlier this session, see the
+sixth round above): `db_set_tag_element_value(acd_path, "Tray_Accum_Motor", "[1].StartFaultTimer.PRE",
+1000)` raised `ValueError: Type 'TIMER' does not resolve to a known DataType in this project DB`.
+`TIMER` (like `COUNTER`/`CONTROL`) is a Rockwell BUILT-IN structured type, never a row in
+`proj_data_types` — the navigation loop's member-lookup only ever queried the project's own UDT
+table, with no fallback for the handful of built-in structs every real project uses constantly
+(every motor/sequence UDT in the reporting project has a TIMER member somewhere).
+
+**Two bugs, not one, found by tracing the actual code path the reported error came from.**
+`set_tag_element_value()`'s navigation loop is the immediate, reported failure — but zero-filling a
+tag with no stored value yet (or zero-filling a missing intermediate member on an existing one)
+goes through `_zero_value_for_member()` (`acd/l5x/elements/rendering.py`), which has the EXACT SAME
+gap one layer down: its `_scalar_zero()` helper never checked `_BUILTIN_STRUCT_MEMBERS` either,
+falling through to the generic "unknown type -- a harmless scalar zero beats crashing" branch for
+ANY member typed `TIMER`/`COUNTER`/`CONTROL`, producing a bare `0` instead of the real
+`{"PRE": 0, "ACC": 0, "EN": 0, "TT": 0, "DN": 0}`-shaped dict. This is a genuinely separate,
+already-latent bug — reachable from ANY caller of `_zero_value_for_member()`, not just
+`set_tag_element_value()` (e.g. the "Mutating a UDT with live tag instances" scenario documented
+above, for a UDT whose newly-added member happens to be TIMER/COUNTER-typed) — found only because
+tracing the reported error one level deeper (why did navigating INTO the zero-filled
+`StartFaultTimer` value fail, given it should have been a dict already?) led straight to it. Fixed
+both, in order:
+
+1. **`_zero_value_for_member()`**: `_scalar_zero()` now checks `_BUILTIN_STRUCT_MEMBERS.get(mdt_upper)`
+   (the same lookup table `_udt_scalar_to_xml`/`_l5k_udt_literal` already use for RENDERING a
+   built-in struct member, see "REAL/LREAL NaN and Infinity rendering"/"UDT L5K rendering" areas
+   above for its sibling usages) BEFORE falling through to the generic unknown-type fallback,
+   producing the correct all-zero dict for every one of the built-in type's own listed members.
+2. **`set_tag_element_value()`'s navigation loop** (`acd/l5x/project_db.py`): checks
+   `_BUILTIN_STRUCT_MEMBERS.get(current_type_name.upper())` FIRST, before the `proj_data_types`
+   SQL lookup (a real project can never legally have a UDT literally named `TIMER`/`COUNTER`/
+   `CONTROL` — Studio rejects the name collision — so there's no ambiguity in checking built-ins
+   first). A member NOT found on the built-in type's own list raises `KeyError` (matching the
+   existing "unknown member" behavior for a real UDT); trying to navigate PAST a built-in member
+   (e.g. `"...StartFaultTimer.PRE.Bogus"`) raises `ValueError` immediately — every currently-known
+   built-in struct member (`PRE`/`ACC`/`EN`/`TT`/`DN`/...) is itself a plain `DINT`/`BOOL`, never a
+   nested struct, so there's nothing further to zero-fill/navigate into.
+
+**Verified**: the exact motivating shape (`[1].StartFaultTimer.PRE` on a UDT array tag whose element
+type has a `StartFaultTimer: TIMER` member) sets the target leaf correctly, zero-fills every other
+TIMER status member (`ACC`/`EN`/`TT`/`DN`) to real `0`s rather than a bare int, and leaves untouched
+sibling array elements' own `StartFaultTimer` correctly shaped as a full dict too (not silently
+collapsed).
+
+Covered by `test_zero_value_for_member_builtin_timer`, `test_zero_value_for_member_builtin_counter`,
+`test_zero_value_for_member_builtin_timer_array`, and
+`test_zero_value_for_member_struct_containing_builtin_timer_member` (`test/test_elements_helpers.py`
+— the pure zero-fill fix, independent of the DB layer); and
+`test_set_tag_element_value_navigates_into_builtin_timer_member` (the literal reported case, also
+confirming every sibling status member/array element zero-fills correctly),
+`test_set_tag_element_value_builtin_counter_member`,
+`test_set_tag_element_value_builtin_timer_unknown_member_raises_key_error`,
+`test_set_tag_element_value_cannot_navigate_past_builtin_timer_leaf`, and
+`test_db_set_tag_element_value_builtin_timer_stateless_wrapper` (`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

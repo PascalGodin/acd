@@ -97,6 +97,7 @@ from acd.l5x.elements import (
     RSLogix5000Content,
     Routine,
     Tag,
+    _BUILTIN_STRUCT_MEMBERS,
     _validate_rll_rung_syntax,
     _zero_value_for_member,
     new_aoi as _new_aoi,
@@ -1096,29 +1097,54 @@ class ProjectDB:
 
         current_type_name = data_type_name
         for i, member_name in enumerate(members):
-            dt_row = cur.execute(
-                "SELECT id FROM proj_data_types WHERE name=? COLLATE NOCASE",
-                (current_type_name,),
-            ).fetchone()
-            if dt_row is None:
-                raise ValueError(
-                    f"Type {current_type_name!r} does not resolve to a known DataType in "
-                    f"this project DB -- cannot navigate to member {member_name!r} of "
-                    f"path {path!r} for tag {tag_name!r}"
+            # Built-in Logix struct types (TIMER, COUNTER, CONTROL, ...) are
+            # never project UDTs -- proj_data_types has no row for them at
+            # all -- but every real project uses them constantly as UDT
+            # members (StartFaultTimer, Delay_1..9, ...). Checked FIRST,
+            # before the proj_data_types lookup, since it's a cheap dict
+            # lookup and a project can never legally have a UDT literally
+            # named "TIMER"/"COUNTER"/"CONTROL" (Studio rejects the name
+            # collision). Found via a real report: navigating
+            # "[1].StartFaultTimer.PRE" raised "Type 'TIMER' does not
+            # resolve to a known DataType" -- this project DB genuinely had
+            # no way to know TIMER's own member shape at all.
+            builtin_members = _BUILTIN_STRUCT_MEMBERS.get(current_type_name.upper())
+            if builtin_members is not None:
+                real_name = next(
+                    (bn for bn, _ in builtin_members if bn.upper() == member_name.upper()), None
                 )
-            member_row = cur.execute(
-                "SELECT name, data_type_name, dimension, radix, hidden, target, bit_number, "
-                "external_access, description FROM proj_members WHERE data_type_id=? "
-                "AND name=? COLLATE NOCASE",
-                (dt_row[0], member_name),
-            ).fetchone()
-            if member_row is None:
-                raise KeyError(
-                    f"No member named {member_name!r} on type {current_type_name!r} "
-                    f"(navigating path {path!r} for tag {tag_name!r})"
-                )
-            (real_name, m_dtype, m_dim, m_radix, m_hidden, m_target, m_bit_number,
-             m_ext_access, m_desc) = member_row
+                if real_name is None:
+                    raise KeyError(
+                        f"No member named {member_name!r} on built-in type "
+                        f"{current_type_name!r} (navigating path {path!r} for tag "
+                        f"{tag_name!r})"
+                    )
+                m_dtype = dict(builtin_members)[real_name]
+            else:
+                dt_row = cur.execute(
+                    "SELECT id FROM proj_data_types WHERE name=? COLLATE NOCASE",
+                    (current_type_name,),
+                ).fetchone()
+                if dt_row is None:
+                    raise ValueError(
+                        f"Type {current_type_name!r} does not resolve to a known DataType "
+                        f"in this project DB, nor a built-in Logix struct (TIMER/COUNTER/"
+                        f"CONTROL) -- cannot navigate to member {member_name!r} of path "
+                        f"{path!r} for tag {tag_name!r}"
+                    )
+                member_row = cur.execute(
+                    "SELECT name, data_type_name, dimension, radix, hidden, target, "
+                    "bit_number, external_access, description FROM proj_members "
+                    "WHERE data_type_id=? AND name=? COLLATE NOCASE",
+                    (dt_row[0], member_name),
+                ).fetchone()
+                if member_row is None:
+                    raise KeyError(
+                        f"No member named {member_name!r} on type {current_type_name!r} "
+                        f"(navigating path {path!r} for tag {tag_name!r})"
+                    )
+                (real_name, m_dtype, m_dim, m_radix, m_hidden, m_target, m_bit_number,
+                 m_ext_access, m_desc) = member_row
 
             if not isinstance(container, dict):
                 raise ValueError(
@@ -1129,6 +1155,16 @@ class ProjectDB:
             if i == len(members) - 1:
                 container[real_name] = value
             else:
+                if builtin_members is not None:
+                    # Every currently-known built-in struct member (TIMER/
+                    # COUNTER/CONTROL's PRE/ACC/EN/...) is itself a plain
+                    # DINT/BOOL, never a nested struct -- there's nothing to
+                    # zero-fill/navigate further into.
+                    raise ValueError(
+                        f"Member {real_name!r} of built-in type {current_type_name!r} is "
+                        f"a plain {m_dtype}, not a struct -- path {path!r} for tag "
+                        f"{tag_name!r} cannot navigate any further through it"
+                    )
                 if real_name not in container:
                     m_wrapper = Member(real_name, real_name, m_dtype, m_dim, m_radix,
                                         bool(m_hidden), m_target, m_bit_number, m_ext_access,

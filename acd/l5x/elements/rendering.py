@@ -276,6 +276,23 @@ def _zero_value_for_member(member: "Member", data_types_map: Dict[str, "DataType
             return 0.0 if mdt_upper in ("REAL", "LREAL") else 0
         if _is_string_family_type(mdt, data_types_map):
             return {"LEN": 0, "DATA": ""}
+        # Built-in Logix struct types (TIMER, COUNTER, CONTROL, ...) are
+        # never in data_types_map (they're not project UDTs at all -- see
+        # _BUILTIN_STRUCT_MEMBERS's own module comment) -- without this
+        # check, a member typed as one of these (extremely common: almost
+        # every real UDT has a TIMER/COUNTER member somewhere) fell through
+        # to the "unknown type" scalar-zero fallback below, producing a
+        # bare 0 instead of the correct {"PRE": 0, "ACC": 0, ...} shape.
+        # Found via a real report: db_set_tag_element_value() zero-filling
+        # an array-of-struct tag with a TIMER member left that member as a
+        # plain int, which then broke navigating INTO it (e.g.
+        # "[1].StartFaultTimer.PRE") one level up the call stack.
+        builtin_members = _BUILTIN_STRUCT_MEMBERS.get(mdt_upper)
+        if builtin_members is not None:
+            return {
+                bname: (0.0 if bdt in ("REAL", "LREAL") else 0)
+                for bname, bdt in builtin_members
+            }
         dt_obj = data_types_map.get(mdt_upper)
         if dt_obj is None:
             return 0  # unknown type -- a harmless scalar zero beats crashing

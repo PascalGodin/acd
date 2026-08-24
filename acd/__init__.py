@@ -187,9 +187,15 @@ EDITS -- durable the moment the call returns (see above), each raising
     "Mutating a UDT with live tag instances" section documents), then the
     one leaf is set -- no separate "seed a default first" step needed. Same
     zero-fill applies to any missing intermediate member found while
-    navigating an existing value. Raises `KeyError` for an unknown tag or
-    member, `ValueError` for an out-of-range/mismatched index or an
-    unsupported `path` shape.
+    navigating an existing value. Navigates into a Rockwell BUILT-IN
+    structured type (`TIMER`/`COUNTER`/`CONTROL`) the same as a real
+    project UDT -- e.g. `"[3].StartFaultTimer.PRE"` works even though
+    `TIMER` is never itself a row in the project's own DataType table.
+    Raises `KeyError` for an unknown tag or member, `ValueError` for an
+    out-of-range/mismatched index, an unsupported `path` shape, or trying
+    to navigate PAST a built-in struct member (every one of `TIMER`/
+    `COUNTER`/`CONTROL`'s own members is a plain `DINT`/`BOOL`, never a
+    nested struct).
   - `db_new_datatype(acd_path, name, description=None)` -- create a new,
     empty UDT. Use `db_new_member()` afterward to populate it, the same
     way you already would for an existing UDT.

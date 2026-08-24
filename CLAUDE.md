@@ -4524,6 +4524,55 @@ Covered by `test_get_tag_comment_element_path`, `test_get_tag_comment_whole_tag_
 `test_list_tag_comments_empty_when_no_comments`, `test_list_tag_comments_missing_tag_raises_key_error`,
 and `test_db_get_tag_comment_and_list_tag_comments_stateless_wrappers` (`test/test_project_db.py`).
 
+## Eighth round: `db_edit_member()` — the same "no edit counterpart" shape as the AOI-parameter gap
+
+A real report, explicitly noting it's the same underlying shape as the earlier AOI-parameter gap
+(`db_new_aoi_parameter()` had no `db_edit_aoi_parameter()`, fixed in the fifth round above):
+`db_new_member()`/`db_delete_member()` exist, but there was no `db_edit_member()` — a member's
+`description` (or any other field) had no fix path short of Studio's own UDT editor after import,
+whether the member was newly added via `db_new_member()` or already present on a real,
+pre-existing UDT (the reporting case: setting `Bin_Sequence.Action_13`'s description to match a
+sibling field's label already set directly in Studio). **The report's suggestion to consider one
+shared fix for both was already moot by the time it arrived** — `db_edit_aoi_parameter()` had
+already shipped in the fifth round; this round only needed the DataType-member counterpart.
+
+Added `ProjectDB.edit_member(data_type_name, name, member_data_type=None, dimension=None,
+radix=None, description=None)` / `db_edit_member()` (`acd/l5x/project_db.py`) — same "only what
+you pass changes" convention as `edit_tag()`/`edit_aoi_parameter()`. One real difference from
+`edit_aoi_parameter()`'s own `dimension` caveat: **no ambiguity here** — `new_member()`'s own
+established convention already treats `dimension=0` (not `None`) as the real scalar value, so
+`edit_member(dimension=None)` unambiguously means "leave unchanged," with no equivalent to
+`edit_aoi_parameter()`'s "can't explicitly clear back to scalar" limitation.
+
+**A real, deliberate exception to "only what you pass changes," caught by the first version of
+the method's own test**: if `member_data_type` changes and `radix` is NOT also explicitly passed,
+the OLD radix is discarded rather than carried over — reusing `new_member()`'s own default
+derivation for the NEW type instead. First implementation naively kept the old stored radix
+(`effective_radix = radix if radix is not None else cur_radix` unconditionally), which a test
+changing `DINT` → `REAL` caught immediately: the member ended up with `Radix="Decimal"` on a REAL
+field, which a real Studio 5000 REAL member never has (`"Float"` is the only correct radix — see
+`_PRIMITIVE_RADIX`). Fixed by only carrying over the current radix when `member_data_type` itself
+is unchanged; a data_type change with no explicit `radix=` now re-derives the new type's own
+correct default instead of a stale, wrong one.
+
+**Explicitly NOT supported, raising `ValueError` rather than guessing** — converting a member
+to/from a BIT-overlay member is a structural operation (real backing-field allocation, hidden
+flag, target, bit_number — see `new_bit_member()`'s own extensive history above), not a plain
+field edit: `member_data_type="BIT"` always raises (use `new_bit_member()`/
+`db_new_member(..., member_data_type="BIT")` instead, which performs the real allocation this
+method has no way to do); and `member_data_type`/`dimension` on a member that's ALREADY a
+BIT-overlay member or a hidden BIT-backing field also raises (only its `description`/`radix` may
+be edited that way) — `description`/`radix` edits on an existing BIT member ARE allowed and leave
+`target`/`bit_number`/`hidden` untouched.
+
+Covered by `test_edit_member_updates_only_passed_fields` (the literal motivating case: description
+edit leaves `data_type` untouched), `test_edit_member_changes_data_type_and_dimension_via_new_member_defaults`
+(confirms the radix-re-derivation fix, would have failed under the first, naive implementation),
+`test_edit_member_rejects_conversion_to_bit`, `test_edit_member_rejects_type_change_on_existing_bit_member`,
+`test_edit_member_allows_description_on_existing_bit_member`,
+`test_edit_member_missing_data_type_raises_key_error`, `test_edit_member_missing_member_raises_key_error`,
+and `test_db_edit_member_stateless_wrapper` (`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

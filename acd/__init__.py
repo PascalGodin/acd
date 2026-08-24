@@ -201,6 +201,17 @@ EDITS -- durable the moment the call returns (see above), each raising
     member, or creating a new one) -- previously committed with no error
     but with no `target`/`bit_number` at all, only failing a real Studio
     "Import Data Type..." on `Target` several steps later.
+  - `db_edit_member(acd_path, data_type_name, name, member_data_type=None,
+    dimension=None, radix=None, description=None)` -- update an existing
+    member's fields in place; only the fields actually passed (non-`None`)
+    are changed. Works on a member newly added via `db_new_member()` OR
+    already present on a real, pre-existing UDT. RAISES if `member_data_type`
+    would convert the member to/from a BIT-overlay member (use
+    `db_new_member(..., member_data_type="BIT")` instead -- that needs a
+    real backing-field allocation this method can't perform) or if
+    `member_data_type`/`dimension` is passed for a member that's already a
+    BIT-overlay member or hidden BIT-backing field (only its
+    `description`/`radix` may be edited that way).
   - `db_new_aoi(acd_path, name, description=None)` -- create a new, empty
     Add-On Instruction. Use `db_new_aoi_parameter()` to add
     Input/Output/InOut parameters, `db_new_aoi_local_tag()` for private
@@ -490,6 +501,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_set_tag_element_value,
     db_new_datatype,
     db_new_member,
+    db_edit_member,
     db_new_aoi,
     db_new_aoi_parameter,
     db_edit_aoi_parameter,

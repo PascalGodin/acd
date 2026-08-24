@@ -1369,6 +1369,124 @@ class ProjectDB:
             self._conn.commit()
         return member_id
 
+    def edit_member(self, data_type_name: str, name: str,
+                     member_data_type: Union[str, None] = None,
+                     dimension: Union[int, None] = None,
+                     radix: Union[str, None] = None,
+                     description: Union[str, None] = None) -> None:
+        """Update an existing UDT member's fields in place -- only the
+        fields actually passed (non-`None`) are changed, same "only what
+        you pass" convention as `edit_tag()`/`edit_aoi_parameter()`. Added
+        after a real report, the same shape as the earlier AOI-parameter
+        gap: a member -- newly added via `new_member()`, or already present
+        on a real, pre-existing UDT (the reporting case: a plain field on
+        `Bin_Sequence` needing its description set to match a sibling
+        field's, done by hand in Studio's own UDT editor as the only
+        available fix) -- had no way to change its `description` (or any
+        other field) through this API at all.
+
+        Unlike `dimension` on `edit_aoi_parameter()`, `dimension=None` here
+        has NO ambiguity with "explicitly set to scalar" -- `new_member()`'s
+        own convention already treats `dimension=0` (not `None`) as the
+        real scalar value, so `dimension=None` unambiguously means "leave
+        the current dimension unchanged."
+
+        For a normal (non-BIT, non-hidden-backing) member, reuses
+        `new_member()`'s own radix-default derivation by re-running it
+        against the MERGED (existing + overridden) field set -- one place
+        the defaulting logic lives, same reasoning as `edit_aoi_parameter()`.
+        A DELIBERATE exception to the general "only what you pass changes"
+        rule: if `member_data_type` is changed and `radix` is NOT also
+        explicitly passed, the CURRENT stored radix is discarded (not
+        carried over) in favor of `new_member()`'s own fresh default for
+        the NEW type -- e.g. changing `DINT` to `REAL` re-derives `"Float"`
+        rather than keeping the stale `"Decimal"` a REAL member should
+        never actually have. Pass `radix=` explicitly alongside
+        `member_data_type=` if you need a specific non-default radix on
+        the changed member.
+
+        NOT supported, raising `ValueError` rather than guessing:
+        - `member_data_type="BIT"` -- converting a member TO a BIT-overlay
+          member needs a real backing-field allocation (reusing a free bit
+          in an existing hidden backing member, or creating a new one) that
+          this method has no way to perform; use `new_bit_member()`/
+          `db_new_member(..., member_data_type="BIT")` instead.
+        - Changing `member_data_type`/`dimension` on an member that's
+          ALREADY a BIT-overlay member OR a hidden BIT-backing field (only
+          its `description`/`radix` may be edited through this method) --
+          delete and recreate it via `new_bit_member()`/`new_member()` if a
+          genuinely different type/dimension allocation is needed.
+
+        Raises `KeyError` if `data_type_name`/`name` doesn't resolve to an
+        existing member.
+        """
+        cur = self._conn.cursor()
+        dt_row = cur.execute(
+            "SELECT id FROM proj_data_types WHERE name=? COLLATE NOCASE", (data_type_name,)
+        ).fetchone()
+        if dt_row is None:
+            raise KeyError(f"No DataType named {data_type_name!r}")
+        dt_id = dt_row[0]
+        row = cur.execute(
+            "SELECT id, data_type_name, dimension, radix, hidden, target, description "
+            "FROM proj_members WHERE data_type_id=? AND name=? COLLATE NOCASE",
+            (dt_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No member named {name!r} in DataType {data_type_name!r}")
+        (member_id, cur_dtype, cur_dimension, cur_radix, cur_hidden, cur_target,
+         cur_description) = row
+        is_bit_related = bool(cur_hidden) or cur_target is not None
+
+        if member_data_type is not None and member_data_type.upper() == "BIT":
+            raise ValueError(
+                "edit_member() cannot convert a member to a BIT-overlay member -- use "
+                "new_bit_member()/db_new_member(..., member_data_type='BIT') instead, "
+                "which allocates a real backing field."
+            )
+        if is_bit_related and (member_data_type is not None or dimension is not None):
+            raise ValueError(
+                f"Member {name!r} of {data_type_name!r} is a BIT-overlay member or a "
+                f"hidden BIT-backing field -- only its description/radix may be edited "
+                f"through edit_member(); delete and recreate it via "
+                f"new_bit_member()/new_member() if a different type/dimension "
+                f"allocation is genuinely needed."
+            )
+
+        effective_description = description if description is not None else cur_description
+        # If the data_type is changing and no explicit radix was given,
+        # DON'T carry over the old type's radix -- let _new_member() derive
+        # a fresh default for the NEW type instead (see docstring above).
+        if radix is not None:
+            effective_radix = radix
+        elif member_data_type is not None:
+            effective_radix = None
+        else:
+            effective_radix = cur_radix
+
+        if is_bit_related:
+            # member_data_type is guaranteed None here (raised above
+            # otherwise), so effective_radix already falls back to
+            # cur_radix when radix wasn't explicitly passed.
+            cur.execute(
+                "UPDATE proj_members SET radix=?, description=? WHERE id=?",
+                (effective_radix, effective_description, member_id),
+            )
+        else:
+            effective_dtype = member_data_type if member_data_type is not None else cur_dtype
+            effective_dimension = dimension if dimension is not None else cur_dimension
+            member = _new_member(name, effective_dtype, dimension=effective_dimension,
+                                  radix=effective_radix, description=effective_description)
+            cur.execute(
+                "UPDATE proj_members SET data_type_name=?, dimension=?, radix=?, "
+                "description=? WHERE id=?",
+                (member.data_type, member.dimension, member.radix, member._description,
+                 member_id),
+            )
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
     def new_aoi(self, name: str, description: Union[str, None] = None) -> int:
         """Create a new, empty Add-On Instruction directly in this project's
         DB -- the SQL equivalent of appending `new_aoi(...)`
@@ -2819,6 +2937,19 @@ def db_new_member(acd_path, data_type_name: str, name: str, member_data_type: st
     return _run(acd_path, project_dir, verbose, lambda db: db.new_member(
         data_type_name, name, member_data_type, dimension=dimension, radix=radix,
         description=description, index=index,
+    ))
+
+
+def db_edit_member(acd_path, data_type_name: str, name: str,
+                    member_data_type: Union[str, None] = None,
+                    dimension: Union[int, None] = None,
+                    radix: Union[str, None] = None,
+                    description: Union[str, None] = None,
+                    project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.edit_member()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.edit_member(
+        data_type_name, name, member_data_type=member_data_type, dimension=dimension,
+        radix=radix, description=description,
     ))
 
 

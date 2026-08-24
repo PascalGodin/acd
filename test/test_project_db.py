@@ -1010,6 +1010,114 @@ def test_new_member_missing_data_type_raises_key_error(acd_copy):
         db.close()
 
 
+def test_edit_member_updates_only_passed_fields(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_EM_UDT")
+        db.new_member("PDB_EM_UDT", "Action_12", "BOOL", description="Auto Index Accum Chain")
+
+        db.edit_member("PDB_EM_UDT", "Action_12", description="Auto Index Storage Chain")
+
+        dt = db.get_datatype("PDB_EM_UDT")
+        member = next(m for m in dt["members"] if m["name"] == "Action_12")
+        assert member["description"] == "Auto Index Storage Chain"
+        assert member["data_type"] == "BOOL"  # untouched
+    finally:
+        db.close()
+
+
+def test_edit_member_changes_data_type_and_dimension_via_new_member_defaults(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_EM_UDT2")
+        db.new_member("PDB_EM_UDT2", "Field1", "DINT")
+
+        db.edit_member("PDB_EM_UDT2", "Field1", member_data_type="REAL", dimension=5)
+
+        dt = db.get_datatype("PDB_EM_UDT2")
+        member = next(m for m in dt["members"] if m["name"] == "Field1")
+        assert member["data_type"] == "REAL"
+        assert member["dimension"] == 5
+        assert member["radix"] == "Float"  # re-derived default for REAL
+    finally:
+        db.close()
+
+
+def test_edit_member_rejects_conversion_to_bit(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_EM_UDT3")
+        db.new_member("PDB_EM_UDT3", "Field1", "DINT")
+        with pytest.raises(ValueError, match="cannot convert"):
+            db.edit_member("PDB_EM_UDT3", "Field1", member_data_type="BIT")
+    finally:
+        db.close()
+
+
+def test_edit_member_rejects_type_change_on_existing_bit_member(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_EM_UDT4")
+        db.new_member("PDB_EM_UDT4", "Flag1", "BIT")
+        with pytest.raises(ValueError, match="BIT-overlay member"):
+            db.edit_member("PDB_EM_UDT4", "Flag1", member_data_type="DINT")
+        with pytest.raises(ValueError, match="BIT-overlay member"):
+            db.edit_member("PDB_EM_UDT4", "Flag1", dimension=2)
+    finally:
+        db.close()
+
+
+def test_edit_member_allows_description_on_existing_bit_member(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_EM_UDT5")
+        db.new_member("PDB_EM_UDT5", "Flag1", "BIT")
+
+        db.edit_member("PDB_EM_UDT5", "Flag1", description="a bit flag")
+
+        dt = db.get_datatype("PDB_EM_UDT5")
+        member = next(m for m in dt["members"] if m["name"] == "Flag1")
+        assert member["description"] == "a bit flag"
+        assert member["target"] is not None  # untouched
+    finally:
+        db.close()
+
+
+def test_edit_member_missing_data_type_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        with pytest.raises(KeyError):
+            db.edit_member("NO_SUCH_UDT", "X", description="x")
+    finally:
+        db.close()
+
+
+def test_edit_member_missing_member_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_EM_UDT6")
+        with pytest.raises(KeyError):
+            db.edit_member("PDB_EM_UDT6", "NoSuchMember", description="x")
+    finally:
+        db.close()
+
+
+def test_db_edit_member_stateless_wrapper(acd_copy):
+    from acd import db_edit_member
+
+    db_new_datatype(str(acd_copy), "PDB_EM_UDT7")
+    db_new_member(str(acd_copy), "PDB_EM_UDT7", "Field1", "DINT", description="original")
+
+    db_edit_member(str(acd_copy), "PDB_EM_UDT7", "Field1", description="edited")
+
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        dt = db.get_datatype("PDB_EM_UDT7")
+        assert dt["members"][0]["description"] == "edited"
+    finally:
+        db.close()
+
+
 def test_new_member_bit_type_allocates_backing_field(acd_copy):
     # Regression test for a real reported bug: db_new_member(dt, name, "BIT")
     # used to commit with no error but with hidden=0/target=NULL/bit_number=NULL

@@ -722,6 +722,74 @@ def test_db_set_tag_element_value_builtin_timer_stateless_wrapper(acd_copy):
         db.close()
 
 
+def test_set_tag_element_value_navigates_into_real_project_aoi_member(aoi_acd_copy):
+    # The literal reported bug: a UDT member typed as a REAL, already-
+    # imported project AOI (e.g. "VAB_MCC_IO" in the reporting project)
+    # raised "Type '...' does not resolve to a known DataType" the same
+    # way TIMER/COUNTER used to -- because the data_types_map this method
+    # built never included the real AOI's own synthetic instance-shape
+    # type, which only exists on a real Controller object.
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    real_aoi_name = reference.controller.aois[0].name
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.new_datatype("PDB_HasRealAoiMember")
+        db.new_member("PDB_HasRealAoiMember", "MCC", real_aoi_name)
+        db.new_tag("PDB_RealAoiTag", "PDB_HasRealAoiMember")
+
+        db.set_tag_element_value("PDB_RealAoiTag", "MCC.AOIDINTLocalTag", 42)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "PDB_RealAoiTag")
+        mcc = tag._initial_value["MCC"]
+        assert isinstance(mcc, dict), f"expected a nested structure, got {mcc!r}"
+        assert mcc["AOIDINTLocalTag"] == 42
+    finally:
+        db.close()
+
+
+def test_set_tag_element_value_navigates_into_not_yet_real_aoi_member(acd_copy):
+    # The sibling case: a UDT member typed as an AOI created via
+    # new_aoi()/db_new_aoi() in THIS project DB (not yet imported into
+    # Studio) -- covered by _sync_data_types_map(), not ControllerBuilder's
+    # own real-AOI decode.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NewAoiForNav")
+        db.new_aoi_parameter("PDB_NewAoiForNav", "Speed", "DINT", usage="Input")
+        db.new_datatype("PDB_HasNewAoiMember")
+        db.new_member("PDB_HasNewAoiMember", "Ctrl", "PDB_NewAoiForNav")
+        db.new_tag("PDB_NewAoiTag", "PDB_HasNewAoiMember")
+
+        db.set_tag_element_value("PDB_NewAoiTag", "Ctrl.Speed", 100)
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "PDB_NewAoiTag")
+        assert tag._initial_value["Ctrl"]["Speed"] == 100
+    finally:
+        db.close()
+
+
+def test_db_set_tag_element_value_real_aoi_member_stateless_wrapper(aoi_acd_copy):
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    real_aoi_name = reference.controller.aois[0].name
+
+    db_new_datatype(str(aoi_acd_copy), "PDB_HasRealAoiMemberWrap")
+    db_new_member(str(aoi_acd_copy), "PDB_HasRealAoiMemberWrap", "MCC", real_aoi_name)
+    db_new_tag(str(aoi_acd_copy), "PDB_RealAoiTagWrap", "PDB_HasRealAoiMemberWrap")
+
+    db_set_tag_element_value(str(aoi_acd_copy), "PDB_RealAoiTagWrap", "MCC.AOIDINTLocalTag", 99)
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "PDB_RealAoiTagWrap")
+        assert tag._initial_value["MCC"]["AOIDINTLocalTag"] == 99
+    finally:
+        db.close()
+
+
 def test_set_tag_comment_element_path(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:

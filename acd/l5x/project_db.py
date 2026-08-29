@@ -68,6 +68,7 @@ from loguru import logger as log
 
 from acd.api import (
     _AOI_RESERVED_ROUTINE_NAMES,
+    _sync_data_types_map,
     diff_io_addresses as _diff_io_addresses,
     diff_project as _diff_project,
     diff_routine as _diff_routine,
@@ -1027,6 +1028,21 @@ class ProjectDB:
         a real decoded value that's one member short, is patched rather
         than rejected.
 
+        Navigates into a member typed as a REAL PROJECT AOI the same way
+        as a plain UDT (e.g. a UDT member typed as an AOI like
+        `"VAB_MCC_IO"`) -- via the same synthetic instance-shape
+        `DataType`/`_sync_data_types_map()` machinery `export_routine()`/
+        `export_aoi()`/etc. already rely on for this (see CLAUDE.md's AOI
+        instance-value sections). This is why this method pays for a full
+        `to_controller()` rehydration rather than the cheaper
+        `proj_data_types`-only map every OTHER read method in this class
+        prefers (`get_datatype()`, `get_routine()`'s fast path, ...) --
+        that synthetic-type machinery only exists on a real `Controller`
+        object, and there's no cheaper way to get it. Acceptable here
+        since, unlike `get_routine()`, this is a write typically called
+        once (or a handful of times) per tag, not looped over hundreds of
+        routines.
+
         Raises `KeyError` if `tag_name` doesn't exist in scope, or if a
         member named in `path` doesn't exist on the resolved type at that
         point in the chain. Raises `ValueError` for an out-of-range index,
@@ -1070,8 +1086,13 @@ class ProjectDB:
                 f"not start with an index"
             )
 
-        data_types_map: Dict[str, DataType] = {}
-        self._load_data_types(data_types_map)
+        # Full data_types_map -- project UDTs AND real/DB-created AOI
+        # synthetic instance-shape types (see docstring above for why a
+        # full to_controller() rehydration is needed here, unlike every
+        # other read method in this class).
+        project = self.to_controller()
+        _sync_data_types_map(project)
+        data_types_map = project.controller._data_types_map
 
         if iv_json is None:
             root_member = Member(tag_name, tag_name, data_type_name, dim or 0, None, False,
@@ -1121,30 +1142,41 @@ class ProjectDB:
                     )
                 m_dtype = dict(builtin_members)[real_name]
             else:
-                dt_row = cur.execute(
-                    "SELECT id FROM proj_data_types WHERE name=? COLLATE NOCASE",
-                    (current_type_name,),
-                ).fetchone()
-                if dt_row is None:
+                # data_types_map covers a real project UDT, a real
+                # (already-imported) AOI's own synthetic instance-shape
+                # type, AND a db_new_aoi()-created (not-yet-real) AOI's
+                # synthetic type (via _sync_data_types_map() above) --
+                # uniformly, with no separate AOI-specific handling needed
+                # here. Found via a real report: a UDT member typed as a
+                # real project AOI (e.g. "VAB_MCC_IO") raised the exact
+                # same "does not resolve" error TIMER/COUNTER/CONTROL used
+                # to, because this used to query proj_data_types directly
+                # instead of the richer map that already knows about AOIs.
+                dt_obj = data_types_map.get(current_type_name.upper())
+                if dt_obj is None:
                     raise ValueError(
-                        f"Type {current_type_name!r} does not resolve to a known DataType "
-                        f"in this project DB, nor a built-in Logix struct (TIMER/COUNTER/"
+                        f"Type {current_type_name!r} does not resolve to a known DataType, "
+                        f"a project AOI, or a built-in Logix struct (TIMER/COUNTER/"
                         f"CONTROL) -- cannot navigate to member {member_name!r} of path "
                         f"{path!r} for tag {tag_name!r}"
                     )
-                member_row = cur.execute(
-                    "SELECT name, data_type_name, dimension, radix, hidden, target, "
-                    "bit_number, external_access, description FROM proj_members "
-                    "WHERE data_type_id=? AND name=? COLLATE NOCASE",
-                    (dt_row[0], member_name),
-                ).fetchone()
-                if member_row is None:
+                member_obj = next(
+                    (m for m in dt_obj.members if m.name.upper() == member_name.upper()), None
+                )
+                if member_obj is None:
                     raise KeyError(
                         f"No member named {member_name!r} on type {current_type_name!r} "
                         f"(navigating path {path!r} for tag {tag_name!r})"
                     )
-                (real_name, m_dtype, m_dim, m_radix, m_hidden, m_target, m_bit_number,
-                 m_ext_access, m_desc) = member_row
+                real_name = member_obj.name
+                m_dtype = member_obj.data_type
+                m_dim = member_obj.dimension
+                m_radix = member_obj.radix
+                m_hidden = member_obj.hidden
+                m_target = member_obj.target
+                m_bit_number = member_obj.bit_number
+                m_ext_access = member_obj.external_access
+                m_desc = member_obj._description
 
             if not isinstance(container, dict):
                 raise ValueError(

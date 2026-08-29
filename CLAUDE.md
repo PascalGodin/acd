@@ -4706,6 +4706,67 @@ confirming every sibling status member/array element zero-fills correctly),
 `test_set_tag_element_value_cannot_navigate_past_builtin_timer_leaf`, and
 `test_db_set_tag_element_value_builtin_timer_stateless_wrapper` (`test/test_project_db.py`).
 
+## Eleventh round: `set_tag_element_value()` couldn't navigate into a member typed as a project AOI
+
+Direct follow-up to the tenth round's TIMER/COUNTER/CONTROL fix, and diagnosed by the reporting
+agent as "the same type-resolver... still doesn't check the project's AOI table at all": a UDT
+member typed as a real, already-imported project AOI (`VAB_MOTOR_CTRL_MCC.MCC` typed
+`VAB_MCC_IO`) hit the identical `"does not resolve to a known DataType... nor a built-in Logix
+struct"` error, both through `set_tag_element_value()` directly AND baked into the exported L5X
+(`<DataValueMember Name="MCC" DataType="VAB_MCC_IO" Radix="Decimal" Value="0"/>` where Studio
+needed a full nested `<Structure>`) -- confirmed by the reporting agent to be specific to
+NEWLY-CREATED tags; a tag already imported into Studio previously (`Tray_Accum_Motor[1].MCC`) reads
+back correctly, since acd-tools never had to synthesize its default value for that one.
+
+**Root cause, and why the tenth round's fix didn't already cover this**: the tenth round's navigation
+loop queried `proj_data_types` directly (plus a `_BUILTIN_STRUCT_MEMBERS` check) -- it never had
+access to a real `Controller` object at all, so it had no way to reach the synthetic instance-shape
+`DataType` `ControllerBuilder.build()` already seeds for every real AOI (into `all_data_types_map`,
+keyed by the AOI's own name -- see "AOI Input/Output parameters..."/"Mutating a UDT with live tag
+instances..." sections above for this exact mechanism's own history), nor the `_sync_data_types_map()`
+fallback `export_routine()`/`export_aoi()`/etc. already rely on for a `db_new_aoi()`-created,
+not-yet-real AOI.
+
+**Fix**: `set_tag_element_value()` now calls `self.to_controller()` (a full rehydration) and
+`_sync_data_types_map(project)` (the exact same call `export_routine()`/`export_program()`/
+`export_datatype()`/`export_aoi()` already make) to build its `data_types_map`, instead of the
+cheap `proj_data_types`-only map every OTHER read method in this class prefers (`get_datatype()`,
+`get_routine()`'s fast path, ...). This is a deliberate, explained exception to this class's own
+established "avoid full rehydration where possible" convention (see `get_routine()`'s own extensive
+performance history above) -- justified because, unlike `get_routine()` (which was reported looped
+over ~180 routines), `set_tag_element_value()` is a write typically called once or a handful of
+times per tag, not in a tight loop, so the one-time full-decode cost is an acceptable trade for
+correctly resolving EVERY type category (project UDTs, built-in structs, AND now real/not-yet-real
+AOIs) uniformly through the single canonical map, rather than hand-rolling per-category resolution
+logic that has to be extended again every time a new category turns up (this is the SECOND time in
+two consecutive rounds a hand-rolled "resolve this type name" path missed a whole category).
+
+The navigation loop's member lookup was simplified alongside this: instead of a second, separate
+`proj_members` SQL query per step, it now reads directly off the already-resolved `DataType.members`
+list in `data_types_map` -- one lookup mechanism for every type category (project UDT, real AOI
+synthetic type, DB-created AOI synthetic type), rather than three different code paths.
+
+**Verified**: a UDT member typed as a REAL, pre-existing project AOI (the `AddOnInstruction` fixture
+AOI in `ACDTestsWithAOI.ACD`, which itself carries `EnableIn`/`EnableOut`/a hidden backing field/a
+local tag) now navigates and zero-fills correctly via `set_tag_element_value()`, and the same for a
+member typed as a brand-new, `db_new_aoi()`-created AOI (covered by the `_sync_data_types_map()`
+half of the fix). Both existing TIMER/COUNTER navigation tests from the tenth round and every other
+`set_tag_element_value()` test continue to pass unchanged.
+
+**Known, deliberately out-of-scope caveat, inherited from the AOI-instance-value-decoding gaps
+already documented elsewhere in this file**: this fix gets `set_tag_element_value()` to resolve
+and zero-fill an AOI-typed member's shape AT ALL (a real, all-or-nothing blocker before this) -- it
+does NOT independently fix or improve the underlying fidelity of a REAL AOI's own synthetic
+instance-shape decode (still documented as imperfect in places -- e.g. an L5K value count that
+doesn't match the named-member count in one investigated case). If a resolved AOI-typed member's
+own zero-filled shape ever looks incomplete compared to a real Studio-created instance, that's this
+pre-existing, separately-tracked gap, not a new one introduced here.
+
+Covered by `test_set_tag_element_value_navigates_into_real_project_aoi_member` (the literal
+reported case, against the real `AddOnInstruction` AOI in `ACDTestsWithAOI.ACD`),
+`test_set_tag_element_value_navigates_into_not_yet_real_aoi_member` (the `db_new_aoi()` sibling
+case), and `test_db_set_tag_element_value_real_aoi_member_stateless_wrapper` (`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

@@ -188,11 +188,16 @@ EDITS -- durable the moment the call returns (see above), each raising
     one leaf is set -- no separate "seed a default first" step needed. Same
     zero-fill applies to any missing intermediate member found while
     navigating an existing value. Navigates into a Rockwell BUILT-IN
-    structured type (`TIMER`/`COUNTER`/`CONTROL`) the same as a real
-    project UDT -- e.g. `"[3].StartFaultTimer.PRE"` works even though
-    `TIMER` is never itself a row in the project's own DataType table.
-    Raises `KeyError` for an unknown tag or member, `ValueError` for an
-    out-of-range/mismatched index, an unsupported `path` shape, or trying
+    structured type (`TIMER`/`COUNTER`/`CONTROL`) OR a member typed as a
+    project AOI (real/already-imported, or created via `db_new_aoi()`)
+    the same as a real project UDT -- e.g. `"[3].StartFaultTimer.PRE"` or
+    `"MCC.SomeAoiParam"` both work even though neither `TIMER` nor an AOI
+    name is itself a row in the project's own DataType table. Pays for a
+    full rehydration internally to do this (unlike most other `db_*`
+    reads) -- acceptable since this is a write typically called once per
+    tag, not looped. Raises `KeyError` for an unknown tag or member,
+    `ValueError` for an out-of-range/mismatched index, an unsupported
+    `path` shape, or trying
     to navigate PAST a built-in struct member (every one of `TIMER`/
     `COUNTER`/`CONTROL`'s own members is a plain `DINT`/`BOOL`, never a
     nested struct).

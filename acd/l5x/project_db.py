@@ -18,13 +18,18 @@ owns an unprefixed `rungs` table (raw `object_id, rung, seq_number`
 records) in the SAME `acd.db` file; without the prefix, this module's own
 schema would silently collide with (and DROP) that raw table on rebuild.
 
-`.modules`/`.aois`/`.tasks` and every Controller-level scalar field are
-NOT part of the new editable tables at all -- nothing edits these yet
-(v1 scope is tags, UDT members, rungs, tag comments only). `to_controller()`
-re-derives them fresh from the raw tables via the existing, already-verified
-`ControllerBuilder` every call -- zero new decode logic for these, at the
-cost of redoing that decode work each time `to_controller()` runs (a known,
-accepted v1 tradeoff -- see its own docstring).
+AOIs (parameters, local tags, routines/rungs) are FULLY editable the same way
+Programs/tags/UDTs are -- both a real, pre-existing project AOI and one
+created via `new_aoi()`/`db_new_aoi()` are materialized into `proj_aois`/
+`proj_aoi_parameters`/`proj_aoi_local_tags`/`proj_routines` uniformly (see
+`_materialize()`), so `db_insert_rung(..., aoi_name=...)` and friends work
+against a real AOI's own `"Logic"` routine the same as a Program's routine.
+`.modules`/`.tasks` and every OTHER Controller-level scalar field are still
+NOT part of the editable tables at all -- `to_controller()` re-derives those
+fresh from the raw tables via the existing, already-verified `ControllerBuilder`
+every call -- zero new decode logic for these, at the cost of redoing that
+decode work each time `to_controller()` runs (a known, accepted tradeoff --
+see `to_controller()`'s own docstring).
 
 PREFER THE `db_*` FUNCTIONS BELOW (`db_new_tag`, `db_insert_rung`, ...) over
 `open_project_db()`/`ProjectDB` directly for a typical one-off edit -- each
@@ -528,6 +533,40 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
     for tag in ctrl.tags:
         _insert_tag(_CONTROLLER_SCOPE, "<controller>", tag)
 
+    def _insert_routine(owner_column: str, owner_id: int, owner_label: str,
+                         routine: Routine) -> None:
+        # owner_column is always one of two hardcoded literals this module's
+        # own code passes ("program_id"/"aoi_id"), never external input --
+        # same safe f-string-column-name pattern already used by
+        # _load_routines_where()'s own SELECT.
+        try:
+            cur.execute(
+                f"INSERT INTO proj_routines ({owner_column}, name, type, description) "
+                "VALUES (?, ?, ?, ?)",
+                (owner_id, routine.name, routine.type, routine._description),
+            )
+        except sqlite3.IntegrityError as e:
+            raise sqlite3.IntegrityError(
+                f"proj_routines: routine name {routine.name!r} collides with another "
+                f"routine already inserted in {owner_label} -- Comps.Dat genuinely "
+                f"contains two distinct routine records sharing this (scope, name), "
+                f"and this schema currently requires routine names to be unique per "
+                f"scope. Original error: {e}"
+            ) from e
+        routine_id = cur.lastrowid
+        for i, text in enumerate(routine.rungs):
+            source_object_id = routine._rung_ids[i] if i < len(routine._rung_ids) else None
+            cur.execute(
+                "INSERT INTO proj_rungs (routine_id, rung_index, text, comment, "
+                "source_object_id) VALUES (?, ?, ?, ?, ?)",
+                (routine_id, i, text, routine._rung_comments.get(i), source_object_id),
+            )
+        for i, text in enumerate(routine._st_lines):
+            cur.execute(
+                "INSERT INTO proj_st_lines (routine_id, line_index, text) VALUES (?, ?, ?)",
+                (routine_id, i, text),
+            )
+
     for program in ctrl.programs:
         cur.execute(
             "INSERT INTO proj_programs (name, main_routine_name, fault_routine_name, disabled, "
@@ -539,33 +578,56 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
         for tag in program.tags:
             _insert_tag(program_id, program.name, tag)
         for routine in program.routines:
-            try:
-                cur.execute(
-                    "INSERT INTO proj_routines (program_id, name, type, description) "
-                    "VALUES (?, ?, ?, ?)",
-                    (program_id, routine.name, routine.type, routine._description),
-                )
-            except sqlite3.IntegrityError as e:
-                raise sqlite3.IntegrityError(
-                    f"proj_routines: routine name {routine.name!r} collides with another "
-                    f"routine already inserted in program {program.name!r} -- Comps.Dat "
-                    f"genuinely contains two distinct routine records sharing this "
-                    f"(program, name), and this schema currently requires routine names "
-                    f"to be unique per program. Original error: {e}"
-                ) from e
-            routine_id = cur.lastrowid
-            for i, text in enumerate(routine.rungs):
-                source_object_id = routine._rung_ids[i] if i < len(routine._rung_ids) else None
-                cur.execute(
-                    "INSERT INTO proj_rungs (routine_id, rung_index, text, comment, source_object_id) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (routine_id, i, text, routine._rung_comments.get(i), source_object_id),
-                )
-            for i, text in enumerate(routine._st_lines):
-                cur.execute(
-                    "INSERT INTO proj_st_lines (routine_id, line_index, text) VALUES (?, ?, ?)",
-                    (routine_id, i, text),
-                )
+            _insert_routine("program_id", program_id, f"program {program.name!r}", routine)
+
+    # Every real AOI in the project, materialized the same way a Program
+    # already is (parameters/local tags/routines/rungs all become normal,
+    # directly-editable rows) -- this table used to hold ONLY brand-new
+    # AOIs authored via new_aoi()/db_new_aoi(), deliberately excluding a
+    # real project's own AOIs to avoid dropping their LocalTags (which
+    # weren't trackable in this schema at the time). Now that
+    # proj_aoi_local_tags exists, that original reason no longer applies --
+    # see CLAUDE.md's "real AOI routine editing" section for the real
+    # report (maintaining an existing AOI's logic, e.g. a running plant's
+    # VFD interlock AOI) this was blocking, and the full history of the
+    # narrower "proj_aois never holds a real AOI" design this replaces.
+    for aoi in ctrl.aois:
+        try:
+            cur.execute(
+                "INSERT INTO proj_aois (name, description, revision, revision_extension, "
+                "vendor, execute_prescan, execute_postscan, execute_enable_in_false, "
+                "created_date, created_by, edited_date, edited_by, software_revision) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (aoi.name, aoi._description, aoi.revision, aoi.revision_extension, aoi.vendor,
+                 aoi.execute_prescan, aoi.execute_postscan, aoi.execute_enable_in_false,
+                 aoi.created_date, aoi.created_by, aoi.edited_date, aoi.edited_by,
+                 aoi.software_revision),
+            )
+        except sqlite3.IntegrityError as e:
+            raise sqlite3.IntegrityError(
+                f"proj_aois: AOI name {aoi.name!r} collides with another AOI already "
+                f"inserted -- this schema requires AOI names to be globally unique. "
+                f"Original error: {e}"
+            ) from e
+        aoi_id = cur.lastrowid
+        for seq, p in enumerate(aoi.parameters):
+            cur.execute(
+                "INSERT INTO proj_aoi_parameters (aoi_id, seq, name, data_type_name, "
+                "dimensions, radix, usage, required, visible, external_access, constant, "
+                "description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (aoi_id, seq, p.name, p.data_type, p.dimensions, p.radix, p.usage,
+                 p.required, p.visible, p.external_access, p.constant, p._description),
+            )
+        for seq, lt in enumerate(aoi.local_tags):
+            cur.execute(
+                "INSERT INTO proj_aoi_local_tags (aoi_id, seq, name, data_type_name, "
+                "dimensions, radix, external_access, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (aoi_id, seq, lt.name, lt.data_type, lt.dimensions, lt.radix,
+                 lt.external_access, lt._description),
+            )
+        for routine in aoi.routines:
+            _insert_routine("aoi_id", aoi_id, f"AOI {aoi.name!r}", routine)
+
     db.commit()
 
 
@@ -834,15 +896,15 @@ class ProjectDB:
         return row[0]
 
     def _aoi_id(self, aoi_name: str) -> int:
+        """Resolve an AOI name to its `proj_aois.id` -- covers both a real
+        project AOI (materialized at rebuild time) and one authored via
+        `new_aoi()`/`db_new_aoi()`, uniformly.
+        """
         row = self._conn.execute(
             "SELECT id FROM proj_aois WHERE name=? COLLATE NOCASE", (aoi_name,)
         ).fetchone()
         if row is None:
-            raise KeyError(
-                f"No AOI named {aoi_name!r} -- only AOIs created via new_aoi()/db_new_aoi() "
-                f"in THIS project DB are addressable here, not a real project's pre-existing "
-                f"AOIs (v1 scope limit, see new_aoi()'s own docstring)."
-            )
+            raise KeyError(f"No AOI named {aoi_name!r}")
         return row[0]
 
     def _routine_id(self, routine_name: str, program_name: Union[str, None] = None,
@@ -850,8 +912,8 @@ class ProjectDB:
         """Resolve a routine name to its `proj_routines.id`.
 
         `program_name` given: looks ONLY in that program. `aoi_name` given:
-        looks ONLY in that AOI (created via `new_aoi()`/`db_new_aoi()` in
-        THIS project DB -- same v1 scope limit as `_aoi_id()`). Passing both
+        looks ONLY in that AOI (a real project AOI or one created via
+        `new_aoi()`/`db_new_aoi()`, uniformly). Passing both
         raises `ValueError`. Neither given (both `None`, the default):
         searches every program AND every AOI -- raises `ValueError` naming
         every scope a match was found in if genuinely ambiguous (this is the
@@ -1564,14 +1626,12 @@ class ProjectDB:
         to add its logic routine, the same way `new_member()` populates a
         UDT created via `new_datatype()`.
 
-        v1 scope limit, see `new_aoi()`'s own docstring: this ONLY creates
-        brand-new AOIs -- a real project's own pre-existing AOIs are never
-        readable/editable through this table (`to_controller()` leaves them
-        completely untouched, sourced fresh from the raw ACD data every
-        call, and appends anything from here alongside them). Raises
-        `sqlite3.IntegrityError` if an AOI with this name already exists
-        in THIS table (does not check against a real project's own
-        pre-existing AOI names, which this table has no visibility into).
+        `proj_aois` also holds every real project AOI (materialized at
+        rebuild time -- see `_materialize()`), so `sqlite3.IntegrityError`
+        is raised the same way whether `name` collides with another
+        brand-new AOI or a real, pre-existing project AOI -- a real
+        project can't have two AOIs sharing a name either, so this
+        correctly refuses rather than silently shadowing one.
         """
         aoi = _new_aoi(name, description=description)
         cur = self._conn.cursor()
@@ -1597,21 +1657,21 @@ class ProjectDB:
                            required: Union[str, None] = None, visible: Union[str, None] = None,
                            external_access: Union[str, None] = None,
                            ) -> int:
-        """Add a public parameter to an AOI created via `new_aoi()`/
-        `db_new_aoi()`, at position `index` (default: appended) -- the SQL
-        equivalent of appending `new_aoi_parameter(...)`
-        (`acd/l5x/elements/model.py`) to `AOI.parameters`. See that
-        function's own docstring for `usage`/`radix`/`external_access`/
-        `constant`/`required`/`visible` conventions, including the
-        `required`/`visible`/`external_access` override args here (`None` =
-        this constructor's own default; pass an explicit string to override
-        -- e.g. to build a real `EnableIn`/`EnableOut` parameter by hand, or
-        use `new_aoi_parameter()`/`new_aoi_enable_parameters()` directly and
-        insert the two returned `Parameter` objects yourself if you need the
-        ready-made pair without duplicating this call twice).
+        """Add a public parameter to an AOI (a real project AOI or one
+        created via `new_aoi()`/`db_new_aoi()`, uniformly), at position
+        `index` (default: appended) -- the SQL equivalent of appending
+        `new_aoi_parameter(...)` (`acd/l5x/elements/model.py`) to
+        `AOI.parameters`. See that function's own docstring for
+        `usage`/`radix`/`external_access`/`constant`/`required`/`visible`
+        conventions, including the `required`/`visible`/`external_access`
+        override args here (`None` = this constructor's own default; pass
+        an explicit string to override -- e.g. to build a real
+        `EnableIn`/`EnableOut` parameter by hand, or use `new_aoi_parameter()`/
+        `new_aoi_enable_parameters()` directly and insert the two returned
+        `Parameter` objects yourself if you need the ready-made pair without
+        duplicating this call twice).
 
-        Raises `KeyError` if `aoi_name` doesn't resolve to an AOI created in
-        THIS project DB (see `new_aoi()`'s own v1 scope limit), `ValueError`
+        Raises `KeyError` if `aoi_name` doesn't resolve to any AOI, `ValueError`
         if `usage` isn't `"Input"`/`"Output"`/`"InOut"`, if `dimension` is
         given with a `usage` other than `"InOut"` (Studio 5000 rejects an
         array `Input`/`Output` parameter outright), or if `data_type` isn't
@@ -1658,16 +1718,15 @@ class ProjectDB:
                            dimension: Union[int, None] = None,
                            description: Union[str, None] = None,
                            index: Union[int, None] = None) -> int:
-        """Add a private/scratch LocalTag to an AOI created via `new_aoi()`/
-        `db_new_aoi()`, at position `index` (default: appended) -- the SQL
-        equivalent of appending `new_aoi_local_tag(...)`
-        (`acd/l5x/elements/model.py`) to `AOI.local_tags`. Unlike a
-        `Parameter`, a LocalTag has no `Usage`/`Required`/`Visible` concept
-        -- it's never a public Input/Output/InOut pin, just internal state
-        for the AOI's own logic.
+        """Add a private/scratch LocalTag to an AOI (a real project AOI or
+        one created via `new_aoi()`/`db_new_aoi()`, uniformly), at position
+        `index` (default: appended) -- the SQL equivalent of appending
+        `new_aoi_local_tag(...)` (`acd/l5x/elements/model.py`) to
+        `AOI.local_tags`. Unlike a `Parameter`, a LocalTag has no
+        `Usage`/`Required`/`Visible` concept -- it's never a public
+        Input/Output/InOut pin, just internal state for the AOI's own logic.
 
-        Raises `KeyError` if `aoi_name` doesn't resolve to an AOI created in
-        THIS project DB (see `new_aoi()`'s own v1 scope limit),
+        Raises `KeyError` if `aoi_name` doesn't resolve to any AOI,
         `sqlite3.IntegrityError` if a local tag with this name already
         exists on that AOI.
         """
@@ -1795,9 +1854,10 @@ class ProjectDB:
         EXACTLY ONE of `program_name`/`aoi_name` must be given (unlike
         `new_tag()`, where `program_name=None` means controller scope, a
         routine has no scope-less default -- it always belongs to exactly
-        one Program or one AOI). `aoi_name` must resolve to an AOI created
-        via `new_aoi()`/`db_new_aoi()` in THIS project DB (v1 scope limit,
-        same as `new_aoi_parameter()`). Raises `ValueError` if both or
+        one Program or one AOI). `aoi_name` may be a real project AOI or
+        one created via `new_aoi()`/`db_new_aoi()`, uniformly (e.g. adding
+        a `"Prescan"` routine to a real AOI that only has `"Logic"` so
+        far). Raises `ValueError` if both or
         neither are given, or if `routine_type` isn't `"RLL"`/`"ST"`,
         `KeyError` if the given scope name doesn't resolve,
         `sqlite3.IntegrityError` if a routine with this name already exists
@@ -2316,17 +2376,14 @@ class ProjectDB:
         return self._load_routines_where(self._conn.cursor(), "program_id", program_id)
 
     def _load_aois(self) -> List[AOI]:
-        """Every AOI created via `new_aoi()`/`db_new_aoi()` in THIS project
-        DB, fully populated (parameters + logic routine, if any) -- NEVER a
-        real project's own pre-existing AOIs (v1 scope limit, see
-        `new_aoi()`'s own docstring). `to_controller()` merges this list
-        onto the real, freshly-decoded `.aois`, with a name collision
-        resolved in favor of the AOI loaded HERE (see `to_controller()`'s
-        own comment for why: once a `db_new_aoi()`-authored AOI is actually
-        imported into Studio and re-saved, the real ACD gains an AOI under
-        the same name too, and the one loaded here is always the more
-        current of the two for anyone still editing that name through
-        `db_*`).
+        """Every AOI in this project DB, fully populated (parameters/local
+        tags/routines) -- BOTH a real project's own pre-existing AOIs
+        (materialized at rebuild time, see `_materialize()`) AND any
+        brand-new one authored via `new_aoi()`/`db_new_aoi()` in this
+        session. `to_controller()` uses this as the sole source for
+        `.aois`, fully replacing whatever `ControllerBuilder`'s own fresh
+        from-raw-Comps.Dat decode produced, the same way `.programs`/
+        `.tags`/`.data_types` already work.
         """
         cur = self._conn.cursor()
         rows = cur.execute(
@@ -2370,17 +2427,17 @@ class ProjectDB:
 
     def to_controller(self) -> RSLogix5000Content:
         """Rehydrate a full, fresh `Controller`/`RSLogix5000Content` object
-        graph from this DB. `.tags`/`.data_types`/`.programs` (and their
-        routines/rungs) reflect the CURRENT state of the normalized
-        `proj_*` tables, including any edits made through this `ProjectDB`
-        -- cheap (plain SELECTs into dataclasses, no binary decoding).
-        `.modules`/`.aois`/`.tasks` and every Controller-level scalar field
-        are re-derived fresh from the raw tables via the same
-        `ControllerBuilder` a plain `load_acd()` call uses (not edited
-        through this class in v1 -- see this module's own docstring) --
-        this does real, non-trivial decode work each call (though never
-        re-parses/re-unzips the source `.ACD` itself), a known v1
-        cost/simplicity tradeoff, not a bug.
+        graph from this DB. `.tags`/`.data_types`/`.programs`/`.aois` (and
+        their routines/rungs/parameters/local tags) reflect the CURRENT
+        state of the normalized `proj_*` tables, including any edits made
+        through this `ProjectDB` -- cheap (plain SELECTs into dataclasses,
+        no binary decoding). `.modules`/`.tasks` and every OTHER
+        Controller-level scalar field are still re-derived fresh from the
+        raw tables via the same `ControllerBuilder` a plain `load_acd()`
+        call uses (not edited through this class -- see this module's own
+        docstring) -- this does real, non-trivial decode work each call
+        (though never re-parses/re-unzips the source `.ACD` itself), a
+        known cost/simplicity tradeoff, not a bug.
 
         Call this ONCE per export and get both the returned project and
         the routine/data_type you're about to pass to
@@ -2413,34 +2470,20 @@ class ProjectDB:
         controller.tags = self._load_tags(_CONTROLLER_SCOPE, data_types_map)
         controller.__post_init__()  # recompute io_tags/alias_tags from the new .tags
 
-        # AOIs are handled differently from every other collection here:
-        # APPENDED, never fully replaced -- see _load_aois()'s own docstring
-        # for why (a real project's own pre-existing AOIs, including
-        # LocalTags this DB never persists, must never be touched or
-        # dropped). BUT a real AOI here CAN share a name with a proj_aois
-        # one: once a db_new_aoi()-authored AOI is actually imported into
-        # Studio and the project re-saved, the next rebuild's fresh
-        # ControllerBuilder decode picks up that AOI for real, while the
-        # user keeps editing the SAME name through db_new_aoi_parameter()/
-        # db_new_aoi_local_tag() against the still-separate proj_aois row --
-        # producing two same-named AOI objects in this one list. Any
-        # name-keyed lookup downstream (this class's own export_aoi(), or a
-        # caller's own next(a for a in aois if a.name == ...)) then risks
-        # silently resolving to whichever happens to come first, which used
-        # to be the real one -- stale relative to every edit made since that
-        # import (a real report: Parameters/LocalTags came back from a
-        # 3-recreate-cycles-ago version while db_get_routine()'s routine
-        # content, sourced independently via proj_routines.aoi_id, was
-        # already correctly fresh). The proj_aois-sourced object is always
-        # the more current one for a name the user is actively authoring
-        # through db_*, so it wins any collision -- exclude the
-        # ControllerBuilder-decoded AOI(s) sharing a name with one loaded
-        # here before appending.
-        new_aois = self._load_aois()
-        new_aoi_names = {a.name.upper() for a in new_aois}
-        controller.aois = [
-            a for a in controller.aois if a.name.upper() not in new_aoi_names
-        ] + new_aois
+        # AOIs are now FULLY REPLACED from proj_aois, the same way
+        # .programs/.tags/.data_types already are -- proj_aois holds every
+        # real project AOI (materialized at rebuild time, see
+        # _materialize()) as well as any brand-new one authored via
+        # new_aoi()/db_new_aoi(), so ControllerBuilder's own fresh
+        # from-raw-Comps.Dat AOI decode is discarded here just like its
+        # fresh Program/Tag/DataType decodes already are -- proj_aois is
+        # the single source of truth for AOIs now, not a secondary overlay.
+        # (Previously this APPENDED proj_aois-sourced AOIs onto
+        # ControllerBuilder's own decode, with a name-collision exclusion
+        # rule, because proj_aois used to hold ONLY brand-new AOIs -- see
+        # CLAUDE.md's "real AOI routine editing" section for why that
+        # narrower design was replaced.)
+        controller.aois = self._load_aois()
 
         project = ProjectBuilder(str(self.project_dir / "QuickInfo.XML")).build()
         project.controller = controller
@@ -2514,12 +2557,10 @@ class ProjectDB:
         """`to_controller()` + AOI lookup + the existing, unmodified
         `export_aoi()` in one call. `validate` defaults to `True` here for
         the same reason as `export_routine()`/`export_datatype()` above --
-        see either's own docstring. `aoi_name` must resolve to an AOI
-        created via `new_aoi()`/`db_new_aoi()` in THIS project DB, OR a real
-        project's own pre-existing AOI name (unlike routine/tag lookups, an
-        AOI export doesn't need `new_aoi()` first -- `to_controller()`
-        already includes every real AOI, untouched, alongside anything
-        created here; see `_load_aois()`'s own docstring).
+        see either's own docstring. `aoi_name` may be a real, pre-existing
+        project AOI or one created via `new_aoi()`/`db_new_aoi()` --
+        `to_controller()` sources `.aois` uniformly from `proj_aois` either
+        way (see `_load_aois()`'s own docstring).
 
         See `acd.api.export_aoi()`'s own docstring for the CAUTION about
         this wrapper shape being unverified against a real Studio 5000
@@ -2565,21 +2606,17 @@ class ProjectDB:
     def list_routines(self, program_name: Union[str, None] = None) -> List[dict]:
         """Name/type/line-count for every routine, WITHOUT rung/line
         content -- same shape as `acd.api.list_routines()`. Still sourced
-        via a full `to_controller()` rehydration (NOT the SQL-direct
-        shortcut `get_routine()` now uses -- see its own docstring for why):
-        `proj_routines` never contains a REAL, pre-existing AOI's own
-        routines at all (`_materialize()` only ever walks `ctrl.programs`,
-        never `ctrl.aois` -- deliberate, see `_load_aois()`'s own docstring
-        on why `proj_aois` never holds a real AOI either), so a SQL-only
-        listing here would silently omit every real AOI's routine from the
-        result -- a real, dangerous gap for exactly the "find every routine
-        project-wide" use case this function exists for. Unlike
-        `get_routine()` (one name, cheap to fall back to a full decode only
-        when genuinely needed), there's no equivalently cheap way to list
-        *some* routines fast and merge in the rest, so this method keeps
-        paying the one-time full-decode cost on every call -- acceptable
-        since a caller normally calls this ONCE to see what exists, not in
-        a loop (loop `get_routine()`, not this, if you must; better yet see
+        via a full `to_controller()` rehydration, not a SQL-direct query --
+        `proj_routines` now DOES contain every real AOI's own routines too
+        (materialized at rebuild time, same as `.programs` -- see
+        `_materialize()`), so the original reason this always paid for a
+        full rehydration (a real AOI's routine being invisible to a
+        SQL-only listing) no longer applies; this just hasn't been
+        converted to the SQL-direct shape `get_datatype()`/`list_datatypes()`/
+        `list_aois()` already use, since it wasn't the focus of the change
+        that made it possible. Acceptable in the meantime since a caller
+        normally calls this ONCE to see what exists, not in a loop (loop
+        `get_routine()`, not this, if you must; better yet see
         `db_find_tag_references()` for "who references X" instead of
         looping either one, per `acd.__init__`'s own guidance).
         """
@@ -2670,16 +2707,18 @@ class ProjectDB:
         declaration order. Returns a plain dict, not an `AOI` object, same
         convention as `get_datatype()`/`get_routine()`.
 
-        Tries `proj_aois` first (an AOI created via `new_aoi()`/
-        `db_new_aoi()` in THIS project DB) -- cheap, SQL-direct, no
-        rehydration. FALLS BACK to a full `to_controller()` rehydration ONLY
-        when not found there, which covers a REAL, pre-existing project
-        AOI (never stored in `proj_aois` at all, see `_load_aois()`'s own
-        docstring for why) -- the same fast-path/fallback shape
-        `get_routine()` already uses for the equivalent Program-routine vs.
-        AOI-routine split.
+        Always SQL-direct against `proj_aois`/`proj_aoi_parameters`/
+        `proj_aoi_local_tags` -- no rehydration needed, the same as
+        `get_datatype()` -- since `proj_aois` now holds every AOI in the
+        project (a real, pre-existing one materialized at rebuild time, or
+        one created via `new_aoi()`/`db_new_aoi()`), not just brand-new
+        ones. If a real AOI added to the source `.ACD` since the last
+        rebuild doesn't show up here yet, pass `rebuild=True` to
+        `open_project_db()`/`db_get_aoi()` once (or wait for the automatic
+        mtime-triggered rebuild) -- same as any other schema/materialization
+        change in this module's history.
 
-        Raises `KeyError` if no AOI named `name` exists either way.
+        Raises `KeyError` if no AOI named `name` exists.
         """
         cur = self._conn.cursor()
         row = cur.execute(
@@ -2687,35 +2726,7 @@ class ProjectDB:
             (name,),
         ).fetchone()
         if row is None:
-            project = self.to_controller()
-            aoi = next(
-                (a for a in (project.controller.aois or []) if a.name.upper() == name.upper()),
-                None,
-            )
-            if aoi is None:
-                raise KeyError(f"No AOI named {name!r}")
-            return {
-                "name": aoi.name,
-                "description": aoi._description,
-                "revision": aoi.revision,
-                "parameters": [
-                    {
-                        "name": p.name, "data_type": p.data_type, "dimensions": p.dimensions,
-                        "usage": p.usage, "radix": p.radix, "required": p.required,
-                        "visible": p.visible, "external_access": p.external_access,
-                        "description": p._description,
-                    }
-                    for p in aoi.parameters
-                ],
-                "local_tags": [
-                    {
-                        "name": lt.name, "data_type": lt.data_type, "dimensions": lt.dimensions,
-                        "radix": lt.radix, "external_access": lt.external_access,
-                        "description": lt._description,
-                    }
-                    for lt in aoi.local_tags
-                ],
-            }
+            raise KeyError(f"No AOI named {name!r}")
         aoi_id, real_name, description, revision = row
         param_rows = cur.execute(
             "SELECT name, data_type_name, dimensions, radix, usage, required, visible, "
@@ -2756,24 +2767,21 @@ class ProjectDB:
         `new_aoi()`/`db_new_aoi()` in this project DB) -- the `get_aoi()`
         counterpart to `list_datatypes()`.
 
-        Unlike `list_datatypes()`, this DOES pay for a full
-        `to_controller()` rehydration -- same reasoning as `list_routines()`
-        (see its own docstring): `proj_aois` never holds a real project's
-        own pre-existing AOIs (v1 scope limit), so a SQL-only listing here
-        would silently omit every real AOI, which is worse for a "what AOIs
-        exist" call than the one-time decode cost. Prefer `get_aoi()`
-        directly (or `db_get_project_summary()`'s own AOI name list) over
-        looping this.
+        Always SQL-direct against `proj_aois`/`proj_aoi_parameters` -- same
+        as `list_datatypes()`, no rehydration needed -- now that `proj_aois`
+        holds every AOI in the project, not just brand-new ones (see
+        `get_aoi()`'s own docstring for the same note about a stale,
+        not-yet-rebuilt `acd.db`).
         """
-        project = self.to_controller()
+        rows = self._conn.execute(
+            "SELECT a.name, a.description, a.revision, COUNT(p.id) "
+            "FROM proj_aois a LEFT JOIN proj_aoi_parameters p ON p.aoi_id = a.id "
+            "GROUP BY a.id ORDER BY a.name COLLATE NOCASE"
+        ).fetchall()
         return [
-            {
-                "name": a.name,
-                "description": a._description,
-                "revision": a.revision,
-                "parameter_count": len(a.parameters),
-            }
-            for a in (project.controller.aois or [])
+            {"name": name, "description": description, "revision": revision,
+             "parameter_count": count}
+            for (name, description, revision, count) in rows
         ]
 
     def tag_exists(self, name: str, program_name: Union[str, None] = None) -> bool:
@@ -2807,9 +2815,10 @@ class ProjectDB:
         for why, so a `list_routines()` entry can be fed straight in here.
 
         Sourced DIRECTLY from `proj_routines`/`proj_rungs`/`proj_st_lines`
-        via SQL, NOT via `to_controller()`, for the common case (a Program's
-        routine, or an AOI created via `new_aoi()`/`db_new_aoi()` in THIS
-        project DB) -- a real report found looping this call (or the
+        via SQL, NOT via `to_controller()` -- covers every routine in the
+        project now, real AOI-owned ones included (see `_materialize()`),
+        not just a Program's routine or a `new_aoi()`/`db_new_aoi()`-created
+        AOI's -- a real report found looping this call (or the
         stateless `db_get_routine()`) over every routine in a ~180-routine
         project (a normal "find every reference to X" scan, exactly the
         pattern `db_find_tag_references()`/`find_tag_references()` already
@@ -2828,15 +2837,12 @@ class ProjectDB:
         stateless wrapper -- see below) is a cheap SQL query per routine,
         not a full decode per routine.
 
-        FALLS BACK to a full `to_controller()` rehydration (the old, slow
-        behavior) ONLY when the fast path finds no match at all -- this
-        covers a REAL, pre-existing AOI's own routine, which `proj_routines`
-        never contains (`_materialize()` only ever walks a project's
-        Programs, never its AOIs -- deliberate, see `_load_aois()`'s own
-        docstring). Rare enough in practice (one routine, not 180) that
-        paying the slow path once here is fine; `list_routines()` still
-        always does this (see its own docstring for why a partial/merged
-        fast path isn't safe there the way it is here).
+        Still FALLS BACK to a full `to_controller()` rehydration if the fast
+        path finds no match at all -- kept as a defensive safety net (e.g.
+        an `acd.db` built by an older version of this code, before real
+        AOIs were materialized into `proj_routines`, and not yet rebuilt)
+        rather than because any routine is expected to genuinely need it
+        now.
         """
         try:
             routine_id = self._routine_id(routine_name, program_name, aoi_name)

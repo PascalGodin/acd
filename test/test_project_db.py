@@ -1507,6 +1507,65 @@ def test_new_aoi_can_be_populated_with_parameters_and_routine(acd_copy):
         db.close()
 
 
+def test_insert_rung_into_real_pre_existing_aoi_logic_routine(aoi_acd_copy):
+    # The literal feature request this whole materialization change was
+    # built for: maintaining an EXISTING AOI's own logic is far more
+    # common on a running plant than authoring a brand-new one, but there
+    # used to be no write path at all for a real, pre-existing AOI's
+    # routine content -- db_insert_rung(..., aoi_name=...) only ever
+    # worked for an AOI created via new_aoi()/db_new_aoi() in the same
+    # session. Now a real AOI's own "Logic" routine (already containing
+    # one real rung, "NOP();", in this fixture) is directly editable the
+    # same way a Program's routine already is.
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.insert_rung("Logic", 1, "XIO(Comm_OK)OTE(Stop);", aoi_name="AddOnInstruction")
+
+        routine = db.get_routine("Logic", aoi_name="AddOnInstruction")
+        assert routine["rungs"] == ["NOP();", "XIO(Comm_OK)OTE(Stop);"]
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "AddOnInstruction")
+        logic = next(r for r in aoi.routines if r.name == "Logic")
+        assert logic.rungs == ["NOP();", "XIO(Comm_OK)OTE(Stop);"]
+    finally:
+        db.close()
+
+
+def test_db_insert_rung_into_real_aoi_persists_across_reopen(aoi_acd_copy):
+    db_insert_rung(str(aoi_acd_copy), "Logic", 1, "XIO(Comm_OK)OTE(Stop);",
+                    aoi_name="AddOnInstruction")
+
+    routine = db_get_routine(str(aoi_acd_copy), "Logic", aoi_name="AddOnInstruction")
+    assert routine["rungs"] == ["NOP();", "XIO(Comm_OK)OTE(Stop);"]
+
+
+def test_delete_rung_from_real_pre_existing_aoi_logic_routine(aoi_acd_copy):
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.insert_rung("Logic", 1, "XIO(Comm_OK)OTE(Stop);", aoi_name="AddOnInstruction")
+        db.delete_rung("Logic", 0, aoi_name="AddOnInstruction")
+
+        routine = db.get_routine("Logic", aoi_name="AddOnInstruction")
+        assert routine["rungs"] == ["XIO(Comm_OK)OTE(Stop);"]
+    finally:
+        db.close()
+
+
+def test_export_aoi_reflects_rung_inserted_into_real_pre_existing_aoi(aoi_acd_copy, tmp_path):
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.insert_rung("Logic", 1, "XIO(Comm_OK)OTE(Stop);", aoi_name="AddOnInstruction")
+
+        output_path = tmp_path / "real_aoi_with_new_rung.L5X"
+        db.export_aoi("AddOnInstruction", str(output_path))
+        content = output_path.read_text(encoding="utf-8")
+        assert "XIO(Comm_OK)OTE(Stop)" in content
+        assert "NOP()" in content  # the real, pre-existing rung is still there too
+    finally:
+        db.close()
+
+
 def test_new_aoi_parameter_missing_aoi_raises_key_error(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:
@@ -1725,10 +1784,12 @@ def test_export_routine_raises_clear_error_for_aoi_owned_routine(acd_copy):
 
 
 def test_new_aoi_never_touches_real_pre_existing_aoi(aoi_acd_copy):
-    # Regression/design-confirmation test: proj_aois holds ONLY brand-new
-    # AOIs, never a real project's own -- confirms to_controller() APPENDS
-    # rather than replacing .aois, so a real AOI's own LocalTags (never
-    # persisted through proj_aois at all) survive rehydration untouched.
+    # Design-confirmation test, UPDATED for full AOI materialization (see
+    # CLAUDE.md's "real AOI routine editing" section): proj_aois now holds
+    # EVERY AOI, real ones included (materialized at rebuild time) -- this
+    # test now confirms an UNRELATED new AOI doesn't disturb a real AOI's
+    # own already-materialized LocalTags, not that real AOIs bypass
+    # proj_aois entirely (the old, narrower design this superseded).
     reference = load_acd(str(aoi_acd_copy), verbose=False)
     real_aoi_names = {a.name for a in reference.controller.aois}
     assert real_aoi_names, "fixture should have at least one real AOI"
@@ -1749,45 +1810,37 @@ def test_new_aoi_never_touches_real_pre_existing_aoi(aoi_acd_copy):
         db.close()
 
 
-def test_new_aoi_wins_name_collision_against_real_pre_existing_aoi(aoi_acd_copy):
-    # Regression test for a real report: once a db_new_aoi()-authored AOI is
-    # actually imported into Studio and the project re-saved, the next
-    # rebuild's fresh ControllerBuilder decode picks up that AOI for real,
-    # while proj_aois keeps its own separate, still-being-edited row under
-    # the same name -- to_controller() used to APPEND the fresh proj_aois
-    # object after the real one, so a name-keyed lookup (this class's own
-    # export_aoi(), or any next(a for a in aois if a.name == ...)) could
-    # silently resolve to the stale real one instead. The fixture's real
-    # AOI is named "AddOnInstruction" -- reuse that exact name for a
-    # brand-new proj_aois entry to force the collision.
-    reference = load_acd(str(aoi_acd_copy), verbose=False)
-    real_aoi = next(a for a in reference.controller.aois if a.name == "AddOnInstruction")
-    real_param_names = [p.name for p in real_aoi.parameters]
-
+def test_new_aoi_rejects_name_collision_against_real_pre_existing_aoi(aoi_acd_copy):
+    # Superseded regression test: now that proj_aois materializes every
+    # real project AOI too (see CLAUDE.md's "real AOI routine editing"
+    # section), a name collision between a brand-new AOI and a real one is
+    # caught by the SAME UNIQUE constraint that already rejects two
+    # brand-new AOIs sharing a name -- a real project can't have two AOIs
+    # named the same way either, so refusing is the correct outcome, not
+    # silently letting the fresh one "win" (the previous behavior, back
+    # when proj_aois excluded real AOIs entirely and to_controller() had
+    # to resolve the collision itself).
     db = open_project_db(str(aoi_acd_copy), verbose=False)
     try:
-        db.new_aoi("AddOnInstruction")
-        db.new_aoi_parameter("AddOnInstruction", "FreshParam", "DINT", usage="Input")
-
-        project = db.to_controller()
-        matches = [a for a in project.controller.aois if a.name == "AddOnInstruction"]
-        assert len(matches) == 1, "the real and proj_aois-sourced AOI must not both survive"
-        aoi = matches[0]
-        assert [p.name for p in aoi.parameters] == ["FreshParam"]
-        assert [p.name for p in aoi.parameters] != real_param_names
+        with pytest.raises(sqlite3.IntegrityError):
+            db.new_aoi("AddOnInstruction")  # the fixture's real AOI's own name
     finally:
         db.close()
 
 
-def test_db_export_aoi_uses_fresh_parameters_on_name_collision(aoi_acd_copy, tmp_path):
-    db_new_aoi(str(aoi_acd_copy), "AddOnInstruction")
+def test_db_export_aoi_reflects_edits_to_real_pre_existing_aoi_parameters(aoi_acd_copy, tmp_path):
+    # The real-world need the old collision test used to approximate
+    # (getting a "fresh" parameter into a real AOI's own export) now has a
+    # direct, correct path: edit the REAL AOI's own parameters/local tags
+    # directly, no separate brand-new AOI or collision trick needed at all.
     db_new_aoi_parameter(str(aoi_acd_copy), "AddOnInstruction", "FreshParam", "DINT",
                           usage="Input")
 
-    output_path = tmp_path / "collided_aoi.L5X"
+    output_path = tmp_path / "edited_real_aoi.L5X"
     db_export_aoi(str(aoi_acd_copy), "AddOnInstruction", str(output_path))
     content = output_path.read_text(encoding="utf-8")
     assert 'Name="FreshParam"' in content
+    assert 'Name="EnableIn"' in content  # the AOI's own real parameters are still there too
 
 
 def test_db_new_aoi_stateless_wrappers_and_export(acd_copy, tmp_path):

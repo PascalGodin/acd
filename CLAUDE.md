@@ -4767,6 +4767,121 @@ reported case, against the real `AddOnInstruction` AOI in `ACDTestsWithAOI.ACD`)
 `test_set_tag_element_value_navigates_into_not_yet_real_aoi_member` (the `db_new_aoi()` sibling
 case), and `test_db_set_tag_element_value_real_aoi_member_stateless_wrapper` (`test/test_project_db.py`).
 
+## Twelfth round: real AOI routine editing — full materialization replaces the old "never touch a real AOI" design
+
+A real, well-specified feature request, explicitly NOT a bug: `db_new_aoi()`'s whole write path
+(parameters, local tags, routine content, including `db_insert_rung(..., aoi_name=...)`) only ever
+addressed AOIs created via `new_aoi()`/`db_new_aoi()` in the current session — there was NO write
+path at all for a REAL, pre-existing project AOI's own routine content, even though
+`db_get_routine()`/`db_export_aoi()` could already read one back in full. The concrete, motivating
+need: appending one `Comm_OK`-gated safety rung (forcing Start/Forward/Reverse/ClearFault to 0,
+Stop to 1, and the frequency reference to 0 on comms loss) to each of four real VFD-interlock AOIs
+already in production use — maintaining an EXISTING AOI's logic is the common case on a running
+plant; authoring a brand-new one is comparatively rare.
+
+**Two implementation strategies were on the table, with a real architectural tradeoff between
+them** — presented to the user directly rather than picked silently, since the chosen one touches
+a foundational, previously-deliberate design invariant with real blast radius:
+1. A narrow overlay table recording rung/comment edits keyed by (real AOI name, routine name),
+   applied on top of the real, freshly-decoded AOI routine content at `to_controller()` time —
+   smaller, safer, but a second, parallel code path alongside the existing `proj_routines`-based
+   editing.
+2. Fully materializing every real project AOI into `proj_aois`/`proj_aoi_parameters`/
+   `proj_aoi_local_tags`/`proj_routines` the same way a Program already is — bigger, touches an
+   existing invariant (`proj_aois` used to hold ONLY brand-new AOIs, deliberately, to avoid
+   dropping real LocalTags this schema didn't track yet), but means every existing write method
+   (`insert_rung`, `delete_rung`, `new_aoi_parameter`, `edit_aoi_parameter`, `delete_aoi_parameter`,
+   `new_aoi_local_tag`, `new_routine`, ...) just works against a real AOI uniformly, with zero new
+   code needed beyond materialization itself.
+
+**The user chose option 2 (full materialization).** Implemented as follows:
+
+**`_materialize()`** now walks `ctrl.aois` (every real AOI `ControllerBuilder` just decoded from
+the raw ACD) the same way it already walks `ctrl.programs` — INSERTing each AOI's own row plus its
+parameters/local tags/routines/rungs/ST-lines, via a new shared `_insert_routine(owner_column,
+owner_id, owner_label, routine)` closure (extracted from the Program loop's own previously-inline
+rung/ST-line insertion code, parameterized by `"program_id"`/`"aoi_id"` — the same safe
+hardcoded-literal f-string-column-name pattern `_load_routines_where()` already used). The original
+reason `proj_aois` excluded real AOIs (LocalTags weren't trackable in this schema at the time it was
+first built) no longer applies — `proj_aoi_local_tags` was added in a later round specifically to
+support `new_aoi_local_tag()`, and nothing was ever done to also materialize a real AOI's own real
+LocalTags into it until now.
+
+**`to_controller()`**: `.aois` is now FULLY REPLACED from `_load_aois()` (`controller.aois =
+self._load_aois()`), the same way `.programs`/`.tags`/`.data_types` already are — discarding
+`ControllerBuilder`'s own fresh AOI decode entirely, rather than the old "APPEND `proj_aois`
+entries onto the real decode, with a name-collision-resolution rule favoring the `proj_aois` one"
+logic (needed only because `proj_aois` used to be a separate, incomplete overlay). `proj_aois` is
+now the single source of truth for AOIs, matching every other collection.
+
+**Consequence: `new_aoi()`'s name-collision behavior changed, correctly.** Previously, creating a
+brand-new AOI with the same name as a real, pre-existing one was ALLOWED (silently shadowing the
+real one via the old collision-resolution rule in `to_controller()`) — this was itself a real,
+documented fix from an earlier round (see "AOI creation support" area above), needed back when
+`proj_aois` genuinely could hold two same-named AOI concepts (one real, one DB-authored) at once.
+Now that `proj_aois` has a single row per name covering BOTH cases uniformly, that same collision
+raises `sqlite3.IntegrityError` immediately — correctly, since a real project can't have two AOIs
+sharing a name either; there's no reason to allow this schema to pretend otherwise. Two existing
+tests asserting the OLD "fresh one wins" behavior were rewritten:
+`test_new_aoi_wins_name_collision_against_real_pre_existing_aoi` → 
+`test_new_aoi_rejects_name_collision_against_real_pre_existing_aoi` (asserts the raise);
+`test_db_export_aoi_uses_fresh_parameters_on_name_collision` → 
+`test_db_export_aoi_reflects_edits_to_real_pre_existing_aoi_parameters` (the real-world need the
+old test approximated via a collision trick now has a direct path: edit the real AOI's own
+parameters via `db_new_aoi_parameter()`/`db_edit_aoi_parameter()` directly, no synthetic collision
+needed at all).
+
+**`get_aoi()`/`list_aois()` simplified to always-SQL-direct** (matching `get_datatype()`/
+`list_datatypes()`'s own shape) — their previous `to_controller()` fallback/always-full-rehydration
+behavior existed ONLY because `proj_aois` used to be incomplete for real AOIs; now that it isn't,
+the slow path was dead weight with an increasingly-wrong docstring justifying it. `list_routines()`
+was NOT converted the same way (its own docstring now explains why: not the focus of this change,
+still correct as full-rehydration, just no longer REQUIRED to be) — `get_routine()`'s SQL-direct
+fast path already covers a real AOI's routine directly via `proj_routines.aoi_id` with no change
+needed there at all, and its own now-mostly-dead `to_controller()` fallback is kept as a defensive
+safety net (e.g. a not-yet-rebuilt `acd.db` from before this change) rather than removed.
+
+**A real, deliberate widening of scope beyond "just routine editing," flagged directly rather than
+silently expanded**: full materialization means `db_new_aoi_parameter()`/`db_edit_aoi_parameter()`/
+`db_delete_aoi_parameter()`/`db_new_aoi_local_tag()`/`db_new_routine(..., aoi_name=...)` all now work
+against a REAL AOI's own definition too, not just its routine logic — adding/editing/removing a
+PUBLIC parameter on an already-imported AOI is a materially bigger structural change than editing
+internal ladder logic (it can affect every existing instance call site across the whole project),
+but it's the natural, consistent consequence of removing the "proj_aois never holds a real AOI"
+restriction rather than something specially re-implemented. No new guard was added to restrict this
+narrower-than-full-materialization — the existing per-field validation (`new_aoi_parameter()`'s own
+elementary-type/array-only-on-InOut checks, reserved routine names, etc.) already applies uniformly
+regardless of whether the AOI is real or new.
+
+**Verified**: the exact motivating shape — inserting a new rung into a real, pre-existing AOI's
+`"Logic"` routine (which already contains real content, not an empty stub) — persists correctly
+across `to_controller()` rehydration, is visible via `get_routine()`/`db_get_routine()`, survives a
+close/reopen cycle, and renders correctly in `export_aoi()`'s output alongside the AOI's own
+original, untouched rung content. Deleting a rung from a real AOI's routine, and editing/adding a
+real AOI's own parameters, were verified the same way.
+
+**Known, deliberately out-of-scope caveat inherited from this change, not introduced by it**:
+`AoiBuilder.build()`'s own `ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` decode is
+already documented elsewhere in this file as hardcoded/wrong for a real AOI (never actually read
+from the real ACD binary) — materializing a real AOI through `proj_aois` now PERSISTS that same
+already-wrong value across every rebuild rather than silently re-deriving it fresh each time, which
+is a strictly neutral change (every existing consumer of a real AOI's `.execute_prescan` already saw
+the same wrong value before this round, via `ControllerBuilder`'s own decode) — flagged here so a
+future investigation into fixing that decode gap doesn't mistake this round for having made it
+worse.
+
+Covered by, in `test/test_project_db.py`: `test_insert_rung_into_real_pre_existing_aoi_logic_routine`
+(the literal motivating case, against the real `AddOnInstruction` AOI in `ACDTestsWithAOI.ACD`,
+which already has one real rung),
+`test_db_insert_rung_into_real_aoi_persists_across_reopen`,
+`test_delete_rung_from_real_pre_existing_aoi_logic_routine`,
+`test_export_aoi_reflects_rung_inserted_into_real_pre_existing_aoi`,
+`test_new_aoi_rejects_name_collision_against_real_pre_existing_aoi`,
+`test_db_export_aoi_reflects_edits_to_real_pre_existing_aoi_parameters`, and the updated
+`test_new_aoi_never_touches_real_pre_existing_aoi` (now documenting the new reason it passes, not
+just the old one) — plus every pre-existing AOI test in this file re-verified passing unchanged
+(37 of 39 AOI-related tests needed zero changes at all).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

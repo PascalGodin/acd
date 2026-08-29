@@ -144,21 +144,19 @@ Two separate fixes, worth understanding both:
      wrappers, each of which opens/verifies/closes its own connection.
      `get_routine()` is ALSO now backed directly by SQL
      (`proj_routines`/`proj_rungs`/`proj_st_lines`) for the common case (a
-     Program's routine, or an AOI created via `db_new_aoi()`), not a full
+     Program's routine, or a real/`db_new_aoi()`-created AOI's -- every AOI
+     is now materialized into the same tables a Program's routine already
+     uses, see CLAUDE.md's "real AOI routine editing" section), not a full
      `to_controller()` rehydration, specifically because of this report --
      a full-project routine-by-routine loop with a single connection is a
-     cheap SQL query per routine now for that case, not a full project
-     decode per routine (the original report's slowdown was BOTH factors
-     compounding: opening a new connection AND a full rehydration, on every
-     single iteration). It transparently falls back to the slower, old
-     behavior only for a REAL, pre-existing AOI's own routine (not tracked
-     in the fast path's tables at all) -- rare enough as a single lookup
-     that this is a fine trade. `list_routines()` itself still always does
-     one full `to_controller()` (unavoidable for now: it's the only way to
-     see a real AOI's routines at all, and silently dropping those from a
-     "list every routine" call would be worse than the one-time cost) --
-     but that's ONE call, not the N-times loop that actually caused the
-     reported slowdown.
+     cheap SQL query per routine now, not a full project decode per
+     routine (the original report's slowdown was BOTH factors compounding:
+     opening a new connection AND a full rehydration, on every single
+     iteration). `list_routines()` itself still always does one full
+     `to_controller()` (not required anymore, just not yet converted to
+     the cheaper SQL-direct shape other list methods use) -- but that's
+     ONE call, not the N-times loop that actually caused the reported
+     slowdown.
 
 EDITS -- durable the moment the call returns (see above), each raising
 `KeyError` for an unknown name/scope:
@@ -227,19 +225,21 @@ EDITS -- durable the moment the call returns (see above), each raising
     Add-On Instruction. Use `db_new_aoi_parameter()` to add
     Input/Output/InOut parameters, `db_new_aoi_local_tag()` for private
     scratch storage, and `db_new_routine(..., aoi_name=name)` for its logic
-    routine. **v1 scope limit**: only newly-created AOIs are addressable
-    through this table at all -- a real project's own pre-existing AOIs are
-    never edited through it (though `db_export_aoi()` can still export one
-    of THOSE directly, unmodified or after you mutate it via
-    `db_to_controller()`). `ExecutePrescan`/`ExecutePostscan`/
-    `ExecuteEnableInFalse` and read-back beyond `db_get_project_summary()`'s
-    own AOI name list are still explicitly out of scope for this v1 pass.
+    routine. Raises `sqlite3.IntegrityError` if `name` collides with
+    ANOTHER AOI already in the project -- real or brand-new, uniformly (a
+    real project can't have two AOIs sharing a name either). A real,
+    pre-existing project AOI is FULLY editable through this same table
+    (parameters, local tags, routine content) once materialized at rebuild
+    time -- see CLAUDE.md's "real AOI routine editing" section.
+    `ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` are still not
+    correctly decoded from a real AOI at all (a separate, pre-existing gap
+    -- see `AoiBuilder.build()`'s own history in CLAUDE.md), independent of
+    this.
   - `db_new_aoi_parameter(acd_path, aoi_name, name, data_type,
     usage="Input", dimension=None, description=None, index=None,
     required=None, visible=None, external_access=None)` -- add a public
-    parameter to an AOI created via `db_new_aoi()` (RAISES if `aoi_name` is
-    a real project AOI this table doesn't know about -- same v1 scope limit
-    as `db_new_aoi()` itself). `usage` is `"Input"`, `"Output"`, or
+    parameter to an AOI (real or `db_new_aoi()`-created, uniformly).
+    `usage` is `"Input"`, `"Output"`, or
     `"InOut"`. `required`/`visible`/`external_access` default to
     `"true"`/`"true"`/usage-derived when omitted (`None`) -- pass explicit
     strings to override, e.g. to build the real `EnableIn`/`EnableOut`
@@ -279,13 +279,15 @@ EDITS -- durable the moment the call returns (see above), each raising
   - `db_new_aoi_local_tag(acd_path, aoi_name, name, data_type,
     dimension=None, description=None, index=None)` -- add a private/scratch
     LocalTag (internal AOI state that shouldn't be a public parameter) to
-    an AOI created via `db_new_aoi()` (same v1 scope/RAISES rule as
-    `db_new_aoi_parameter()`). No `Usage`/`Required`/`Visible` concept --
-    unlike a `Parameter`, a LocalTag is never a public pin.
+    an AOI (real or `db_new_aoi()`-created, uniformly). No
+    `Usage`/`Required`/`Visible` concept -- unlike a `Parameter`, a
+    LocalTag is never a public pin.
   - `db_new_routine(acd_path, routine_name, routine_type,
     program_name=None, description=None, aoi_name=None)` -- create a new,
     empty routine (`routine_type` `"RLL"` or `"ST"`) in an EXISTING program
-    OR an AOI created via `db_new_aoi()`. EXACTLY ONE of
+    OR AOI (real or `db_new_aoi()`-created, uniformly -- e.g. adding a
+    `"Prescan"` routine to a real AOI that only has `"Logic"` so far).
+    EXACTLY ONE of
     `program_name`/`aoi_name` is required (unlike `db_new_tag()`, there is
     no controller-scope routine concept to default to for either). Use
     `db_insert_rung()`/`db_insert_st_line()` afterward to populate it.
@@ -422,9 +424,12 @@ confident it's unnecessary and want to skip the pass:
     member of `data_type_name` itself.
   - `db_export_aoi(acd_path, aoi_name, output_path, owner=None,
     validate=True)` -- a standalone partial L5X for Studio's "Import Add-On
-    Instruction..." feature, for creating/modifying an AOI (`db_new_aoi()`/
+    Instruction..." feature, for creating/modifying an AOI -- `db_new_aoi()`/
     `db_new_aoi_parameter()`/`db_new_aoi_local_tag()`/
-    `db_new_routine(..., aoi_name=...)` first). Validates every struct-typed
+    `db_new_routine(..., aoi_name=...)` first for a brand-new AOI, or
+    `db_insert_rung()`/`db_edit_aoi_parameter()`/etc. directly against a
+    REAL, pre-existing project AOI's name (see CLAUDE.md's "real AOI
+    routine editing" section). Validates every struct-typed
     parameter AND local tag of `aoi_name` itself, and (unconditionally, not
     gated by `validate=`) that every one of its routine names is one of
     Rockwell's own reserved set (`"Logic"`/`"Prescan"`/`"Postscan"`/

@@ -5072,6 +5072,79 @@ same synthetic RxGeneric-shaped comps record convention as `_aoi_tag_record()`/
 parametrized case fails under the old hardcoded-`"false"` code before confirming it passes with the
 fix.
 
+## Sixteenth round: spurious clone/rename bookkeeping decoded as real AOI Parameters/LocalTags -- a blank-DataType collision could take down an ENTIRE project's `db_*` access
+
+A real, well-diagnosed report, two severities of the same root cause:
+
+- **Non-fatal**: a real reference project (`Test_SQL_Ref.ACD`, AOI `PE_SQL_ParseTDSResponse`) had
+  two junk `LocalTag`-shaped entries (`$943b741c$`, `$5df874af$`) show up in `db_get_aoi()`'s
+  `local_tags` list -- distinct names, no collision, just cosmetic noise.
+- **Fatal**: after renaming an AOI in Studio, a different real project had 14 such entries, several
+  sharing the identical name (`__CLONE0000000E` x5, `__CLONE0000000F` x4, `__CLONE00000010` x3) --
+  `_materialize()`'s `INSERT INTO proj_aoi_local_tags` (which has a real
+  `UNIQUE(aoi_id, name COLLATE NOCASE)` index, per the AOI-creation-support round above) raised
+  `sqlite3.IntegrityError` on the second colliding name, taking down `open_project_db()`/every
+  `db_*` call against that `acd_path` entirely -- not a scoped, recoverable failure, the whole
+  project became unusable through this library until fixed.
+
+**Root cause, confirmed via `_aoi_tag_data_type()`**: every one of these junk entries has a BLANK
+`data_type` -- `_aoi_tag_data_type()` (`builders_tag.py`) returns `""` whenever an
+RxTagCollection child's own DataType OID pointer (raw offset 0x2A) doesn't resolve to any live
+comps row. A real Parameter/LocalTag always has a real type; a blank one is never a legitimate
+state, only a decode-time signal that the pointer is dangling. The non-Logix-legal names
+(`__CLONE0000000E`, `$11006696$`) are consistent with Rockwell-internal bookkeeping left behind by
+an in-place AOI rename (historically implemented as clone+delete under the hood, per the report's
+own suspicion) -- `AoiBuilder.build()` had no filter for this at all, treating every
+RxTagCollection child as a real Parameter/LocalTag regardless.
+
+**Fix, at the source rather than only at the SQL layer** (matching this codebase's own established
+pattern for other Comps-level decode noise -- hex-named cached-MSG connections, `"__Map:"`-prefixed
+shadow entries, `ZZZZZ_TEMPORARY_IMPORT_DATATYPE_NAME` placeholders, all filtered right where
+they're first read, not downstream): `AoiBuilder.build()` now skips appending any built
+`Parameter`/`LocalTag` whose own `.data_type` is falsy, logging a `log.info()` naming the AOI,
+the spurious child's own name, and its object_id for visibility. This protects every consumer of
+`.aois` uniformly -- `to_controller()`, `export_aoi()`, and `_materialize()`'s own SQL
+insertion -- not just the one call path that happened to crash first. Both severities described in
+the report trace to this exact filter: the non-fatal case (distinct junk names) now simply
+disappears from `local_tags`; the fatal case (colliding junk names) never reaches the SQL insert at
+all, so there's nothing left to collide on.
+
+**Defense-in-depth added at the SQL layer too**, mirroring the exact pattern already used for
+`proj_aois`/`proj_data_types`/`proj_tags`/`proj_routines` name collisions (see "A real .ACD can
+contain two DataTypes with the same name" above): `_materialize()`'s `proj_aoi_parameters`/
+`proj_aoi_local_tags` inserts are now wrapped in `try/except sqlite3.IntegrityError`, re-raising
+with a clear message naming the AOI and the colliding parameter/local-tag name, instead of a bare
+"UNIQUE constraint failed" -- a backstop for any OTHER, not-yet-understood cause of two REAL
+(non-blank-`data_type`) parameters/local tags sharing a name on one AOI, so a future instance of
+this class of bug fails fast and diagnosably rather than reproducing this exact "every `db_*` call
+blocked, no idea why" severity from scratch.
+
+**A real, avoidable test-quality gap found while writing the regression tests for this**: the
+existing `_aoi_tag_record()` synthetic-record helper (`test_elements_helpers.py`, built for the
+AOI parameter-ordering fix above) never set a resolvable DataType OID at all -- meaning
+`test_aoi_builder_orders_parameters_by_member_ref_not_seq_number()`/
+`test_aoi_builder_orders_local_tags_by_member_ref_too()` had been unknowingly testing against the
+exact same blank-`data_type` shape this bug report flagged, the whole time, with nobody having
+checked. Both tests broke the instant the new filter was added. Fixed by giving `_aoi_tag_record()`
+a `data_type_oid` parameter (default: a fixed OID both existing tests now insert a matching dummy
+`DataType` comps row for, so they keep testing ordering, not accidentally the filter) -- rather
+than special-casing around the newly-broken tests, which would have left this same blind spot for
+the next person to trip over.
+
+**Verified end-to-end against the real `Test_SQL_Ref.ACD`** (read-only, scratch copy): all 20 real
+AOIs materialize with no crash, and `PE_SQL_ParseTDSResponse`'s own `local_tags` (20 real entries)
+no longer include either of the two reported junk entries.
+
+Covered by `test_aoi_builder_skips_parameter_with_unresolvable_data_type`,
+`test_aoi_builder_skips_local_tag_with_unresolvable_data_type`,
+`test_aoi_builder_skips_colliding_named_junk_children_without_crashing` (the literal fatal-severity
+repro: 5 children sharing one junk name, confirmed the rebuild doesn't raise and none of them
+appear) -- `test/test_elements_helpers.py`; and
+`test_materialize_raises_clear_error_on_aoi_parameter_name_collision`,
+`test_materialize_raises_clear_error_on_aoi_local_tag_name_collision` (the SQL-layer
+defense-in-depth backstop, constructed directly at the model level since `AoiBuilder` itself no
+longer produces this shape) -- `test/test_project_db.py`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

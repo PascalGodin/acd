@@ -763,7 +763,11 @@ def test_datatype_builder_excludes_deleted_member_with_stale_extended_record():
     assert dt._dead_member_bytes == 2
 
 
-def _aoi_tag_record(member_ref: int, is_param: bool) -> bytes:
+_AOI_TAG_RECORD_DEFAULT_DT_OID = 999900  # arbitrary, must match a comps row callers insert
+
+
+def _aoi_tag_record(member_ref: int, is_param: bool,
+                     data_type_oid: int = _AOI_TAG_RECORD_DEFAULT_DT_OID) -> bytes:
     """Build a synthetic AOI RxTagCollection child (Parameter or LocalTag)
     comps record. `member_ref` (raw offset [14:18]) is the real Rockwell
     order key AoiBuilder now sorts by -- see its own docstring for how this
@@ -773,10 +777,19 @@ def _aoi_tag_record(member_ref: int, is_param: bool) -> bytes:
     arbitrary order. `is_param` sets ext01[0x20E] bit 0x04 (Input) so
     AoiBuilder classifies this child as a Parameter, or leaves it 0 so it's
     classified as a LocalTag (see `_aoi_tag_usage_flags`).
+
+    `data_type_oid` (raw offset 0x2A, `_aoi_tag_data_type()`'s own DataType
+    object_id pointer) defaults to `_AOI_TAG_RECORD_DEFAULT_DT_OID` --
+    callers building a REAL (non-spurious) child must also insert a comps
+    row with that object_id so it resolves to a real type name; pass 0 (or
+    any object_id with no matching comps row) to build a spurious,
+    blank-DataType child, the same shape AoiBuilder now filters out (see
+    `test_aoi_builder_skips_*_with_unresolvable_data_type` below).
     """
     header = struct.pack("<IIHHH", 0, 0, 40, 999, 0)  # 14 bytes
     main_record = bytearray(60)
     struct.pack_into("<I", main_record, 0, member_ref)  # this record's bytes [14:18]
+    struct.pack_into("<I", main_record, 28, data_type_oid)  # this record's bytes [42:46] (0x2A)
     ext01 = bytearray(0x210)
     if is_param:
         ext01[0x20E] = 0x04  # Input usage bit
@@ -826,6 +839,14 @@ def test_aoi_builder_orders_parameters_by_member_ref_not_seq_number():
     cur.execute(
         "INSERT INTO comps VALUES (?,?,?,?,?,?)",
         (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""),
+    )
+    # A resolvable DataType, matching _aoi_tag_record()'s default OID -- AoiBuilder
+    # now filters out any child whose DataType OID doesn't resolve (see the
+    # blank-DataType regression tests below), so a REAL/non-spurious child needs
+    # one for these ordering tests to keep testing ordering, not that filter.
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (_AOI_TAG_RECORD_DEFAULT_DT_OID, 0, "DINT", 0, 256, b""),
     )
     # Real intended order (by member_ref): First(10) < Second(20) < Third(30),
     # inserted here in the OPPOSITE order with an identical seq_number=0 for
@@ -879,6 +900,10 @@ def test_aoi_builder_orders_local_tags_by_member_ref_too():
     )
     cur.execute(
         "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (_AOI_TAG_RECORD_DEFAULT_DT_OID, 0, "DINT", 0, 256, b""),
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
         (THIRD_ID, TAG_COLL_ID, "LT_Third", 0, 256, _aoi_tag_record(30, is_param=False)),
     )
     cur.execute(
@@ -894,6 +919,84 @@ def test_aoi_builder_orders_local_tags_by_member_ref_too():
     aoi = AoiBuilder(cur, AOI_ID).build()
 
     assert [lt.name for lt in aoi.local_tags] == ["LT_First", "LT_Second", "LT_Third"]
+
+
+def _make_aoi_db():
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE nameless(parent_id int, record BLOB)")
+    db.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    return db
+
+
+def test_aoi_builder_skips_parameter_with_unresolvable_data_type():
+    # Regression test for a real, well-diagnosed report: AoiBuilder used to
+    # include ANY RxTagCollection child classified as a parameter, even one
+    # whose DataType OID (raw offset 0x2A) doesn't resolve to any live comps
+    # row -- _aoi_tag_data_type() returns "" for exactly this case. A real
+    # project had these show up with non-Logix-legal names ($11006696$,
+    # __CLONE0000000E) and a blank DataType -- Rockwell-internal bookkeeping
+    # (likely tied to in-place AOI rename, historically clone+delete under
+    # the hood), not a real parameter, that AoiBuilder was picking up as if
+    # it were one.
+    db = _make_aoi_db()
+    cur = db.cursor()
+    AOI_ID, TAG_COLL_ID, JUNK_ID = 1000, 1001, 1100
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (AOI_ID, 0, "TestAOI3", 0, 256, b"\x00" * 20))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""))
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (JUNK_ID, TAG_COLL_ID, "$11006696$", 0, 256, _aoi_tag_record(10, is_param=True, data_type_oid=0)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+    assert aoi.parameters == []
+
+
+def test_aoi_builder_skips_local_tag_with_unresolvable_data_type():
+    db = _make_aoi_db()
+    cur = db.cursor()
+    AOI_ID, TAG_COLL_ID, JUNK_ID = 1200, 1201, 1300
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (AOI_ID, 0, "TestAOI4", 0, 256, b"\x00" * 20))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""))
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (JUNK_ID, TAG_COLL_ID, "__CLONE0000000E", 0, 256, _aoi_tag_record(10, is_param=False, data_type_oid=0)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+    assert aoi.local_tags == []
+
+
+def test_aoi_builder_skips_colliding_named_junk_children_without_crashing():
+    # The FATAL severity from the same report: several spurious children
+    # sharing the IDENTICAL name (__CLONE0000000E x5 in the real project).
+    # Before this fix, these were treated as real LocalTags and, once
+    # inserted into proj_aoi_local_tags (which has a real UNIQUE(aoi_id,
+    # name) index), a rebuild crashed with sqlite3.IntegrityError -- not a
+    # scoped failure, it took down EVERY db_* call against that acd_path.
+    # AoiBuilder itself must never even construct a LocalTag for these, so
+    # there's nothing left for the SQL layer to collide on.
+    db = _make_aoi_db()
+    cur = db.cursor()
+    AOI_ID, TAG_COLL_ID = 1400, 1401
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (AOI_ID, 0, "TestAOI5", 0, 256, b"\x00" * 20))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""))
+    for i, child_id in enumerate([1500, 1501, 1502, 1503, 1504]):
+        cur.execute(
+            "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+            (child_id, TAG_COLL_ID, "__CLONE0000000E", 0, 256,
+             _aoi_tag_record(10 + i, is_param=False, data_type_oid=0)),
+        )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()  # must not raise
+    assert aoi.local_tags == []
 
 
 def _build_aoi_record(flags_byte: int) -> bytes:

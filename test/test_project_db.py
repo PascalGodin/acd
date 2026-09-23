@@ -45,7 +45,14 @@ from acd import (
     open_project_db,
 )
 from acd.api import get_routine, load_acd
-from acd.l5x.elements import DataType, Routine, new_tag
+from acd.l5x.elements import (
+    DataType,
+    Routine,
+    new_aoi,
+    new_aoi_local_tag,
+    new_aoi_parameter,
+    new_tag,
+)
 from acd.l5x import project_db as project_db_module
 from acd.l5x.project_db import (
     _materialize,
@@ -181,6 +188,49 @@ def test_materialize_raises_clear_error_on_routine_name_collision(acd_copy):
     conn = sqlite3.connect(":memory:")
     try:
         with pytest.raises(sqlite3.IntegrityError, match="PDB_DUP_ROUTINE"):
+            _materialize(conn, project, str(acd_copy))
+    finally:
+        conn.close()
+
+
+def test_materialize_raises_clear_error_on_aoi_parameter_name_collision(acd_copy):
+    # Defense-in-depth backstop, per the same "worth checking whether other
+    # collections have the same exposure" reasoning as the tag/routine
+    # collision tests above -- AoiBuilder itself already filters out the
+    # ONE real cause of this found so far (spurious blank-DataType decode
+    # artifacts, see test_aoi_builder_skips_*_with_unresolvable_data_type in
+    # test_elements_helpers.py), so this constructs a genuine collision
+    # directly at the model level to confirm any OTHER cause still fails
+    # with a clear, named diagnosis instead of a bare "UNIQUE constraint
+    # failed" that blocks every db_* call against this acd_path.
+    project = load_acd(str(acd_copy), verbose=False)
+    aoi = new_aoi("PDB_COLLIDE_AOI")
+    aoi.parameters = [
+        new_aoi_parameter("PDB_DUP_PARAM", "DINT", usage="Input"),
+        new_aoi_parameter("PDB_DUP_PARAM", "DINT", usage="Input"),
+    ]
+    project.controller.aois = list(project.controller.aois) + [aoi]
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="PDB_DUP_PARAM"):
+            _materialize(conn, project, str(acd_copy))
+    finally:
+        conn.close()
+
+
+def test_materialize_raises_clear_error_on_aoi_local_tag_name_collision(acd_copy):
+    project = load_acd(str(acd_copy), verbose=False)
+    aoi = new_aoi("PDB_COLLIDE_AOI2")
+    aoi.local_tags = [
+        new_aoi_local_tag("PDB_DUP_LTAG", "DINT"),
+        new_aoi_local_tag("PDB_DUP_LTAG", "DINT"),
+    ]
+    project.controller.aois = list(project.controller.aois) + [aoi]
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="PDB_DUP_LTAG"):
             _materialize(conn, project, str(acd_copy))
     finally:
         conn.close()

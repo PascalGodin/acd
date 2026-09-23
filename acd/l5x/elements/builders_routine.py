@@ -789,14 +789,50 @@ class AoiBuilder(L5xElementBuilder):
             for _, child_oid, is_param, _ in children_with_order:
                 if is_param:
                     try:
-                        parameters.append(ParameterBuilder(self._cur, child_oid).build())
+                        parameter = ParameterBuilder(self._cur, child_oid).build()
                     except Exception:
-                        pass
+                        continue
+                    # A blank data_type means _aoi_tag_data_type() couldn't
+                    # resolve this child's own DataType object_id pointer to
+                    # any live comps row -- never a legitimate state for a
+                    # real Parameter/LocalTag, since every real one always
+                    # has a real type. Found via a real, well-diagnosed
+                    # report: spurious pseudo-members with blank DataType
+                    # and non-Logix-legal names (__CLONE0000000E,
+                    # $11006696$) -- Rockwell-internal bookkeeping, likely
+                    # tied to in-place AOI rename (historically
+                    # clone+delete under the hood) -- that AoiBuilder was
+                    # picking up as if real. Several shared the identical
+                    # name in one real project, tripping
+                    # proj_aoi_parameters'/proj_aoi_local_tags' own
+                    # UNIQUE(aoi_id, name) index and taking down the WHOLE
+                    # project DB's rebuild, not just that one AOI --
+                    # filtering at the source here (rather than only at the
+                    # SQL insert layer) means every consumer of `.aois`
+                    # (to_controller(), export_aoi(), this SQL
+                    # materialization, ...) is protected uniformly. See
+                    # CLAUDE.md for the full investigation.
+                    if not parameter.data_type:
+                        log.info(
+                            f"AOI {name!r}: skipping spurious parameter-shaped child "
+                            f"{parameter.name!r} (object_id={child_oid}) with no resolvable "
+                            "DataType -- likely Rockwell-internal bookkeeping, not a real parameter"
+                        )
+                        continue
+                    parameters.append(parameter)
                 else:
                     try:
-                        local_tags.append(LocalTagBuilder(self._cur, child_oid).build())
+                        local_tag = LocalTagBuilder(self._cur, child_oid).build()
                     except Exception:
-                        pass
+                        continue
+                    if not local_tag.data_type:
+                        log.info(
+                            f"AOI {name!r}: skipping spurious local-tag-shaped child "
+                            f"{local_tag.name!r} (object_id={child_oid}) with no resolvable "
+                            "DataType -- likely Rockwell-internal bookkeeping, not a real local tag"
+                        )
+                        continue
+                    local_tags.append(local_tag)
 
         # --- Extract Routines from RxRoutineCollection ---
         self._cur.execute(

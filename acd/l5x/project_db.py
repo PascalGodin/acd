@@ -624,20 +624,44 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
             ) from e
         aoi_id = cur.lastrowid
         for seq, p in enumerate(aoi.parameters):
-            cur.execute(
-                "INSERT INTO proj_aoi_parameters (aoi_id, seq, name, data_type_name, "
-                "dimensions, radix, usage, required, visible, external_access, constant, "
-                "description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (aoi_id, seq, p.name, p.data_type, p.dimensions, p.radix, p.usage,
-                 p.required, p.visible, p.external_access, p.constant, p._description),
-            )
+            try:
+                cur.execute(
+                    "INSERT INTO proj_aoi_parameters (aoi_id, seq, name, data_type_name, "
+                    "dimensions, radix, usage, required, visible, external_access, constant, "
+                    "description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (aoi_id, seq, p.name, p.data_type, p.dimensions, p.radix, p.usage,
+                     p.required, p.visible, p.external_access, p.constant, p._description),
+                )
+            except sqlite3.IntegrityError as e:
+                # AoiBuilder.build() already filters out blank-DataType
+                # decode artifacts (Rockwell-internal bookkeeping, e.g.
+                # __CLONE/$hex$-named clone/rename leftovers -- see
+                # CLAUDE.md) before they ever reach here, which is what
+                # caused this exact class of collision in practice. This
+                # is a defensive backstop for any OTHER, not-yet-understood
+                # cause of two real parameters sharing a name on one AOI --
+                # a clear, named diagnosis instead of a bare "UNIQUE
+                # constraint failed" that blocks every db_* call against
+                # this acd_path with no indication why.
+                raise sqlite3.IntegrityError(
+                    f"proj_aoi_parameters: AOI {aoi.name!r} has two parameters named "
+                    f"{p.name!r} -- this schema requires parameter names to be unique per "
+                    f"AOI. Original error: {e}"
+                ) from e
         for seq, lt in enumerate(aoi.local_tags):
-            cur.execute(
-                "INSERT INTO proj_aoi_local_tags (aoi_id, seq, name, data_type_name, "
-                "dimensions, radix, external_access, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (aoi_id, seq, lt.name, lt.data_type, lt.dimensions, lt.radix,
-                 lt.external_access, lt._description),
-            )
+            try:
+                cur.execute(
+                    "INSERT INTO proj_aoi_local_tags (aoi_id, seq, name, data_type_name, "
+                    "dimensions, radix, external_access, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (aoi_id, seq, lt.name, lt.data_type, lt.dimensions, lt.radix,
+                     lt.external_access, lt._description),
+                )
+            except sqlite3.IntegrityError as e:
+                raise sqlite3.IntegrityError(
+                    f"proj_aoi_local_tags: AOI {aoi.name!r} has two local tags named "
+                    f"{lt.name!r} -- this schema requires local tag names to be unique per "
+                    f"AOI. Original error: {e}"
+                ) from e
         for routine in aoi.routines:
             _insert_routine("aoi_id", aoi_id, f"AOI {aoi.name!r}", routine)
 

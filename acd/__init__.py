@@ -202,6 +202,17 @@ EDITS -- durable the moment the call returns (see above), each raising
   - `db_new_datatype(acd_path, name, description=None)` -- create a new,
     empty UDT. Use `db_new_member()` afterward to populate it, the same
     way you already would for an existing UDT.
+  - `db_new_string_datatype(acd_path, name, max_length, description=None)`
+    -- create a new, FULLY POPULATED custom-length STRING-family UDT (e.g.
+    a project's own `STRING_1500`/`STR_8192`-style type) in one call --
+    `LEN` (scalar `DINT`) + `DATA` (`SINT[max_length]`, `Radix="ASCII"`),
+    with `Family="StringFamily"` actually set. `db_new_datatype()` +
+    `db_new_member()` CANNOT build a real string type -- the result looks
+    identical (same LEN/DATA members) but `Family` stays `"NoFamily"`,
+    which is the ONE thing Logix's own string instructions
+    (`CONCAT`/`DTOS`/`MID`/`INSERT`/`FIND`/...) check to recognize a type
+    as a real string -- a lookalike UDT built that way silently fails to
+    work with any of them in Studio, a late/quiet failure, not a loud one.
   - `db_new_member(acd_path, data_type_name, name, member_data_type,
     dimension=0, radix=None, description=None, index=None)` -- add a
     member to an EXISTING UDT, at `index` (default: appended).
@@ -516,6 +527,7 @@ from acd.l5x.project_db import (  # noqa: F401
     db_list_tag_comments,
     db_set_tag_element_value,
     db_new_datatype,
+    db_new_string_datatype,
     db_new_member,
     db_edit_member,
     db_new_aoi,

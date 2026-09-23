@@ -326,6 +326,44 @@ def new_datatype(name: str, description: Union[str, None] = None) -> DataType:
     return DataType(name, name, "NoFamily", "User", [], _description=description)
 
 
+def new_string_datatype(name: str, max_length: int, description: Union[str, None] = None) -> DataType:
+    """Construct a new custom-length STRING-family `DataType` (e.g. a
+    project's own `STRING_1500`/`STR_8192`-style type) for insertion into
+    `project.controller.data_types` -- `new_datatype()` deliberately has no
+    way to produce one (see its own docstring: `"StringFamily" only applies
+    to a string-family type, which isn't what this constructs"`), and there
+    was previously no `db_*`/constructor path to build one at all.
+
+    Unlike `new_datatype()`, this returns a FULLY POPULATED type, not an
+    empty one to build up via `new_member()` -- a string-family type's
+    shape is always exactly the same two members (`LEN`: scalar `DINT`,
+    `DATA`: `SINT[max_length]` with `Radix="ASCII"`), confirmed against a
+    real project's own `STRING20` fixture type, so there's nothing for a
+    caller to legitimately vary beyond the name/length/description already
+    covered by this function's own parameters.
+
+    `family="StringFamily"` is the ONE thing `_is_string_family_type()`
+    (`elements/types.py`) checks to decide whether a type is a real string
+    for Logix's own string instructions (`CONCAT`/`DTOS`/`MID`/`INSERT`/
+    `FIND`/...) -- a lookalike UDT hand-built from `new_datatype()` +
+    `new_member()` (LEN/DATA members, but `family="NoFamily"`) LOOKS
+    identical on the surface but silently fails to work with any of them in
+    Studio, a late/quiet failure mode rather than a loud one. `cls` is
+    always `"User"` (a string-family type a caller creates by hand is never
+    `"ProductDefined"`/`"IO"`, same reasoning as `new_datatype()`'s own
+    fixed `cls`).
+
+    `max_length` becomes `DATA`'s own `Dimension` -- `_string_family_capacity()`
+    (`elements/types.py`) reads exactly this field back to determine the
+    type's own character capacity, so this is the one value that actually
+    matters beyond the type's name.
+    """
+    len_member = new_member("LEN", "DINT")
+    data_member = new_member("DATA", "SINT", dimension=max_length, radix="ASCII")
+    return DataType(name, name, "StringFamily", "User", [len_member, data_member],
+                     _description=description)
+
+
 # Maps primitive DataType names to their L5K zero-default value string.
 # UDT, STRING, ALARM_DIGITAL, MESSAGE, and array types are intentionally omitted —
 # they require complex structured L5K encoding that is not yet implemented.

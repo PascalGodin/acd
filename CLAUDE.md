@@ -4882,6 +4882,62 @@ which already has one real rung),
 just the old one) — plus every pre-existing AOI test in this file re-verified passing unchanged
 (37 of 39 AOI-related tests needed zero changes at all).
 
+## Thirteenth round: `db_new_string_datatype()` — `db_new_datatype()` could never produce a real string type
+
+A real, well-diagnosed gap: `db_new_datatype()`'s own docstring already says explicitly "there is
+no override parameter: `StringFamily` only applies to a string-family type, which isn't what this
+constructs" — but there was no `db_*` path anywhere that COULD produce one. A custom-length STRING
+(Rockwell's own `STRING_1500`/`STR_8192`-style types — `LEN`:`DINT` + `DATA`:`SINT[n]`,
+`Family="StringFamily"`) is routine in a real project (anywhere a string longer than the built-in
+82-char `STRING` is needed), and hand-building one via `db_new_datatype()` + `db_new_member(...,
+"LEN", "DINT")` + `db_new_member(..., "DATA", "SINT", dimension=n)` produces a struct that LOOKS
+identical on the surface but is `Family="NoFamily"` — confirmed by the report directly:
+`db_get_datatype()` on a real project's own `STR_8192`/`STR_1500`/`PE_STR_480` types all show
+`family: StringFamily`, while a hand-built lookalike UDT created the same session read back
+`family: NoFamily`. `_is_string_family_type()` (`elements/types.py`) checks EXACTLY this one field
+to decide whether Logix's own string instructions (`CONCAT`/`DTOS`/`MID`/`INSERT`/`FIND`/...)
+recognize a type as a real string — a `NoFamily` lookalike silently fails to work with any of them
+in Studio, the same "succeeds, quietly wrong" failure shape this file's own methodology repeatedly
+warns hardest against, not a loud error.
+
+**The decode side already fully understood this concept** (`DataTypeBuilder.build()`,
+`builders_datatype.py`: `string_family = "StringFamily" if string_family_int == 1 else "NoFamily"`,
+read from extended record `0x6C`) — the capability existed for READING a real string-family type,
+just never for CREATING one, the exact shape of gap this codebase has closed several times before
+for other object kinds (AOIs, routines, plain UDTs — see their own "creation-side gap" sections
+above).
+
+Added `new_string_datatype(name, max_length, description=None) -> DataType`
+(`acd/l5x/elements/model.py`) and `ProjectDB.new_string_datatype()`/`db_new_string_datatype()`
+(`acd/l5x/project_db.py`), following the report's own suggested shape rather than overloading
+`new_datatype()` with a family kwarg (keeping `new_datatype()`'s own "no override, this constructs
+one specific thing" contract intact, matching its existing docstring's own stated reasoning). Two
+deliberate differences from `new_datatype()`'s own "starts empty, populate via `new_member()`"
+convention, both because a string-family type has exactly one correct shape, not an arbitrary one a
+caller builds up:
+- `family="StringFamily"`, `cls="User"` (fixed, like `new_datatype()`'s own fixed values).
+- Returns/creates a FULLY POPULATED type in one call — `LEN` (scalar `DINT`, `Radix="Decimal"`) +
+  `DATA` (`SINT[max_length]`, `Radix="ASCII"`) — confirmed against a real project's own `STRING20`
+  fixture type's exact member shape (`Radix="ASCII"` on `DATA` specifically, not the primitive
+  default `"Decimal"` a plain `SINT` array would otherwise get via `new_member()`'s own radix
+  derivation) rather than requiring two more `db_new_member()` calls to build the one shape that's
+  ever actually correct. `max_length` becomes `DATA`'s own `Dimension` — the exact field
+  `_string_family_capacity()` already reads back to determine a string type's real character
+  capacity, so this is the one value beyond the name that actually matters.
+
+**Verified**: a tag created against a `new_string_datatype()`-built type renders through the SAME
+string-family XML/value path a real `STRING`/`STRING20` tag already uses (`_is_string_family_type()`
+correctly returns `True`, `_string_family_capacity()` correctly reads back `max_length`, and a tag
+of this type with a `{"LEN": ..., "DATA": ...}` value renders its text content in the output XML) —
+not just that the `DataType` object's own fields look right in isolation.
+
+Covered by `test_new_string_datatype_shape`, `test_new_string_datatype_is_recognized_as_string_family`
+(`test/test_api.py`, the pure constructor) and `test_new_string_datatype_creates_len_and_data_members`,
+`test_new_string_datatype_duplicate_name_raises`, `test_db_new_string_datatype_stateless_wrapper_and_export`,
+`test_new_string_datatype_usable_as_a_tag_type` (`test/test_project_db.py` — the last one confirming
+the created type actually renders through the real string-family value path, not just that its own
+`family` field is set correctly in isolation).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

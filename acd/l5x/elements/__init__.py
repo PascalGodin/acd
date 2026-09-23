@@ -67,6 +67,7 @@ from .model import (
     new_tag,
     DataType,
     new_datatype,
+    new_string_datatype,
     Tag,
     LocalTag,
     new_aoi_local_tag,

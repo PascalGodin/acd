@@ -44,6 +44,9 @@ from acd.l5x.elements import (
     new_aoi_parameter,
     new_bit_member,
     new_datatype,
+    new_string_datatype,
+    _is_string_family_type,
+    _string_family_capacity,
     new_member,
     new_routine,
     new_tag,
@@ -561,6 +564,29 @@ def test_new_datatype_result_can_be_populated_with_new_member():
     dt.members.append(bit_member)
 
     assert [m.name for m in dt.members] == ["Field1", bit_member.target, "Flag1"]
+
+
+def test_new_string_datatype_shape():
+    dt = new_string_datatype("STR_500", 500, description="a test string type")
+    assert dt.name == "STR_500"
+    assert dt.family == "StringFamily"
+    assert dt.cls == "User"
+    assert dt._description == "a test string type"
+    assert [m.name for m in dt.members] == ["LEN", "DATA"]
+    len_member, data_member = dt.members
+    assert len_member.data_type == "DINT"
+    assert len_member.dimension == 0
+    assert len_member.radix == "Decimal"
+    assert data_member.data_type == "SINT"
+    assert data_member.dimension == 500
+    assert data_member.radix == "ASCII"
+
+
+def test_new_string_datatype_is_recognized_as_string_family():
+    dt = new_string_datatype("STR_500", 500)
+    data_types_map = {"STR_500": dt}
+    assert _is_string_family_type("STR_500", data_types_map) is True
+    assert _string_family_capacity("STR_500", data_types_map) == 500
 
 
 def test_new_routine_rll():

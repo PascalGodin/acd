@@ -111,6 +111,7 @@ from acd.l5x.elements import (
     new_aoi_parameter as _new_aoi_parameter,
     new_bit_member as _new_bit_member,
     new_datatype as _new_datatype,
+    new_string_datatype as _new_string_datatype,
     new_member as _new_member,
     new_routine as _new_routine,
     new_tag as _new_tag,
@@ -1392,6 +1393,48 @@ class ProjectDB:
             (dt.name, dt.family, dt.cls, dt._description),
         )
         dt_id = cur.lastrowid
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+        return dt_id
+
+    def new_string_datatype(self, name: str, max_length: int,
+                             description: Union[str, None] = None) -> int:
+        """Create a new, FULLY POPULATED custom-length STRING-family UDT in
+        this project's DB -- the SQL equivalent of `new_string_datatype(...)`
+        (`acd/l5x/elements/model.py`), which see for why `new_datatype()` +
+        `new_member()` can't produce a real string type at all (the
+        resulting UDT LOOKS identical -- LEN/DATA members -- but silently
+        fails to work with any of Logix's own string instructions, since
+        `family="StringFamily"` is the one thing that actually marks a type
+        as a real string, and plain `new_datatype()` never sets it).
+
+        Unlike `new_datatype()`, this inserts the type AND its two members
+        (`LEN`: scalar `DINT`; `DATA`: `SINT[max_length]`, `Radix="ASCII"`)
+        in the SAME call -- a string-family type's shape is always exactly
+        these two members, so there's no reason to require two more
+        `new_member()` calls to build something that can only ever have one
+        correct shape.
+
+        Raises `sqlite3.IntegrityError` if a DataType with this name
+        already exists -- same global/project-wide uniqueness as
+        `new_datatype()`.
+        """
+        dt = _new_string_datatype(name, max_length, description=description)
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO proj_data_types (name, family, cls, description) VALUES (?, ?, ?, ?)",
+            (dt.name, dt.family, dt.cls, dt._description),
+        )
+        dt_id = cur.lastrowid
+        for seq, m in enumerate(dt.members):
+            cur.execute(
+                "INSERT INTO proj_members (data_type_id, seq, name, data_type_name, dimension, "
+                "radix, hidden, target, bit_number, external_access, description) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (dt_id, seq, m.name, m.data_type, m.dimension, m.radix, int(m.hidden),
+                 m.target, m.bit_number, m.external_access, m._description),
+            )
         cur.execute("UPDATE proj_meta SET dirty=1")
         if not self._in_transaction:
             self._conn.commit()
@@ -3000,6 +3043,15 @@ def db_new_datatype(acd_path, name: str, description: Union[str, None] = None,
     """Stateless equivalent of `ProjectDB.new_datatype()` -- see its docstring."""
     return _run(acd_path, project_dir, verbose, lambda db: db.new_datatype(
         name, description=description,
+    ))
+
+
+def db_new_string_datatype(acd_path, name: str, max_length: int,
+                            description: Union[str, None] = None,
+                            project_dir=None, verbose: bool = False) -> int:
+    """Stateless equivalent of `ProjectDB.new_string_datatype()` -- see its docstring."""
+    return _run(acd_path, project_dir, verbose, lambda db: db.new_string_datatype(
+        name, max_length, description=description,
     ))
 
 

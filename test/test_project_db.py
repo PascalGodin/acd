@@ -1137,6 +1137,69 @@ def test_db_new_datatype_stateless_wrapper_and_export(acd_copy, tmp_path):
     assert 'Name="Field1"' in content
 
 
+def test_new_string_datatype_creates_len_and_data_members(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_string_datatype("PDB_STR_500", 500, description="a test string type")
+
+        dt = db.get_datatype("PDB_STR_500")
+        assert dt["family"] == "StringFamily"
+        assert dt["cls"] == "User"
+        assert dt["description"] == "a test string type"
+        assert [m["name"] for m in dt["members"]] == ["LEN", "DATA"]
+        len_member, data_member = dt["members"]
+        assert len_member["data_type"] == "DINT"
+        assert data_member["data_type"] == "SINT"
+        assert data_member["dimension"] == 500
+        assert data_member["radix"] == "ASCII"
+    finally:
+        db.close()
+
+
+def test_new_string_datatype_duplicate_name_raises(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_string_datatype("PDB_STR_DUP", 100)
+        with pytest.raises(sqlite3.IntegrityError):
+            db.new_string_datatype("PDB_STR_DUP", 200)
+    finally:
+        db.close()
+
+
+def test_db_new_string_datatype_stateless_wrapper_and_export(acd_copy, tmp_path):
+    from acd import db_new_string_datatype
+
+    db_new_string_datatype(str(acd_copy), "PDB_STR_WRAP", 1500, description="a wrapper test")
+
+    output_path = tmp_path / "new_string_datatype.L5X"
+    db_export_datatype(str(acd_copy), "PDB_STR_WRAP", str(output_path))
+    content = output_path.read_text(encoding="utf-8")
+    assert 'Name="PDB_STR_WRAP"' in content
+    assert 'Family="StringFamily"' in content
+    assert 'Name="LEN"' in content
+    assert 'Name="DATA"' in content
+    assert 'Radix="ASCII"' in content
+
+
+def test_new_string_datatype_usable_as_a_tag_type(acd_copy):
+    # Confirms the created type is recognized as a real string, not just a
+    # lookalike UDT -- a tag of this type should decode/render its value
+    # through the string-family path (LEN/DATA dict shape), matching a real
+    # STRING-family tag's own shape rather than a bare struct's.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_string_datatype("PDB_STR_TAG_TYPE", 20)
+        db.new_tag("PDB_STR_TAG", "PDB_STR_TAG_TYPE", value={"LEN": 5, "DATA": "hello"})
+
+        project = db.to_controller()
+        tag = next(t for t in project.controller.tags if t.name == "PDB_STR_TAG")
+        xml = tag.to_xml()
+        assert 'DataType="PDB_STR_TAG_TYPE"' in xml
+        assert "hello" in xml
+    finally:
+        db.close()
+
+
 def test_new_member_appends_by_default(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:

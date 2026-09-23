@@ -2788,11 +2788,15 @@ class ProjectDB:
         ]
 
     def get_aoi(self, name: str) -> dict:
-        """The current shape of one AOI -- name/description/revision plus
-        every parameter (name/data_type/dimensions/usage/radix/required/
-        visible/external_access/description) and every local tag, in
-        declaration order. Returns a plain dict, not an `AOI` object, same
-        convention as `get_datatype()`/`get_routine()`.
+        """The current shape of one AOI -- name/description/revision/
+        execute_prescan/execute_postscan/execute_enable_in_false (each
+        `"true"`/`"false"`; see `new_aoi()`'s own docstring,
+        `acd/l5x/elements/model.py`, for why getting these three wrong is a
+        SILENT Studio 5000 failure, not a loud one) plus every parameter
+        (name/data_type/dimensions/usage/radix/required/visible/
+        external_access/description) and every local tag, in declaration
+        order. Returns a plain dict, not an `AOI` object, same convention as
+        `get_datatype()`/`get_routine()`.
 
         Always SQL-direct against `proj_aois`/`proj_aoi_parameters`/
         `proj_aoi_local_tags` -- no rehydration needed, the same as
@@ -2809,12 +2813,14 @@ class ProjectDB:
         """
         cur = self._conn.cursor()
         row = cur.execute(
-            "SELECT id, name, description, revision FROM proj_aois WHERE name=? COLLATE NOCASE",
+            "SELECT id, name, description, revision, execute_prescan, execute_postscan, "
+            "execute_enable_in_false FROM proj_aois WHERE name=? COLLATE NOCASE",
             (name,),
         ).fetchone()
         if row is None:
             raise KeyError(f"No AOI named {name!r}")
-        aoi_id, real_name, description, revision = row
+        (aoi_id, real_name, description, revision, execute_prescan, execute_postscan,
+         execute_enable_in_false) = row
         param_rows = cur.execute(
             "SELECT name, data_type_name, dimensions, radix, usage, required, visible, "
             "external_access, constant, description FROM proj_aoi_parameters "
@@ -2830,6 +2836,9 @@ class ProjectDB:
             "name": real_name,
             "description": description,
             "revision": revision,
+            "execute_prescan": execute_prescan,
+            "execute_postscan": execute_postscan,
+            "execute_enable_in_false": execute_enable_in_false,
             "parameters": [
                 {
                     "name": pname, "data_type": dtype, "dimensions": dims, "usage": usage,

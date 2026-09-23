@@ -3392,8 +3392,8 @@ string all matched exactly.
    wrapper level too in the real file) — a small, low-risk addition alongside the other two.
 
 **A separate, real, CONFIRMED bug found in the EXISTING decode path (`AoiBuilder.build()`), unrelated
-to this session's AOI-creation feature — left un-fixed, deliberately, pending more data.**
-`execute_prescan`/`execute_postscan`/`execute_enable_in_false` are hardcoded to `"false", "false",
+to this session's AOI-creation feature — left un-fixed at the time, deliberately, pending more data.**
+`execute_prescan`/`execute_postscan`/`execute_enable_in_false` were hardcoded to `"false", "false",
 "false"` in `AoiBuilder.build()`'s own `return AOI(...)` call — never actually read from the real ACD
 binary at all. The real `AOI_SNTP_QUERY` has `ExecutePrescan="true"` (a real, load-bearing setting,
 not incidental) — confirmed genuinely the same AOI via the matching millisecond-precision
@@ -3401,11 +3401,15 @@ not incidental) — confirmed genuinely the same AOI via the matching millisecon
 explanation. **Not fixed in this pass**: finding the real byte offset/bit for these three flags would
 need reverse-engineering against MULTIPLE real samples with different True/False combinations (the
 same rigor this file's own "Connection Type / RPI" and "BIT-overlay member Target resolution"
-investigations required) — only ONE real data point is available so far (Prescan=true,
+investigations required) — only ONE real data point was available at the time (Prescan=true,
 Postscan=false, EnableInFalse=false), nowhere near enough to safely triangulate an offset without
 risking a wrong guess that looks plausible but isn't (the exact mistake this file has been burned by
-more than once — see its own repeated "don't guess a fix without real data" lesson). Revisit with
-more real AOI samples if this becomes a real blocker.
+more than once — see its own repeated "don't guess a fix without real data" lesson).
+
+**UPDATE — fixed, with real multi-sample data. See "Fifteenth round" below** for the full
+investigation: the user supplied 4 real, isolated single-flag-at-a-time saves of a real AOI
+specifically to close this gap, which triangulated all three bits (`0x10`/`0x04`/`0x01` at ext01
+relative offset 2) with no remaining ambiguity.
 
 **Known, NOT-yet-addressed gaps this same comparison surfaced, still open** (both now confirmed real,
 not speculative, but genuinely out of scope for this pass):
@@ -3474,10 +3478,10 @@ enough to add together):
   mode this whole `validate=True` mechanism exists to catch early (see "Second convenience-API batch"
   above for the original incident this pattern was built to prevent).
 
-**Still not fixed, deliberately, same reasoning as before**: `ExecutePrescan`/`ExecutePostscan`/
-`ExecuteEnableInFalse` decode (confirmed wrong via the real `AOI_SNTP_QUERY` instance, see above) is
-unrelated to either of these two gaps and still needs more real samples before a byte-offset fix is
-safe to attempt.
+**At the time, still not fixed, deliberately, same reasoning as before**: `ExecutePrescan`/
+`ExecutePostscan`/`ExecuteEnableInFalse` decode (confirmed wrong via the real `AOI_SNTP_QUERY`
+instance, see above) was unrelated to either of these two gaps and needed more real samples before a
+byte-offset fix was safe to attempt — since fixed, see "Fifteenth round" below.
 
 Covered by `test_new_aoi_parameter_overrides_required_visible_external_access`,
 `test_new_aoi_parameter_overrides_default_to_original_behavior_when_omitted`,
@@ -4980,13 +4984,12 @@ path), while the explicit constructor parameters remain available for setting a 
 to match a real reference AOI exactly before any routine exists yet) or for deliberately leaving one
 `False` even though the routine will be added later.
 
-**Not addressed, deliberately, since it's a separate, already-documented gap**: `AoiBuilder.build()`'s
-own DECODE of these three flags from a REAL, pre-existing project AOI is still hardcoded/wrong (see
-the "Real-ground-truth verification round" section above) -- this round only adds a way to SET the
-flags for a brand-new AOI (or, via the auto-imply side effect, when adding a reserved routine to
-ANY AOI including a real one materialized into `proj_aois`); it does not fix reading a real AOI's
-own already-correct flag value from the raw ACD binary, which still needs more real samples before
-a byte-offset fix would be safe to attempt.
+**At the time this round shipped, `AoiBuilder.build()`'s own DECODE of these three flags from a
+REAL, pre-existing project AOI was still hardcoded/wrong** (see the "Real-ground-truth verification
+round" section above) -- this round only added a way to SET the flags for a brand-new AOI (or, via
+the auto-imply side effect, when adding a reserved routine to ANY AOI including a real one
+materialized into `proj_aois`). The decode side was fixed immediately after, in the very next round
+-- see "Fifteenth round" below.
 
 Covered by `test_new_aoi_accepts_bool_execute_flags`, `test_new_aoi_accepts_string_execute_flags_case_insensitive`,
 `test_new_aoi_rejects_invalid_execute_flag_value` (`test/test_api.py` -- the pure constructor, alongside
@@ -4996,6 +4999,78 @@ the pre-existing `test_new_aoi_is_empty`, which already locked in the `"false"` 
 `test_new_routine_auto_sets_execute_flag_on_real_pre_existing_aoi` (against the real `AddOnInstruction`
 AOI in `ACDTestsWithAOI.ACD`), and `test_db_new_aoi_stateless_wrapper_accepts_execute_flags`
 (`test/test_project_db.py`).
+
+## Fifteenth round: `AoiBuilder.build()` decode fix -- `ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` were never actually read from the real ACD binary
+
+Direct, immediate follow-up to the fourteenth round: the user asked to get the DECODE side right too
+("I think it would be important to get it right") and supplied real ground truth purpose-built for
+exactly this -- four real, isolated single-edit saves of the same real AOI
+(`VAB_SQL_BuildDelimString`, a fresh AOI in a scratch `Bethel_Planer` dev project), each one flipping
+`ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` ON one at a time from the previous save
+(never chaining backward), each paired with a real Studio 5000 L5X export confirming the exact flag
+state as ground truth:
+
+- File 1 (baseline): all three `"false"`.
+- File 2: File 1 + check "Execute Prescan Routine" only -> `ExecutePrescan="true"`, others `"false"`.
+- File 3: File 2 + check "Execute Postscan Routine" only -> `+ExecutePostscan="true"`.
+- File 4: File 3 + check "Execute EnableInFalse Routine" only -> `+ExecuteEnableInFalse="true"`.
+
+**Method** (the same "isolate exactly one edit, diff the two files" technique already used
+successfully for the Region Map V38.02 layout and the `MainRoutineName` local-ref field, see their
+own sections above): loaded each file read-only via a scratch `ExportL5x(..., _temp_dir=...)` (never
+touching any project's own persistent `acd.db`, per the "real, avoidable mistake" lesson under
+`export_program()` above), located the AOI's own top-level comps record (a child of
+`RxUDIDefinitionCollection`, object_id stayed IDENTICAL and the record stayed the same 401-byte
+length across all four saves -- Studio didn't even reallocate it), and diffed raw bytes pairwise
+(1↔2, 2↔3, 3↔4). Each pairwise diff showed exactly one meaningful changed byte (plus one unrelated,
+ignored region -- see below):
+
+| Diff | Byte @ ext01 rel. offset 2 | Bit isolated |
+|---|---|---|
+| 1→2 | `0x00` → `0x10` | `ExecutePrescan` = `0x10` |
+| 2→3 | `0x10` → `0x14` | `ExecutePostscan` = `0x04` |
+| 3→4 | `0x14` → `0x15` | `ExecuteEnableInFalse` = `0x01` |
+
+All three bits live in extended record `attribute_id=0x1` (the SAME blob `AoiBuilder.build()`
+already reads `Revision` major/minor from, at relative offsets `0x1A`/`0x1C`) -- at relative offset
+2, not a `0x20`/`0x40`/`0x08` guess-by-pattern that would have been wrong (not adjacent bits: `0x10`,
+`0x04`, `0x01`). **A first attempt at this got the relative offset wrong (4, not 2) from miscounting
+a printed hex dump by eye** -- caught immediately by writing an actual end-to-end verification script
+against all four real files (3 of 4 mismatched) rather than trusting the by-hand byte count, a
+concrete reminder of this file's own repeated "verify against a real end-to-end path, not just the
+value you think you found" lesson.
+
+**The unrelated region, deliberately ignored**: a second cluster of bytes (absolute offsets
+333-337, also inside the same ext01 blob) changes on every save too, but decodes as a nonsense
+FILETIME (year 1606, nowhere near any real 2026 date) -- some other internal counter, not chased
+further since it isn't needed here.
+
+**Fix**: `AoiBuilder.build()` (`acd/l5x/elements/builders_routine.py`) now reads
+`flags_byte = e01[2]` (`e01` = the already-decoded `attribute_id=0x1` extended-record bytes) and
+sets `execute_prescan`/`execute_postscan`/`execute_enable_in_false` from bits `0x10`/`0x04`/`0x01`
+respectively, replacing the old hardcoded `"false", "false", "false"` in the `return AOI(...)` call.
+
+**Verified end-to-end against all four real files** (via a direct `AoiBuilder(cur,
+<aoi_object_id>).build()` call against each file's own scratch-decoded comps table, not just the
+isolated byte diff): all four reproduce their real L5X-confirmed flag combination exactly
+(`false/false/false`, `true/false/false`, `true/true/false`, `true/true/true`). Also confirmed the
+small fixture's own real AOI (`ACDTestsWithAOI.ACD`, all three flags `false`) still decodes correctly
+-- this fix is a no-op for the common all-`false` case, not just for the flagged-on cases.
+
+**Caveat, stated plainly since only one real project/AOI has been checked**: this bit layout is
+confirmed via 4 real, cleanly-isolated data points from ONE real AOI in ONE real project -- strong,
+converging evidence (each save changed only the exact expected bit, nothing else, across three
+independent pairwise diffs), but not yet cross-checked against a second, independent real project.
+If a future sample disagrees, re-investigate rather than assume this layout is universal (the same
+caveat this file already states for `member_ref`-based AOI parameter ordering, BIT-overlay Target
+resolution, and other single-project-confirmed byte offsets).
+
+Covered by `test_aoi_builder_decodes_execute_flags_bitmask` (`test/test_elements_helpers.py`,
+parametrized over all three bits independently plus the all-false and all-true cases, using the
+same synthetic RxGeneric-shaped comps record convention as `_aoi_tag_record()`/
+`test_aoi_builder_orders_parameters_by_member_ref_not_seq_number()` above) -- confirmed each
+parametrized case fails under the old hardcoded-`"false"` code before confirming it passes with the
+fix.
 
 ## Testing gotchas
 

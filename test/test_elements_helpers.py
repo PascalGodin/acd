@@ -894,3 +894,69 @@ def test_aoi_builder_orders_local_tags_by_member_ref_too():
     aoi = AoiBuilder(cur, AOI_ID).build()
 
     assert [lt.name for lt in aoi.local_tags] == ["LT_First", "LT_Second", "LT_Third"]
+
+
+def _build_aoi_record(flags_byte: int) -> bytes:
+    """Build a synthetic top-level AOI comps record with a given
+    ExecutePrescan/ExecutePostscan/ExecuteEnableInFalse bitmask byte at
+    ext01 relative offset 2 -- same RxGeneric-shaped record convention as
+    `_aoi_tag_record()` above (header + main record + count_record +
+    ext01 attribute + one deliberately-unparsed trailing attribute).
+    """
+    header = struct.pack("<IIHHH", 0, 0, 40, 999, 0)  # 14 bytes
+    main_record = bytearray(60)
+    ext01 = bytearray(40)
+    ext01[2] = flags_byte
+    ext01_attr = struct.pack("<II", 0x01, len(ext01)) + bytes(ext01)
+    dummy_last_attr = struct.pack("<II", 0x02, 4) + b"\x00" * 4  # left unparsed by RxGeneric
+    count_record = 2  # 1 parsed (0x01) + 1 left unparsed
+    return (
+        header + bytes(main_record) + struct.pack("<II", 0, count_record)
+        + ext01_attr + dummy_last_attr
+    )
+
+
+@pytest.mark.parametrize(
+    "flags_byte,expected",
+    [
+        (0x00, ("false", "false", "false")),
+        (0x10, ("true", "false", "false")),
+        (0x04, ("false", "true", "false")),
+        (0x01, ("false", "false", "true")),
+        (0x15, ("true", "true", "true")),
+    ],
+)
+def test_aoi_builder_decodes_execute_flags_bitmask(flags_byte, expected):
+    # Regression test for a real, confirmed bug: AoiBuilder.build() used to
+    # hardcode ExecutePrescan/ExecutePostscan/ExecuteEnableInFalse to
+    # "false", "false", "false" -- never actually reading them from the
+    # real ACD binary at all. Reverse-engineered from 4 real, isolated
+    # single-flag-at-a-time saves of the same real AOI
+    # (VAB_SQL_BuildDelimString, Bethel_Planer project): baseline 0x00
+    # (all false) -> +ExecutePrescan 0x10 -> +ExecutePostscan 0x14 ->
+    # +ExecuteEnableInFalse 0x15, each save changing only the one expected
+    # bit relative to the previous save, at ext01 relative offset 2. This
+    # test locks in each bit independently (not just the combinations
+    # actually observed in the real saves) so a future refactor can't
+    # silently transpose two bits and still pass.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE nameless(parent_id int, record BLOB)")
+    db.execute(
+        "CREATE TABLE comments(parent int, member_ref int, record_string text, "
+        "record_type int, tag_reference text)"
+    )
+    cur = db.cursor()
+
+    AOI_ID = 900
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (AOI_ID, 0, "TestAOI", 0, 256, _build_aoi_record(flags_byte)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+    assert (aoi.execute_prescan, aoi.execute_postscan, aoi.execute_enable_in_false) == expected

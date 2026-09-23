@@ -1087,6 +1087,22 @@ def test_get_aoi_falls_back_to_rehydration_for_real_pre_existing_aoi(aoi_acd_cop
         assert aoi["name"] == real_aoi.name
         assert [p["name"] for p in aoi["parameters"]] == [p.name for p in real_aoi.parameters]
         assert [lt["name"] for lt in aoi["local_tags"]] == [lt.name for lt in real_aoi.local_tags]
+        assert aoi["execute_prescan"] == real_aoi.execute_prescan
+        assert aoi["execute_postscan"] == real_aoi.execute_postscan
+        assert aoi["execute_enable_in_false"] == real_aoi.execute_enable_in_false
+    finally:
+        db.close()
+
+
+def test_get_aoi_includes_execute_flags(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_GA_FLAGS_AOI", execute_prescan=True, execute_postscan="true")
+
+        aoi = db.get_aoi("PDB_GA_FLAGS_AOI")
+        assert aoi["execute_prescan"] == "true"
+        assert aoi["execute_postscan"] == "true"
+        assert aoi["execute_enable_in_false"] == "false"
     finally:
         db.close()
 

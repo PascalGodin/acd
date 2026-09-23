@@ -79,13 +79,12 @@ step, so a call never returns more than actually asked for:
   - `db_list_aois(acd_path)` -- name/description/revision/parameter_count
     for EVERY AOI (real, pre-existing ones AND any created via
     `db_new_aoi()`) -- then `db_get_aoi(acd_path, name)` for one AOI's
-    actual parameters + local tags. `db_get_aoi()` is cheap/SQL-direct for
-    an AOI created via `db_new_aoi()` in this project DB, falling back to a
-    full rehydration only for a real, pre-existing project AOI (same
-    fast-path/fallback shape as `db_get_routine()`); `db_list_aois()`
-    itself always pays the full-rehydration cost, same reasoning as
-    `db_list_routines()` (a real AOI isn't tracked in the DB's own tables
-    at all, see CLAUDE.md).
+    actual `execute_prescan`/`execute_postscan`/`execute_enable_in_false`
+    flags plus its parameters + local tags. Both are cheap/SQL-direct
+    against `proj_aois` -- no rehydration needed -- for EITHER a real,
+    pre-existing project AOI OR a `db_new_aoi()`-created one, uniformly,
+    now that a real project's own AOIs are fully materialized into
+    `proj_aois` too (see CLAUDE.md's "real AOI routine editing" section).
   - `db_tag_exists(acd_path, name, program_name=None)` -- pre-creation
     collision check in a given scope (controller by default).
   - `db_get_tag_comment(acd_path, name, path=None, program_name=None)` --
@@ -251,11 +250,10 @@ EDITS -- durable the moment the call returns (see above), each raising
     never runs). `db_new_routine(..., aoi_name=...)` ALSO auto-sets the
     matching flag to `"true"` when the corresponding routine is created, so
     these are only for setting a flag up front or explicitly leaving one
-    `False`. `ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` are
-    still not correctly DECODED from a REAL, pre-existing AOI at all (a
-    separate, pre-existing gap -- see `AoiBuilder.build()`'s own history in
-    CLAUDE.md), independent of this -- these flags are only settable at
-    creation time for a brand-new AOI.
+    `False`. `ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` ARE
+    now correctly DECODED from a REAL, pre-existing AOI too (fixed --
+    see `AoiBuilder.build()`'s own history in CLAUDE.md for the real,
+    isolated-single-edit byte-offset investigation that found this).
   - `db_new_aoi_parameter(acd_path, aoi_name, name, data_type,
     usage="Input", dimension=None, description=None, index=None,
     required=None, visible=None, external_access=None)` -- add a public

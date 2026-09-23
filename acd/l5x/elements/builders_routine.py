@@ -654,6 +654,9 @@ class AoiBuilder(L5xElementBuilder):
 
         # --- Revision (major.minor) from ext[0x01] ---
         _r_aoi: Union[RxGeneric, None] = None
+        execute_prescan = "false"
+        execute_postscan = "false"
+        execute_enable_in_false = "false"
         try:
             r = RxGeneric.from_bytes(aoi_record)
             _r_aoi = r
@@ -661,6 +664,28 @@ class AoiBuilder(L5xElementBuilder):
             e01 = exts.get(0x01, b"")
             rev_major = struct.unpack_from("<H", e01, 0x1A)[0] if len(e01) > 0x1B else 1
             rev_minor = struct.unpack_from("<H", e01, 0x1C)[0] if len(e01) > 0x1D else 0
+            # --- ExecutePrescan/ExecutePostscan/ExecuteEnableInFalse: a
+            # bitmask byte at ext01 relative offset 2 (0x10/0x04/0x01
+            # respectively) -- reverse-engineered from 4 real, isolated
+            # single-flag-at-a-time saves of the same real AOI
+            # (VAB_SQL_BuildDelimString): baseline 0x00 (all false) ->
+            # +Prescan 0x10 -> +Postscan 0x14 -> +EnableInFalse 0x15, each
+            # save changing only the one expected bit versus the previous
+            # save, with the AOI's own top-level comps record otherwise
+            # byte-identical apart from an unrelated small counter at a
+            # different offset (not a real calendar FILETIME -- decodes to
+            # the year 1606 -- some other internal counter, ignored here).
+            # See CLAUDE.md's own history for this constructor's prior
+            # hardcoded-false placeholder and the real AOI_SNTP_QUERY
+            # sample (ExecutePrescan="true") that first proved the old
+            # hardcoding was wrong. NOT yet confirmed against a second,
+            # independent real project -- if a future sample disagrees,
+            # re-investigate rather than assume this bit layout is
+            # universal.
+            flags_byte = e01[2] if len(e01) > 2 else 0
+            execute_prescan = "true" if flags_byte & 0x10 else "false"
+            execute_postscan = "true" if flags_byte & 0x04 else "false"
+            execute_enable_in_false = "true" if flags_byte & 0x01 else "false"
         except Exception:
             rev_major, rev_minor = 1, 0
         revision = f"{rev_major}.{rev_minor}"
@@ -831,7 +856,7 @@ class AoiBuilder(L5xElementBuilder):
             name, name, revision,
             meta["revision_extension"],
             vendor,
-            "false", "false", "false",
+            execute_prescan, execute_postscan, execute_enable_in_false,
             meta["created_date"], meta["created_by"],
             meta["edited_date"], meta["edited_by"],
             meta["software_revision"],

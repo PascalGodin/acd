@@ -248,6 +248,18 @@ class _ProjectLock:
         self.release()
 
 
+# Maps an AOI-owned routine's reserved name to the `proj_aois` column
+# recording whether Studio 5000 will actually CALL it -- see
+# ProjectDB.new_routine()'s own docstring for why this is auto-set to
+# "true" as a side effect of creating the routine. "Logic" has no
+# corresponding flag (it always runs) and is deliberately absent here.
+_AOI_EXECUTE_FLAG_COLUMN_BY_ROUTINE_NAME = {
+    "Prescan": "execute_prescan",
+    "Postscan": "execute_postscan",
+    "EnableInFalse": "execute_enable_in_false",
+}
+
+
 _SCHEMA = """
 DROP TABLE IF EXISTS proj_meta;
 DROP TABLE IF EXISTS proj_members;
@@ -1660,7 +1672,10 @@ class ProjectDB:
         if not self._in_transaction:
             self._conn.commit()
 
-    def new_aoi(self, name: str, description: Union[str, None] = None) -> int:
+    def new_aoi(self, name: str, description: Union[str, None] = None,
+                execute_prescan: Union[bool, str] = False,
+                execute_postscan: Union[bool, str] = False,
+                execute_enable_in_false: Union[bool, str] = False) -> int:
         """Create a new, empty Add-On Instruction directly in this project's
         DB -- the SQL equivalent of appending `new_aoi(...)`
         (`acd/l5x/elements/model.py`) to `project.controller.aois`. Use
@@ -1669,6 +1684,16 @@ class ProjectDB:
         to add its logic routine, the same way `new_member()` populates a
         UDT created via `new_datatype()`.
 
+        `execute_prescan`/`execute_postscan`/`execute_enable_in_false` (each
+        a `bool` or `"true"`/`"false"` string, default `False`) -- see
+        `new_aoi()`'s own docstring (`acd/l5x/elements/model.py`) for why
+        getting this wrong is a SILENT failure (a populated but
+        never-called Prescan/Postscan/EnableInFalse routine, no error on
+        import). `new_routine()`/`db_new_routine(..., aoi_name=...)` also
+        flips the matching flag to `"true"` automatically when the
+        corresponding routine is created, so these parameters only matter
+        for setting a flag up front or explicitly leaving one `False`.
+
         `proj_aois` also holds every real project AOI (materialized at
         rebuild time -- see `_materialize()`), so `sqlite3.IntegrityError`
         is raised the same way whether `name` collides with another
@@ -1676,7 +1701,10 @@ class ProjectDB:
         project can't have two AOIs sharing a name either, so this
         correctly refuses rather than silently shadowing one.
         """
-        aoi = _new_aoi(name, description=description)
+        aoi = _new_aoi(name, description=description,
+                        execute_prescan=execute_prescan,
+                        execute_postscan=execute_postscan,
+                        execute_enable_in_false=execute_enable_in_false)
         cur = self._conn.cursor()
         cur.execute(
             "INSERT INTO proj_aois (name, description, revision, revision_extension, vendor, "
@@ -1915,6 +1943,16 @@ class ProjectDB:
         avoiding a name collision with every other AOI's own `"Logic"`
         routine -- see `_routine_id()`'s `aoi_name=` support below for the
         actual way to disambiguate that without renaming anything).
+
+        Creating a `"Prescan"`/`"Postscan"`/`"EnableInFalse"` routine on an
+        AOI also flips that AOI's own matching `execute_prescan`/
+        `execute_postscan`/`execute_enable_in_false` flag to `"true"` in
+        `proj_aois`, automatically -- a routine by one of these names with
+        its execute flag left `"false"` imports into Studio 5000 with no
+        error at all, it just silently never runs (see `new_aoi()`'s own
+        docstring, `acd/l5x/elements/model.py`, for the full story). This
+        never happens for `"Logic"` (there's no corresponding flag) and
+        never overrides an already-`"true"` flag back to `"false"`.
         """
         if (program_name is None) == (aoi_name is None):
             raise ValueError(
@@ -1945,6 +1983,12 @@ class ProjectDB:
                 "VALUES (NULL, ?, ?, ?, ?)",
                 (aoi_id, routine.name, routine.type, routine._description),
             )
+            execute_flag_column = _AOI_EXECUTE_FLAG_COLUMN_BY_ROUTINE_NAME.get(routine_name)
+            if execute_flag_column is not None:
+                cur.execute(
+                    f"UPDATE proj_aois SET {execute_flag_column}='true' WHERE id=?",
+                    (aoi_id,),
+                )
         routine_id = cur.lastrowid
         cur.execute("UPDATE proj_meta SET dirty=1")
         if not self._in_transaction:
@@ -3080,10 +3124,15 @@ def db_edit_member(acd_path, data_type_name: str, name: str,
 
 
 def db_new_aoi(acd_path, name: str, description: Union[str, None] = None,
+               execute_prescan: Union[bool, str] = False,
+               execute_postscan: Union[bool, str] = False,
+               execute_enable_in_false: Union[bool, str] = False,
                project_dir=None, verbose: bool = False) -> int:
     """Stateless equivalent of `ProjectDB.new_aoi()` -- see its docstring."""
     return _run(acd_path, project_dir, verbose, lambda db: db.new_aoi(
         name, description=description,
+        execute_prescan=execute_prescan, execute_postscan=execute_postscan,
+        execute_enable_in_false=execute_enable_in_false,
     ))
 
 

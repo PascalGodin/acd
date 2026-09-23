@@ -40,6 +40,7 @@ from acd import (
     db_set_rung_comment,
     db_set_tag_element_value,
     db_tag_exists,
+    db_to_controller,
     db_transaction,
     open_project_db,
 )
@@ -1778,6 +1779,80 @@ def test_new_routine_accepts_reserved_aoi_routine_names(acd_copy):
         assert {r.name for r in aoi.routines} == {"Logic", "Prescan"}
     finally:
         db.close()
+
+
+def test_new_aoi_execute_flags_params(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI", execute_prescan=True, execute_enable_in_false="True")
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+        assert aoi.execute_prescan == "true"
+        assert aoi.execute_postscan == "false"
+        assert aoi.execute_enable_in_false == "true"
+    finally:
+        db.close()
+
+
+def test_new_routine_auto_sets_execute_flag_for_reserved_aoi_routines(acd_copy):
+    # The literal reported gap: a Prescan/Postscan/EnableInFalse routine
+    # created with the corresponding ExecutePrescan/ExecutePostscan/
+    # ExecuteEnableInFalse flag left "false" imports into Studio with no
+    # error, it just silently never runs. new_routine() now auto-sets the
+    # matching flag to "true" as a side effect of creating the routine.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_routine("Logic", "RLL", aoi_name="PDB_NEW_AOI")
+        db.new_routine("Prescan", "RLL", aoi_name="PDB_NEW_AOI")
+        db.new_routine("Postscan", "RLL", aoi_name="PDB_NEW_AOI")
+        db.new_routine("EnableInFalse", "RLL", aoi_name="PDB_NEW_AOI")
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+        assert aoi.execute_prescan == "true"
+        assert aoi.execute_postscan == "true"
+        assert aoi.execute_enable_in_false == "true"
+    finally:
+        db.close()
+
+
+def test_new_routine_logic_does_not_touch_execute_flags(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_NEW_AOI")
+        db.new_routine("Logic", "RLL", aoi_name="PDB_NEW_AOI")
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+        assert aoi.execute_prescan == "false"
+        assert aoi.execute_postscan == "false"
+        assert aoi.execute_enable_in_false == "false"
+    finally:
+        db.close()
+
+
+def test_new_routine_auto_sets_execute_flag_on_real_pre_existing_aoi(aoi_acd_copy):
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.new_routine("Prescan", "RLL", aoi_name="AddOnInstruction")
+
+        project = db.to_controller()
+        aoi = next(a for a in project.controller.aois if a.name == "AddOnInstruction")
+        assert aoi.execute_prescan == "true"
+    finally:
+        db.close()
+
+
+def test_db_new_aoi_stateless_wrapper_accepts_execute_flags(acd_copy):
+    db_new_aoi(str(acd_copy), "PDB_NEW_AOI", execute_postscan=True)
+
+    project = db_to_controller(str(acd_copy))
+    aoi = next(a for a in project.controller.aois if a.name == "PDB_NEW_AOI")
+    assert aoi.execute_prescan == "false"
+    assert aoi.execute_postscan == "true"
+    assert aoi.execute_enable_in_false == "false"
 
 
 def test_routine_content_functions_use_aoi_name_to_disambiguate_logic_routines(acd_copy):

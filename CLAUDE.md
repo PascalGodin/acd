@@ -4938,6 +4938,65 @@ Covered by `test_new_string_datatype_shape`, `test_new_string_datatype_is_recogn
 the created type actually renders through the real string-family value path, not just that its own
 `family` field is set correctly in isolation).
 
+## Fourteenth round: `db_new_aoi()` couldn't set `ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` -- a silent, late failure, not a loud one
+
+A real, well-diagnosed report matching the "same shape as the parameter-order bug" framing this
+file's own methodology repeatedly calls out: `new_aoi()`/`db_new_aoi()` hardcoded
+`execute_prescan`/`execute_postscan`/`execute_enable_in_false` to `"false"` with no override --
+already acknowledged as a deliberate, non-universal simplification in the constructor's own
+docstring (a real, Rockwell-authored AOI, `AOI_SNTP_QUERY`, has `ExecutePrescan="true"` in
+practice) but with no path to actually set it. The concrete repro: build an AOI via `db_new_aoi()`,
+add a `Prescan` routine via `db_new_routine(..., aoi_name=..., routine_name="Prescan")` +
+`db_insert_rung()` -- both succeed with no error -- then discover on `db_export_aoi()` that
+`ExecutePrescan="false"` is still present right next to the fully-populated `Prescan` routine.
+Importing this into Studio would show the routine in the AOI editor with its "Execute Prescan
+routine..." checkbox unticked -- a routine that exists but Studio never calls, no error anywhere
+to signal it.
+
+**Fix, both of the report's own suggested shapes, not just one** (the report explicitly offered
+"and/or"):
+1. `new_aoi()` (`acd/l5x/elements/model.py`) gained `execute_prescan`/`execute_postscan`/
+   `execute_enable_in_false` parameters (each accepts a real `bool` or the literal string
+   `"true"`/`"false"`, case-insensitive, via a new `_normalize_execute_flag()` helper that raises
+   `ValueError` for anything else -- e.g. a bare `1`, which would otherwise silently produce a
+   plausible-but-wrong value) -- default `False`/`"false"` for all three, preserving the exact
+   prior behavior for every existing caller. `ProjectDB.new_aoi()`/`db_new_aoi()` inherit the same
+   three parameters, threaded straight through to the same constructor.
+2. `ProjectDB.new_routine()` now ALSO auto-sets the matching flag to `"true"` as a side effect of
+   creating a `"Prescan"`/`"Postscan"`/`"EnableInFalse"` routine on an AOI (real or
+   `db_new_aoi()`-created, uniformly -- this rides on the same materialization/`proj_aois` schema
+   already used for both) -- per the report's own reasoning, a routine by one of these names with
+   the flag left off is never a state anyone actually wants. Implemented via a small
+   `_AOI_EXECUTE_FLAG_COLUMN_BY_ROUTINE_NAME` dict (`"Prescan"`→`execute_prescan`, etc., `"Logic"`
+   deliberately absent -- it always runs, no corresponding flag) and a plain `UPDATE proj_aois SET
+   <column>='true' WHERE id=?` right after the routine's own `INSERT`, using the same
+   safe-hardcoded-literal-column-name f-string pattern already established elsewhere in this file
+   (`_insert_routine()`'s `owner_column`, `_load_routines_where()`). Only ever sets `"true"`, never
+   resets a flag back to `"false"` -- creating the routine is a one-way signal of intent, matching
+   the report's own framing that this state is never desirable with the flag off.
+
+This means a caller gets the fix "for free" just by adding the routine (the common, easy-to-forget
+path), while the explicit constructor parameters remain available for setting a flag up front (e.g.
+to match a real reference AOI exactly before any routine exists yet) or for deliberately leaving one
+`False` even though the routine will be added later.
+
+**Not addressed, deliberately, since it's a separate, already-documented gap**: `AoiBuilder.build()`'s
+own DECODE of these three flags from a REAL, pre-existing project AOI is still hardcoded/wrong (see
+the "Real-ground-truth verification round" section above) -- this round only adds a way to SET the
+flags for a brand-new AOI (or, via the auto-imply side effect, when adding a reserved routine to
+ANY AOI including a real one materialized into `proj_aois`); it does not fix reading a real AOI's
+own already-correct flag value from the raw ACD binary, which still needs more real samples before
+a byte-offset fix would be safe to attempt.
+
+Covered by `test_new_aoi_accepts_bool_execute_flags`, `test_new_aoi_accepts_string_execute_flags_case_insensitive`,
+`test_new_aoi_rejects_invalid_execute_flag_value` (`test/test_api.py` -- the pure constructor, alongside
+the pre-existing `test_new_aoi_is_empty`, which already locked in the `"false"` default); and
+`test_new_aoi_execute_flags_params`, `test_new_routine_auto_sets_execute_flag_for_reserved_aoi_routines`,
+`test_new_routine_logic_does_not_touch_execute_flags`,
+`test_new_routine_auto_sets_execute_flag_on_real_pre_existing_aoi` (against the real `AddOnInstruction`
+AOI in `ACDTestsWithAOI.ACD`), and `test_db_new_aoi_stateless_wrapper_accepts_execute_flags`
+(`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

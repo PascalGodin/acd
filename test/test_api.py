@@ -648,6 +648,25 @@ def test_new_aoi_dates_use_real_iso8601_format():
     assert re.match(pattern, aoi.edited_date)
 
 
+def test_new_aoi_accepts_bool_execute_flags():
+    aoi = new_aoi("MyAOI", execute_prescan=True, execute_postscan=False,
+                  execute_enable_in_false=True)
+    assert aoi.execute_prescan == "true"
+    assert aoi.execute_postscan == "false"
+    assert aoi.execute_enable_in_false == "true"
+
+
+def test_new_aoi_accepts_string_execute_flags_case_insensitive():
+    aoi = new_aoi("MyAOI", execute_prescan="True", execute_postscan="FALSE")
+    assert aoi.execute_prescan == "true"
+    assert aoi.execute_postscan == "false"
+
+
+def test_new_aoi_rejects_invalid_execute_flag_value():
+    with pytest.raises(ValueError, match="execute_prescan"):
+        new_aoi("MyAOI", execute_prescan=1)
+
+
 def test_new_aoi_parameter_input_defaults():
     p = new_aoi_parameter("In1", "DINT", usage="Input")
     assert p.name == "In1"

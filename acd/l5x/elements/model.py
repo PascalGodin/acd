@@ -1350,23 +1350,63 @@ class AOI(L5xElement):
         return base[:idx + 1] + inject + base[idx + 1:]
 
 
-def new_aoi(name: str, description: Union[str, None] = None) -> AOI:
+def _normalize_execute_flag(value: Union[bool, str], param_name: str) -> str:
+    """Normalize an `execute_prescan`/`execute_postscan`/
+    `execute_enable_in_false`-style argument (accepts either a real `bool`
+    or the literal string `"true"`/`"false"`, case-insensitive) to the
+    lowercase string form these `AOI` fields are always stored/rendered
+    as. Raises `ValueError` for anything else, rather than silently
+    stringifying a wrong-shaped value (e.g. `1`) into something that LOOKS
+    like a valid flag but isn't.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower()
+    raise ValueError(
+        f"{param_name} must be a bool or the string 'true'/'false' (case-insensitive), "
+        f"not {value!r}."
+    )
+
+
+def new_aoi(name: str, description: Union[str, None] = None,
+            execute_prescan: Union[bool, str] = False,
+            execute_postscan: Union[bool, str] = False,
+            execute_enable_in_false: Union[bool, str] = False) -> AOI:
     """Construct a new, empty `AOI` for insertion into
     `project.controller.aois` -- e.g. to originate a brand-new Add-On
     Instruction before populating it with `new_aoi_parameter()` and a logic
     routine (`new_routine()`/`Routine.insert_rung()`, or `db_new_routine(...,
     aoi_name=...)`/`db_insert_rung()` at the `db_*` layer).
 
-    Fixed, non-configurable values for everything this constructor doesn't
-    expose a parameter for (`revision="1.0"`, `revision_extension`/`vendor`
-    both `None`, `execute_prescan`/`execute_postscan`/
-    `execute_enable_in_false` all `"false"` -- NOTE: a real, Rockwell-authored
-    AOI (`AOI_SNTP_QUERY`, verified against its own real L5X export AND the
-    real ACD it lives in) has `ExecutePrescan="true"`, so `"false"` is not a
-    universal default, just this constructor's own fixed choice, unrelated
-    to the separate decode-side bug noted below; `created_by`/`edited_by`
-    both `""`, `created_date`/`edited_date` both the current time in the
-    REAL ISO-8601-with-milliseconds format Rockwell itself uses
+    `execute_prescan`/`execute_postscan`/`execute_enable_in_false` (each a
+    `bool` or `"true"`/`"false"` string, default `False`/`"false"` --
+    preserving this constructor's original, pre-existing behavior) control
+    whether Studio 5000 will actually CALL the correspondingly-named
+    `"Prescan"`/`"Postscan"`/`"EnableInFalse"` routine if/when one is added
+    via `new_routine()`/`db_new_routine(..., aoi_name=...)`. Getting this
+    wrong is a SILENT failure, not a loud one: an AOI with a fully-populated
+    `Prescan` routine but `ExecutePrescan="false"` imports into Studio with
+    no error at all -- the routine shows up in the AOI editor, its checkbox
+    just stays unticked, so the routine never actually runs. Confirmed via a
+    real, Rockwell-authored AOI (`AOI_SNTP_QUERY`, verified against its own
+    real L5X export AND the real ACD it lives in) that has
+    `ExecutePrescan="true"` in practice -- `"false"` was never a universal
+    default, just this constructor's own original fixed choice (kept as the
+    DEFAULT here for backward compatibility, not because it's usually
+    correct). `ProjectDB.new_routine()`/`db_new_routine()` ALSO set the
+    matching flag to `"true"` automatically as a side effect of creating a
+    `"Prescan"`/`"Postscan"`/`"EnableInFalse"` routine on an AOI (a routine
+    with the flag off is never a state anyone actually wants) -- these
+    constructor parameters are for setting a flag `True` up front (e.g. to
+    match a real reference AOI exactly) or explicitly leaving one `False`
+    even though the routine will be added later.
+
+    Other fixed, non-configurable values for everything this constructor
+    doesn't expose a parameter for (`revision="1.0"`, `revision_extension`/
+    `vendor` both `None`; `created_by`/`edited_by` both `""`,
+    `created_date`/`edited_date` both the current time in the REAL
+    ISO-8601-with-milliseconds format Rockwell itself uses
     (`"2014-04-02T15:31:19.017Z"`) -- verified directly against that same
     real AOI's own L5X export (a `"%a %b %d %H:%M:%S %Y"`-style date, this
     function's own first attempt before that verification, does NOT match) --
@@ -1400,7 +1440,10 @@ def new_aoi(name: str, description: Union[str, None] = None) -> AOI:
     now_dt = datetime.datetime.utcnow()
     now = now_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now_dt.microsecond // 1000:03d}Z"
     return AOI(
-        name, name, "1.0", None, None, "false", "false", "false",
+        name, name, "1.0", None, None,
+        _normalize_execute_flag(execute_prescan, "execute_prescan"),
+        _normalize_execute_flag(execute_postscan, "execute_postscan"),
+        _normalize_execute_flag(execute_enable_in_false, "execute_enable_in_false"),
         now, "", now, "", "33.00", [], [], [],
         _description=description,
     )

@@ -232,8 +232,9 @@ EDITS -- durable the moment the call returns (see above), each raising
     `member_data_type`/`dimension` is passed for a member that's already a
     BIT-overlay member or hidden BIT-backing field (only its
     `description`/`radix` may be edited that way).
-  - `db_new_aoi(acd_path, name, description=None)` -- create a new, empty
-    Add-On Instruction. Use `db_new_aoi_parameter()` to add
+  - `db_new_aoi(acd_path, name, description=None, execute_prescan=False,
+    execute_postscan=False, execute_enable_in_false=False)` -- create a new,
+    empty Add-On Instruction. Use `db_new_aoi_parameter()` to add
     Input/Output/InOut parameters, `db_new_aoi_local_tag()` for private
     scratch storage, and `db_new_routine(..., aoi_name=name)` for its logic
     routine. Raises `sqlite3.IntegrityError` if `name` collides with
@@ -242,10 +243,19 @@ EDITS -- durable the moment the call returns (see above), each raising
     pre-existing project AOI is FULLY editable through this same table
     (parameters, local tags, routine content) once materialized at rebuild
     time -- see CLAUDE.md's "real AOI routine editing" section.
-    `ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` are still not
-    correctly decoded from a real AOI at all (a separate, pre-existing gap
-    -- see `AoiBuilder.build()`'s own history in CLAUDE.md), independent of
-    this.
+    `execute_prescan`/`execute_postscan`/`execute_enable_in_false` (each a
+    `bool` or `"true"`/`"false"` string, default `False`) control whether
+    Studio will actually CALL the matching `"Prescan"`/`"Postscan"`/
+    `"EnableInFalse"` routine if one is added -- getting this wrong is
+    SILENT (the routine imports fine, its checkbox just stays unticked, it
+    never runs). `db_new_routine(..., aoi_name=...)` ALSO auto-sets the
+    matching flag to `"true"` when the corresponding routine is created, so
+    these are only for setting a flag up front or explicitly leaving one
+    `False`. `ExecutePrescan`/`ExecutePostscan`/`ExecuteEnableInFalse` are
+    still not correctly DECODED from a REAL, pre-existing AOI at all (a
+    separate, pre-existing gap -- see `AoiBuilder.build()`'s own history in
+    CLAUDE.md), independent of this -- these flags are only settable at
+    creation time for a brand-new AOI.
   - `db_new_aoi_parameter(acd_path, aoi_name, name, data_type,
     usage="Input", dimension=None, description=None, index=None,
     required=None, visible=None, external_access=None)` -- add a public
@@ -310,7 +320,12 @@ EDITS -- durable the moment the call returns (see above), each raising
     RAISES immediately if you pass anything else, rather than letting a
     creatively-named routine (e.g. named after the AOI itself, to dodge a
     collision with every other AOI's own `"Logic"` routine) fail much
-    later at import time.
+    later at import time. Creating a `"Prescan"`/`"Postscan"`/
+    `"EnableInFalse"` routine also auto-sets the AOI's own matching
+    `execute_*` flag to `"true"` (see `db_new_aoi()`'s own `execute_prescan`/
+    `execute_postscan`/`execute_enable_in_false` params above) -- a routine
+    by one of these names with the flag left `"false"` imports fine but
+    Studio silently never calls it.
   - EVERY routine-content function below EXCEPT `db_export_routine`
     (`db_insert_rung`, `db_delete_rung`, `db_replace_rung_safe`,
     `db_set_rung_comment`, `db_insert_st_line`, `db_delete_st_line`,

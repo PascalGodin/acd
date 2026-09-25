@@ -231,6 +231,41 @@ def test_controller_builder_ignores_nameless_root_object():
     assert controller.name == "CuteLogix"
 
 
+def test_controller_builder_skips_datatype_tombstone_with_empty_extended_records():
+    # Regression test for a real, severe bug: deleting an AOI in Studio 5000
+    # leaves its own implicit DataType comps entry (the synthetic instance-
+    # shape record every AOI gets under RxDataTypeCollection) in place, but
+    # strips ALL of its extended records, leaving a completely empty dict.
+    # Before this fix, DataTypeBuilder.build() unconditionally read
+    # extended_records[0x6C], raising a bare KeyError that took down the
+    # ENTIRE project load (every db_* call), not a scoped failure -- any
+    # project with AOI-deletion history in it can hit this on an ordinary
+    # load, not just an edge case.
+    unzip = Unzip("../resources/CuteLogix.ACD").write_files("build")
+    exp = ExportL5x("../resources/CuteLogix.ACD", "build")
+    cur = exp._cur
+
+    cur.execute("SELECT object_id FROM comps WHERE comp_name='RxDataTypeCollection'")
+    dt_collection_id = cur.fetchone()[0]
+
+    # Same "count_record=1 -> 0 extended records actually parsed" shape as
+    # the real tombstone: object_id/comp_name still present, zero keys.
+    header = struct.pack("<IIHHH", 0, 0, 40, 999, 0)
+    main_record = b"\x00" * 60
+    tombstone_record = header + main_record + struct.pack("<II", 0, 1)
+
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (888888888, dt_collection_id, "DeletedAoiTombstone", 0, 256, tombstone_record),
+    )
+    exp._db.commit()
+
+    controller = ControllerBuilder(cur).build()  # must not raise
+
+    assert "DELETEDAOITOMBSTONE" not in controller._data_types_map
+    assert not any(dt.name == "DeletedAoiTombstone" for dt in controller.data_types)
+
+
 def _connection_record(code: int, rpi: int) -> bytes:
     # Type code is a u16 at offset 90, RPI (microseconds) a u32 immediately
     # after it at offset 92 -- see ModuleBuilder.build()'s own docstring.

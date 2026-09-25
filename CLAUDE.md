@@ -5145,6 +5145,68 @@ appear) -- `test/test_elements_helpers.py`; and
 defense-in-depth backstop, constructed directly at the model level since `AoiBuilder` itself no
 longer produces this shape) -- `test/test_project_db.py`.
 
+## Seventeenth round: `DataTypeBuilder.build()` crashed with a bare `KeyError` on a deleted AOI's leftover tombstone DataType entry
+
+A real, well-diagnosed report, structurally the same class of bug as the sixteenth round above (a
+Comps-level artifact from a Studio delete operation being decoded as if it were real) but hitting a
+different collection and a harder failure mode: `open_project_db()` (and therefore every `db_*`
+call) raised a bare `KeyError: 108` and the ENTIRE project became unusable through this library —
+not scoped to one object, no partial result, no recovery path (the delete had already happened in
+Studio; nothing on the caller's side could undo it).
+
+**Root cause, confirmed directly**: `DataTypeBuilder.build()` (`builders_datatype.py`) read
+`extended_records[0x6C]` with a bare dict index and no presence check — unlike the very similar
+`0x64` (`member_count`) case 11 lines later, which already correctly guards with `if 0x64 in
+extended_records and len(...) == 0x04: ... else: member_count = 0`. Deleting an AOI in Studio 5000
+does NOT remove its implicit DataType comps entry (the synthetic instance-shape record every AOI
+gets under `RxDataTypeCollection`, see the AOI-instance-value-decoding notes elsewhere in this
+file) from the raw ACD binary — it strips the entry's extended-records data down to a completely
+empty dict (zero keys, not just a missing `0x6C`) but leaves the entry itself (name, object_id) in
+place. Confirmed via a real repro: after deleting `VAB_ASCII2Unicode_80Char` in Studio and
+re-saving, its DataType comps row (`object_id=3351031162`) still exists, and
+`extended_records` parses to `{}`. Since this is a normal, expected side effect of a completely
+ordinary Studio operation (delete an AOI, save), any project with AOI-deletion history can hit
+this — not a rare edge case.
+
+**Fix, both parts of the report's own suggestion**:
+1. `0x6C`/`0x67`/`0x69` (string_family/built_in/module_defined) now use the exact same
+   presence-and-length-guarded pattern already established for `0x64`, defaulting to `0` when
+   absent — general robustness for any future case that's missing just one or two of these keys,
+   not only the fully-empty tombstone shape.
+2. A type whose `extended_records` parses to a COMPLETELY EMPTY dict is now recognized as a
+   tombstone and skipped entirely — `DataTypeBuilder.build()`'s return type changed from `DataType`
+   to `Union[DataType, None]`, returning `None` for this case (logged via `log.info()`, matching
+   this file's own "deterministic, expected, not an error" logging convention for similar phantom-
+   object filtering elsewhere), rather than building a fake, empty `"User"` `DataType` that would
+   otherwise pollute `db_list_datatypes()`/`project.controller.data_types` with something that was
+   never real to begin with (none of a tombstone's other fields — `built_in`, `module_defined`,
+   `member_count`, ... — are meaningful either, since they'd all quietly default to zero/empty).
+   This mirrors the SAME defensive posture the function already uses three lines above it for a
+   `RxGeneric.from_bytes()` parse failure — just returning `None` here instead of a stub, since a
+   stub would actually be wrong (a visible fake DataType) rather than merely incomplete.
+3. The one real call site (`ControllerBuilder.build()`, `builders_controller.py`) now skips a
+   `None` result before adding it to `all_data_types_map`/`data_types` — previously this loop had
+   NO `record_type` filter at all on `RxDataTypeCollection` children (unlike Program/Module/Tag/
+   Routine collections elsewhere in this codebase, which already filter deleted rows via
+   `record_type`), so this tombstone would have reached `DataTypeBuilder.build()` regardless of
+   whether Studio ever flips its `record_type` to the deleted marker — the empty-`extended_records`
+   signal is the one that actually fires here, independent of that.
+
+**Verified**: both the pure `DataTypeBuilder.build()` return (`None` for a synthetic tombstone
+record, matching the exact `count_record=1 -> 0 parsed` shape confirmed on the real project) and a
+full `ControllerBuilder.build()` pass against the real `CuteLogix.ACD` fixture with a synthetic
+tombstone row injected as a child of the fixture's own real `RxDataTypeCollection` — the whole
+project loads with no exception, and the tombstone name appears in neither `data_types` nor
+`_data_types_map`.
+
+Covered by `test_datatype_builder_returns_none_for_deleted_aoi_tombstone`,
+`test_datatype_builder_defaults_when_family_builtin_moduledefined_missing` (the narrower,
+non-fully-empty case the report also flagged — some extended records present, just not
+`0x6C`/`0x67`/`0x69` specifically) — `test/test_elements_helpers.py`; and
+`test_controller_builder_skips_datatype_tombstone_with_empty_extended_records`
+(`test/test_database.py`) — confirmed this last one fails with the reported `KeyError` before the
+fix, not just passes with it.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

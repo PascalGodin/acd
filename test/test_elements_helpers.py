@@ -763,6 +763,78 @@ def test_datatype_builder_excludes_deleted_member_with_stale_extended_record():
     assert dt._dead_member_bytes == 2
 
 
+def test_datatype_builder_returns_none_for_deleted_aoi_tombstone():
+    # Regression test for a real, severe bug: deleting an AOI in Studio 5000
+    # does not remove its implicit DataType comps entry (the synthetic
+    # instance-shape record every AOI gets under RxDataTypeCollection) from
+    # the raw ACD binary -- the entry (name, object_id) stays in place, but
+    # ALL of its extended records are stripped away, leaving a completely
+    # empty dict. Confirmed via a real project: deleting an AOI and
+    # re-saving leaves its own DataType comps row in place with
+    # extended_records parsing to zero keys. Before this fix,
+    # DataTypeBuilder.build() unconditionally read extended_records[0x6C],
+    # raising a bare KeyError that took down the ENTIRE project load (every
+    # db_* call), not just this one object -- any project with AOI-deletion
+    # history can hit this on an ordinary load.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    cur = db.cursor()
+
+    TYPE_ID = 950
+    # count_record=1 -> RxGeneric's own "always leaves the last one unparsed"
+    # quirk means 0 extended records actually get parsed -- the exact real
+    # tombstone shape (same construction as this file's own _child_record()).
+    tombstone_record = _child_record()
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (TYPE_ID, 0, "DeletedAoiTombstone", 0, 256, tombstone_record),
+    )
+    db.commit()
+
+    dt = DataTypeBuilder(cur, TYPE_ID).build()
+
+    assert dt is None
+
+
+def test_datatype_builder_defaults_when_family_builtin_moduledefined_missing():
+    # Companion to the tombstone test above, for the narrower case the bug
+    # report also flagged: a type with SOME extended records present, just
+    # not 0x6C/0x67/0x69 specifically (unlike a fully-empty tombstone, this
+    # is otherwise a perfectly real, buildable type). Before this fix this
+    # raised the identical bare KeyError.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    cur = db.cursor()
+
+    TYPE_ID = 951
+    # Only 0x64 (member_count) present -- no 0x6C/0x67/0x69 at all.
+    extended_records = struct.pack("<II", 0x64, 4) + struct.pack("<I", 0)
+    count_record = 2  # 1 parsed (0x64) + 1 always left unparsed
+    type_record = (
+        _rx_generic_header() + struct.pack("<II", 0, count_record) + extended_records
+    )
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (TYPE_ID, 0, "PartialType", 0, 256, type_record),
+    )
+    db.commit()
+
+    dt = DataTypeBuilder(cur, TYPE_ID).build()
+
+    assert dt is not None
+    assert dt.family == "NoFamily"
+    assert dt.cls == "User"
+    assert dt.members == []
+
+
 _AOI_TAG_RECORD_DEFAULT_DT_OID = 999900  # arbitrary, must match a comps row callers insert
 
 

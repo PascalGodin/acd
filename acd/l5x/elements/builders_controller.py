@@ -572,6 +572,12 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _data_type_object_id = result[1]
             dt = DataTypeBuilder(self._cur, _data_type_object_id).build()
+            if dt is None:
+                # A deleted AOI's leftover tombstone DataType comps entry
+                # (empty extended_records) -- see DataTypeBuilder.build()'s
+                # own docstring. Not a real type; skip it entirely rather
+                # than polluting data_types/all_data_types_map.
+                continue
             all_data_types_map[dt.name.upper()] = dt
             if dt.cls == "User":
                 data_types.append(dt)

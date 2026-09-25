@@ -141,7 +141,7 @@ class DataTypeBuilder(L5xElementBuilder):
             u16 = u16[:null_idx]
         return u16.strip()
 
-    def build(self) -> DataType:
+    def build(self) -> Union[DataType, None]:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
             + str(self._object_id)
@@ -161,11 +161,47 @@ class DataTypeBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        string_family_int = struct.unpack("<I", extended_records[0x6C])[0]
+        if not extended_records:
+            # A deleted AOI's own implicit DataType comps entry (the synthetic
+            # instance-shape record every AOI gets under RxDataTypeCollection --
+            # see AoiBuilder/ControllerBuilder's own docs) is NOT removed from
+            # the raw ACD binary when the AOI itself is deleted in Studio -- the
+            # entry (name, object_id) stays in place, but every one of its
+            # extended records is stripped away, leaving a completely empty
+            # dict. None of this record's other fields (family/class/
+            # member_count/...) are meaningful for a tombstone like this, so --
+            # same defensive posture as the RxGeneric.from_bytes() failure case
+            # just above -- skip it entirely rather than building a fake, empty
+            # "User" DataType that would otherwise show up in
+            # db_list_datatypes()/project.controller.data_types with nothing
+            # real behind it. Confirmed via a real project: deleting an AOI in
+            # Studio and re-saving leaves its own DataType comps row
+            # (name+object_id) in place with extended_records parsing to zero
+            # keys -- not a one-off, any project with AOI-deletion history can
+            # hit this on an ordinary load.
+            log.info(
+                f"DataType {name!r}: comps record has no extended records at all -- "
+                "a deleted AOI's leftover tombstone entry, not a real DataType. Skipped."
+            )
+            return None
+
+        string_family_int = (
+            struct.unpack("<I", extended_records[0x6C])[0]
+            if 0x6C in extended_records and len(extended_records[0x6C]) == 0x04
+            else 0
+        )
         string_family = "StringFamily" if string_family_int == 1 else "NoFamily"
 
-        built_in = struct.unpack("<I", extended_records[0x67])[0]
-        module_defined = struct.unpack("<I", extended_records[0x69])[0]
+        built_in = (
+            struct.unpack("<I", extended_records[0x67])[0]
+            if 0x67 in extended_records and len(extended_records[0x67]) == 0x04
+            else 0
+        )
+        module_defined = (
+            struct.unpack("<I", extended_records[0x69])[0]
+            if 0x69 in extended_records and len(extended_records[0x69]) == 0x04
+            else 0
+        )
 
         class_type = "User"
         if module_defined > 0:

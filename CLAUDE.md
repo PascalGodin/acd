@@ -5362,6 +5362,68 @@ exact object_ids/offsets above are enough to re-derive everything above without 
 ground truth for the ENCODING side of this — only the LINK side still needs new information (e.g.
 a third real sample, or successfully parsing `XRefs.Dat`).
 
+## Nineteenth round: `db_new_aoi_parameter()`'s `dimension` was single-int-only — no real multi-dimensional InOut array parameter
+
+A real, well-diagnosed report: `new_aoi_parameter()`/`db_new_aoi_parameter()` typed `dimension` as
+`Union[int, None]`, blocking a genuine multi-dimensional `InOut` array parameter (e.g. a
+`[rows,cols]` result-set table) even though Studio 5000 itself supports one — confirmed via
+Rockwell's own Studio 5000 help (AOI Definition Editor, Parameters tab): array-ness is set purely
+through the Data Type field's own `TypeName[N]`/`TypeName[N,M]` syntax, same as any regular tag, with
+no documented 1D-only restriction for `InOut` beyond the already-implemented elementary-type-on-
+Input/Output rule. The report also correctly noted `new_tag()`'s own `dimensions` parameter already
+accepts the real multi-dimensional comma-separated internal form (e.g. `"25,30"`) — the underlying
+`Parameter`/`LocalTag` data model (both already typed `dimensions: Union[str, None]`) already had the
+capability; only the two constructors' own parameter type never exposed more than a single int.
+
+**Fix**: `dimension` widened to `Union[int, str, None]` in `new_aoi_parameter()`/
+`new_aoi_local_tag()` (`acd/l5x/elements/model.py`) and their `ProjectDB`/`db_*` equivalents
+(`acd/l5x/project_db.py`) — an `int` keeps the exact prior single-dimension behavior; a `str` is
+trusted as-is in the same comma-separated internal form `new_tag()` already uses (e.g. `"25,30"`),
+with **zero validation of the string's own content**, matching `new_tag()`'s own established "trust
+the caller" convention for this form.
+
+**Two real, adjacent crash sites found and fixed while wiring this through** (both would have
+produced a bare, confusing `ValueError: invalid literal for int()` the moment a multi-dim value
+actually reached them, despite the constructor itself accepting it cleanly):
+
+1. **XML rendering never converted comma-to-space.** `Tag.to_xml()` already has a dedicated
+   post-processing step converting the internal comma-separated `Dimensions=` value to Rockwell's
+   real space-separated XML form (`"4,3,2"` → `"4 3 2"`) — `Parameter.to_xml()`/`LocalTag.to_xml()`
+   never had the equivalent, since a single dimension has no comma and the bug never surfaced before
+   multi-dim was even possible. Without this, a real multi-dim export would have rendered the WRONG,
+   comma-separated `Dimensions="25,30"` attribute Studio would reject, rather than the correct
+   `Dimensions="25 30"`. Fixed by adding the identical conversion step to both.
+2. **`_synthetic_aoi_data_type()` (`acd/api.py`) did `int(p.dimensions)`/`int(lt.dimensions)`
+   directly** — a bare `int()` call on a genuine multi-dim string crashes outright. The `Parameter`
+   loop turned out to already be safe in practice (it already skips `usage="InOut"` entirely, and
+   multi-dim is ONLY valid for `InOut` per the existing elementary-type rule — the two conditions
+   never coincide), but the `LocalTag` loop has no such usage concept at all and WOULD crash for a
+   genuine multi-dim LocalTag (now newly possible via the same widened `new_aoi_local_tag()`).
+   Fixed via a new `_flatten_dimensions_for_synthetic_member()` helper: since `Member.dimension`
+   (unlike `Parameter.dimensions`/`LocalTag.dimensions`) is a plain `int` — this codebase's own UDT
+   member model has no multi-dimensional shape at all — a multi-dim string is flattened to its TOTAL
+   element count (via the already-existing `_count_array_elements()`, e.g. `750` for `"25,30"`) as a
+   single-dim array, rather than crashing or silently dropping the member. Same "reasonable default,
+   not real fidelity" spirit already documented on the rest of this function.
+3. **`ProjectDB.edit_aoi_parameter()`'s own "leave dimension unchanged" fallback also did
+   `int(cur_dims)`** — editing ANY other field (e.g. just `description`) on a parameter that already
+   had a stored multi-dim dimension would have crashed the moment this widening made that storage
+   possible. Fixed by passing the already-string-typed `cur_dims` straight through unconverted
+   (`_new_aoi_parameter()` now accepts a string directly, so no conversion is needed at all).
+
+**Deliberately unchanged**: `new_member()`/`edit_member()`/`Member.dimension` (a UDT member's own
+array size) — `Member.dimension` is a genuinely different, single-`int`-only field in this
+codebase's own object model with no multi-dimensional shape at all (see point 2 above); this report
+was scoped to AOI Parameters/LocalTags specifically, and there's no existing precedent or reported
+need to redesign the UDT member model itself.
+
+Covered by `test_new_aoi_parameter_multi_dimensional`, `test_new_aoi_local_tag_multi_dimensional`,
+`test_sync_data_types_map_flattens_multi_dimensional_local_tag_instead_of_crashing`
+(`test/test_api.py`); and `test_new_aoi_parameter_multi_dimensional_persists`,
+`test_edit_aoi_parameter_does_not_crash_on_stored_multi_dimensional_value` (the literal crash-site
+repro for point 3 above), `test_db_new_aoi_parameter_stateless_wrapper_accepts_multi_dimensional_string`,
+`test_new_aoi_local_tag_multi_dimensional_persists` (`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

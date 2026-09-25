@@ -1747,7 +1747,7 @@ class ProjectDB:
         return aoi_id
 
     def new_aoi_parameter(self, aoi_name: str, name: str, data_type: str,
-                           usage: str = "Input", dimension: Union[int, None] = None,
+                           usage: str = "Input", dimension: Union[int, str, None] = None,
                            description: Union[str, None] = None, index: Union[int, None] = None,
                            required: Union[str, None] = None, visible: Union[str, None] = None,
                            external_access: Union[str, None] = None,
@@ -1764,7 +1764,10 @@ class ProjectDB:
         `EnableIn`/`EnableOut` parameter by hand, or use `new_aoi_parameter()`/
         `new_aoi_enable_parameters()` directly and insert the two returned
         `Parameter` objects yourself if you need the ready-made pair without
-        duplicating this call twice).
+        duplicating this call twice). `dimension` accepts a plain `int`
+        (single dimension) or a comma-separated `str` (e.g. `"25,30"`) for a
+        genuine multi-dimensional `InOut` array -- see `new_aoi_parameter()`'s
+        own docstring (`acd/l5x/elements/model.py`) for the full convention.
 
         Raises `KeyError` if `aoi_name` doesn't resolve to any AOI, `ValueError`
         if `usage` isn't `"Input"`/`"Output"`/`"InOut"`, if `dimension` is
@@ -1810,7 +1813,7 @@ class ProjectDB:
         return param_id
 
     def new_aoi_local_tag(self, aoi_name: str, name: str, data_type: str,
-                           dimension: Union[int, None] = None,
+                           dimension: Union[int, str, None] = None,
                            description: Union[str, None] = None,
                            index: Union[int, None] = None) -> int:
         """Add a private/scratch LocalTag to an AOI (a real project AOI or
@@ -1820,6 +1823,9 @@ class ProjectDB:
         `AOI.local_tags`. Unlike a `Parameter`, a LocalTag has no
         `Usage`/`Required`/`Visible` concept -- it's never a public
         Input/Output/InOut pin, just internal state for the AOI's own logic.
+        `dimension` accepts a plain `int` (single dimension) or a comma-
+        separated `str` (e.g. `"25,30"`) for a genuine multi-dimensional
+        array, same convention as `new_aoi_parameter()`.
 
         Raises `KeyError` if `aoi_name` doesn't resolve to any AOI,
         `sqlite3.IntegrityError` if a local tag with this name already
@@ -1858,7 +1864,7 @@ class ProjectDB:
     def edit_aoi_parameter(self, aoi_name: str, name: str,
                             data_type: Union[str, None] = None,
                             usage: Union[str, None] = None,
-                            dimension: Union[int, None] = None,
+                            dimension: Union[int, str, None] = None,
                             description: Union[str, None] = None,
                             required: Union[str, None] = None,
                             visible: Union[str, None] = None,
@@ -1877,6 +1883,10 @@ class ProjectDB:
         `usage="Input"`/`"Output"`, or a `STRING`/UDT/AOI `data_type` with
         that same usage -- see `new_aoi_parameter()`'s own docstring for
         both real Studio import rejections these guard against).
+
+        `dimension` accepts a plain `int` (single dimension) or a comma-
+        separated `str` (e.g. `"25,30"`) for a genuine multi-dimensional
+        array, same convention as `new_aoi_parameter()`.
 
         CAVEAT, same shape as `edit_tag()`'s own documented one:
         `dimension=None` means "leave the current dimension unchanged," NOT
@@ -1908,10 +1918,11 @@ class ProjectDB:
 
         effective_dtype = data_type if data_type is not None else cur_dtype
         effective_usage = usage if usage is not None else cur_usage
-        effective_dimension = (
-            dimension if dimension is not None
-            else (int(cur_dims) if cur_dims is not None else None)
-        )
+        # cur_dims is already in new_aoi_parameter()'s own accepted string
+        # form (single "10" or multi-dim "25,30") -- passed straight
+        # through rather than int()-converted, which used to crash
+        # (ValueError) on a stored multi-dimensional value.
+        effective_dimension = dimension if dimension is not None else cur_dims
         effective_description = description if description is not None else cur_description
         effective_required = required if required is not None else cur_required
         effective_visible = visible if visible is not None else cur_visible
@@ -3170,7 +3181,7 @@ def db_new_aoi(acd_path, name: str, description: Union[str, None] = None,
 
 
 def db_new_aoi_parameter(acd_path, aoi_name: str, name: str, data_type: str,
-                          usage: str = "Input", dimension: Union[int, None] = None,
+                          usage: str = "Input", dimension: Union[int, str, None] = None,
                           description: Union[str, None] = None, index: Union[int, None] = None,
                           required: Union[str, None] = None, visible: Union[str, None] = None,
                           external_access: Union[str, None] = None,
@@ -3186,7 +3197,7 @@ def db_new_aoi_parameter(acd_path, aoi_name: str, name: str, data_type: str,
 def db_edit_aoi_parameter(acd_path, aoi_name: str, name: str,
                            data_type: Union[str, None] = None,
                            usage: Union[str, None] = None,
-                           dimension: Union[int, None] = None,
+                           dimension: Union[int, str, None] = None,
                            description: Union[str, None] = None,
                            required: Union[str, None] = None, visible: Union[str, None] = None,
                            external_access: Union[str, None] = None,
@@ -3206,7 +3217,7 @@ def db_delete_aoi_parameter(acd_path, aoi_name: str, name: str,
 
 
 def db_new_aoi_local_tag(acd_path, aoi_name: str, name: str, data_type: str,
-                          dimension: Union[int, None] = None,
+                          dimension: Union[int, str, None] = None,
                           description: Union[str, None] = None, index: Union[int, None] = None,
                           project_dir=None, verbose: bool = False) -> int:
     """Stateless equivalent of `ProjectDB.new_aoi_local_tag()` -- see its docstring."""

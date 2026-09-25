@@ -1749,6 +1749,70 @@ def test_edit_aoi_parameter_missing_raises_key_error(acd_copy):
         db.close()
 
 
+def test_new_aoi_parameter_multi_dimensional_persists(acd_copy):
+    # Regression test for a real reported gap: dimension used to be
+    # int-only, blocking a genuine multi-dimensional InOut array parameter
+    # (e.g. a [rows,cols] result-set table) -- see new_aoi_parameter()'s own
+    # docstring (elements/model.py) for the full investigation.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_MULTIDIM_AOI")
+        db.new_aoi_parameter("PDB_MULTIDIM_AOI", "Matrix", "DINT", usage="InOut",
+                              dimension="25,30")
+
+        aoi = db.get_aoi("PDB_MULTIDIM_AOI")
+        param = next(p for p in aoi["parameters"] if p["name"] == "Matrix")
+        assert param["dimensions"] == "25,30"
+    finally:
+        db.close()
+
+
+def test_edit_aoi_parameter_does_not_crash_on_stored_multi_dimensional_value(acd_copy):
+    # Regression test: edit_aoi_parameter()'s own "leave dimension unchanged
+    # when not passed" fallback used to do int(cur_dims) directly, which
+    # crashed (ValueError: invalid literal for int()) the moment a
+    # parameter's ALREADY-STORED dimension was a genuine multi-dim string --
+    # editing any OTHER field (here, description) without touching dimension
+    # must not crash, and the dimension must survive unchanged.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_MULTIDIM_EDIT_AOI")
+        db.new_aoi_parameter("PDB_MULTIDIM_EDIT_AOI", "Matrix", "DINT", usage="InOut",
+                              dimension="25,30")
+
+        db.edit_aoi_parameter("PDB_MULTIDIM_EDIT_AOI", "Matrix", description="a 2D table")
+
+        aoi = db.get_aoi("PDB_MULTIDIM_EDIT_AOI")
+        param = next(p for p in aoi["parameters"] if p["name"] == "Matrix")
+        assert param["dimensions"] == "25,30"
+        assert param["description"] == "a 2D table"
+    finally:
+        db.close()
+
+
+def test_db_new_aoi_parameter_stateless_wrapper_accepts_multi_dimensional_string(acd_copy):
+    db_new_aoi(str(acd_copy), "PDB_MULTIDIM_DB_AOI")
+    db_new_aoi_parameter(str(acd_copy), "PDB_MULTIDIM_DB_AOI", "Matrix", "DINT",
+                          usage="InOut", dimension="4,3,2")
+
+    aoi = db_get_aoi(str(acd_copy), "PDB_MULTIDIM_DB_AOI")
+    param = next(p for p in aoi["parameters"] if p["name"] == "Matrix")
+    assert param["dimensions"] == "4,3,2"
+
+
+def test_new_aoi_local_tag_multi_dimensional_persists(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_MULTIDIM_LT_AOI")
+        db.new_aoi_local_tag("PDB_MULTIDIM_LT_AOI", "Matrix", "DINT", dimension="10,20")
+
+        aoi = db.get_aoi("PDB_MULTIDIM_LT_AOI")
+        lt = next(t for t in aoi["local_tags"] if t["name"] == "Matrix")
+        assert lt["dimensions"] == "10,20"
+    finally:
+        db.close()
+
+
 def test_delete_aoi_parameter_removes_it(acd_copy):
     db = open_project_db(str(acd_copy), verbose=False)
     try:

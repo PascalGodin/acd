@@ -33,6 +33,7 @@ from acd.l5x.elements import (
     RSLogix5000Content,
     Routine,
     _AOI_ELEMENTARY_PARAM_TYPES,
+    _count_array_elements,
     _escape_xml_attr,
     _multiline_xml_text,
     _validate_tag_types_resolve,
@@ -1170,14 +1171,36 @@ def _synthetic_aoi_data_type(aoi: "AOI") -> "DataType":
     for p in aoi.parameters:
         if not p.data_type or p.usage == "InOut":
             continue
-        dim = int(p.dimensions) if p.dimensions else 0
+        dim = _flatten_dimensions_for_synthetic_member(p.dimensions)
         dt.members.append(new_member(p.name, p.data_type, dimension=dim, radix=p.radix))
     for lt in aoi.local_tags:
         if not lt.data_type:
             continue
-        dim = int(lt.dimensions) if lt.dimensions else 0
+        dim = _flatten_dimensions_for_synthetic_member(lt.dimensions)
         dt.members.append(new_member(lt.name, lt.data_type, dimension=dim, radix=lt.radix))
     return dt
+
+
+def _flatten_dimensions_for_synthetic_member(dimensions: Union[str, None]) -> int:
+    """`Member.dimension` (unlike `Parameter.dimensions`/`LocalTag.dimensions`)
+    is a single plain `int` -- this codebase's own UDT member model has no
+    multi-dimensional shape at all (see `new_member()`). A genuinely
+    multi-dimensional InOut parameter or LocalTag (e.g. `dimensions="25,30"`,
+    only possible since `new_aoi_parameter()`/`new_aoi_local_tag()` started
+    accepting the same comma-separated multi-dim form `new_tag()` already
+    did) can't be represented as a real multi-dim `Member` here -- flattens
+    to the TOTAL element count (`_count_array_elements()`, e.g. 750 for
+    "25,30") as a single-dim array instead of crashing (`int("25,30")`) or
+    silently dropping the member. Same "reasonable default, not real
+    fidelity" spirit as the rest of this function's own docstring --
+    `None`/empty still means scalar (`0`), matching `int(dimensions)`'s
+    prior behavior exactly for every single-dimension case.
+    """
+    if not dimensions:
+        return 0
+    if "," in dimensions:
+        return _count_array_elements(dimensions)
+    return int(dimensions)
 
 
 def _sync_data_types_map(project: RSLogix5000Content) -> None:

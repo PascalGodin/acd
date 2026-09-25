@@ -278,7 +278,11 @@ EDITS -- durable the moment the call returns (see above), each raising
     output parameter must be of supported elementary data type.)"`). An
     `Input`/`Output` parameter is passed by value and may only be a single
     scalar elementary value; only `InOut` (passed by reference) may be an
-    array OR a structured type (`STRING`/UDT/AOI).
+    array OR a structured type (`STRING`/UDT/AOI). `dimension` accepts a
+    plain `int` (single dimension) or a comma-separated `str` (e.g.
+    `"25,30"`) for a genuine MULTI-dimensional array -- confirmed Studio
+    5000 itself supports this (no documented 1D-only restriction for
+    `InOut` in Rockwell's own help beyond the elementary-type rule above).
   - `db_edit_aoi_parameter(acd_path, aoi_name, name, data_type=None, usage=None,
     dimension=None, description=None, required=None, visible=None,
     external_access=None)` -- update an existing AOI parameter's fields in
@@ -300,7 +304,9 @@ EDITS -- durable the moment the call returns (see above), each raising
     LocalTag (internal AOI state that shouldn't be a public parameter) to
     an AOI (real or `db_new_aoi()`-created, uniformly). No
     `Usage`/`Required`/`Visible` concept -- unlike a `Parameter`, a
-    LocalTag is never a public pin.
+    LocalTag is never a public pin. `dimension` accepts the same plain
+    `int`-or-comma-separated-`str` (e.g. `"25,30"`) multi-dimensional form
+    as `db_new_aoi_parameter()` above.
   - `db_new_routine(acd_path, routine_name, routine_type,
     program_name=None, description=None, aoi_name=None)` -- create a new,
     empty routine (`routine_type` `"RLL"` or `"ST"`) in an EXISTING program

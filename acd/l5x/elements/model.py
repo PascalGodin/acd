@@ -722,6 +722,15 @@ class LocalTag(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
+        # Same SPACE-vs-comma-separated split as Tag.to_xml()/Parameter.to_xml()
+        # -- needed now that a genuine multi-dimensional LocalTag (e.g.
+        # "25,30") is possible; a single-dimension value has no comma and is
+        # unaffected either way.
+        if self.dimensions:
+            base = base.replace(
+                f'Dimensions="{self.dimensions}"',
+                f'Dimensions="{self.dimensions.replace(",", " ")}"',
+            )
         if not self._description:
             return base
         desc = _multiline_xml_text(self._description)
@@ -757,6 +766,15 @@ class Parameter(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
+        # Same SPACE-separated-vs-comma-separated-internal-storage split as
+        # Tag.to_xml() (see its own comment) -- needed now that a genuine
+        # multi-dimensional InOut parameter (e.g. "25,30") is possible; a
+        # single-dimension value has no comma and is unaffected either way.
+        if self.dimensions:
+            base = base.replace(
+                f'Dimensions="{self.dimensions}"',
+                f'Dimensions="{self.dimensions.replace(",", " ")}"',
+            )
         if not self._description:
             return base
         desc = _multiline_xml_text(self._description)
@@ -781,7 +799,7 @@ _AOI_ELEMENTARY_PARAM_TYPES = frozenset(_PRIMITIVE_RADIX) | {"BOOL"}
 
 
 def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
-                       dimension: Union[int, None] = None,
+                       dimension: Union[int, str, None] = None,
                        description: Union[str, None] = None,
                        required: Union[str, None] = None,
                        visible: Union[str, None] = None,
@@ -807,16 +825,30 @@ def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
     see `new_aoi_enable_parameters()` for a ready-made pair instead of
     passing these by hand).
 
-    `dimension`, if given (an `int` > 0), becomes the parameter's array
-    size; `None`/`0` means scalar, matching `Tag.dimensions`' own
-    convention (not `Member.dimension`'s -- there is no `0`-means-scalar
-    ambiguity to guard against here since this only ever produces a plain
-    int-or-None, never a raw stored field). ONLY VALID for `usage="InOut"`
-    -- a real Studio 5000 import rejects an array `Input`/`Output`
-    parameter outright (`"Invalid array. Input or output parameter must be
-    of supported elementary data type with no dimensions."`); raises
+    `dimension`, if given, becomes the parameter's array size -- either a
+    plain `int > 0` (a single dimension, e.g. `10`) or a `str` in the same
+    comma-separated internal form `new_tag()`'s own `dimensions` parameter
+    already uses for a genuine MULTI-dimensional array (e.g. `"25,30"` for
+    a real `[25,30]` 2D array -- `new_tag()`'s own docstring has the full
+    convention, including that a trailing `Tag.to_xml()`-style comma-to-
+    space rendering happens automatically; not independently validated
+    against real Studio 5000 dimension-count/size limits here, matching
+    `new_tag()`'s own "trust the caller" convention for the string form).
+    `None`/`0`/`""` means scalar, matching `Tag.dimensions`' own convention
+    (not `Member.dimension`'s -- there is no `0`-means-scalar ambiguity to
+    guard against here since this only ever produces a plain string-or-
+    None, never a raw stored field). ONLY VALID for `usage="InOut"` -- a
+    real Studio 5000 import rejects an array `Input`/`Output` parameter
+    outright (`"Invalid array. Input or output parameter must be of
+    supported elementary data type with no dimensions."`); raises
     `ValueError` immediately for `dimension` with any other `usage` rather
-    than letting that surface only at import time.
+    than letting that surface only at import time. Confirmed via Rockwell's
+    own Studio 5000 help (AOI Definition Editor, Parameters tab): array-ness
+    is set purely through the Data Type field's own `TypeName[N]`/
+    `TypeName[N,M]` syntax, the same as any regular tag -- there is no
+    separate 1D-only restriction documented for an InOut parameter beyond
+    the elementary-type-on-Input/Output rule above, which is why this was a
+    real, not a platform, gap.
 
     `data_type` for `usage="Input"`/`"Output"` must be one of Rockwell's own
     "elementary" (atomic) types -- `_AOI_ELEMENTARY_PARAM_TYPES`: `BOOL`,
@@ -859,7 +891,14 @@ def new_aoi_parameter(name: str, data_type: str, usage: str = "Input",
     else:
         default_external_access = "Read/Write"
         constant = None
-    dimensions = str(dimension) if dimension else None
+    # A str is trusted as-is (already the comma-separated internal form,
+    # e.g. "25,30" for a real multi-dimensional array -- see this
+    # function's own docstring); an int keeps the original single-dimension
+    # behavior unchanged.
+    if isinstance(dimension, str):
+        dimensions = dimension if dimension else None
+    else:
+        dimensions = str(dimension) if dimension else None
     return Parameter(
         name, name, "Base", data_type, usage, radix,
         required if required is not None else "true",
@@ -894,7 +933,7 @@ def new_aoi_enable_parameters() -> Tuple[Parameter, Parameter]:
     return enable_in, enable_out
 
 
-def new_aoi_local_tag(name: str, data_type: str, dimension: Union[int, None] = None,
+def new_aoi_local_tag(name: str, data_type: str, dimension: Union[int, str, None] = None,
                        description: Union[str, None] = None) -> LocalTag:
     """Construct a new `LocalTag` (private, non-public AOI storage -- scratch
     values/internal state that shouldn't be a visible Input/Output/InOut
@@ -910,12 +949,16 @@ def new_aoi_local_tag(name: str, data_type: str, dimension: Union[int, None] = N
     -- there is no `Usage`/`Required`/`Visible` concept for a LocalTag at
     all, unlike `Parameter`.
 
-    `dimension`, if given (an `int` > 0), becomes the tag's array size;
-    `None`/`0` means scalar, matching `new_tag()`/`new_aoi_parameter()`'s
-    own convention.
+    `dimension`, if given, becomes the tag's array size -- either a plain
+    `int > 0` (a single dimension) or a `str` in the same comma-separated
+    internal form as `new_tag()`/`new_aoi_parameter()`'s own multi-
+    dimensional convention (e.g. `"25,30"`); `None`/`0`/`""` means scalar.
     """
     radix = _PRIMITIVE_RADIX.get(data_type.upper())
-    dimensions = str(dimension) if dimension else None
+    if isinstance(dimension, str):
+        dimensions = dimension if dimension else None
+    else:
+        dimensions = str(dimension) if dimension else None
     return LocalTag(
         name, name, data_type, dimensions, radix, "Read/Write",
         _description=description,

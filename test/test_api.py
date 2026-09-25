@@ -697,6 +697,22 @@ def test_new_aoi_parameter_dimension():
     assert p.dimensions == "10"
 
 
+def test_new_aoi_parameter_multi_dimensional():
+    # Regression test for a real reported gap: dimension used to be int-only,
+    # so a genuine multi-dimensional InOut array parameter (Studio 5000
+    # itself supports one via the same TypeName[N,M] syntax as any regular
+    # tag -- confirmed via Rockwell's own Studio 5000 help, no documented
+    # 1D-only restriction for InOut) had no way to be created. A str in the
+    # same comma-separated internal form new_tag()'s own dimensions already
+    # uses is now accepted, matching that convention exactly.
+    p = new_aoi_parameter("Matrix", "DINT", usage="InOut", dimension="25,30")
+    assert p.dimensions == "25,30"
+    assert 'Dimensions="25 30"' in p.to_xml(), (
+        "the rendered XML must use SPACE-separated dimensions, same as Tag.to_xml(), "
+        "not the comma-separated internal storage form"
+    )
+
+
 def test_new_aoi_parameter_rejects_invalid_usage():
     with pytest.raises(ValueError, match="must be 'Input', 'Output', or 'InOut'"):
         new_aoi_parameter("Bad", "DINT", usage="Local")
@@ -808,6 +824,12 @@ def test_new_aoi_local_tag_defaults():
 def test_new_aoi_local_tag_dimension():
     lt = new_aoi_local_tag("ScratchArr", "DINT", dimension=5)
     assert lt.dimensions == "5"
+
+
+def test_new_aoi_local_tag_multi_dimensional():
+    lt = new_aoi_local_tag("Matrix", "DINT", dimension="4,3,2")
+    assert lt.dimensions == "4,3,2"
+    assert 'Dimensions="4 3 2"' in lt.to_xml()
 
 
 def test_new_aoi_local_tag_udt_type_omits_radix():
@@ -1159,6 +1181,28 @@ def test_sync_data_types_map_excludes_inout_parameters_from_instance_shape():
 
     dt = project.controller._data_types_map["MYAOI"]
     assert {m.name for m in dt.members} == {"In1", "Out1"}
+
+
+def test_sync_data_types_map_flattens_multi_dimensional_local_tag_instead_of_crashing():
+    # Regression test: Member.dimension (unlike Parameter.dimensions/
+    # LocalTag.dimensions) is a plain int -- this codebase's own UDT member
+    # model has no multi-dimensional shape at all. _synthetic_aoi_data_type()
+    # used to do int(lt.dimensions) directly, which crashed (ValueError) the
+    # moment a LocalTag's own dimensions became a genuine multi-dim string
+    # (e.g. "25,30") -- now possible since new_aoi_local_tag() started
+    # accepting the same comma-separated form new_tag() already did. Flattens
+    # to the total element count instead of crashing or silently dropping
+    # the member.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    aoi = new_aoi("MatrixAOI")
+    aoi.local_tags.append(new_aoi_local_tag("Matrix", "DINT", dimension="25,30"))
+    project.controller.aois.append(aoi)
+
+    _sync_data_types_map(project)  # must not raise
+
+    dt = project.controller._data_types_map["MATRIXAOI"]
+    matrix = next(m for m in dt.members if m.name == "Matrix")
+    assert matrix.dimension == 750
 
 
 def test_tag_to_xml_omits_data_for_synthetic_aoi_instance_type():

@@ -5207,6 +5207,161 @@ non-fully-empty case the report also flagged — some extended records present, 
 (`test/test_database.py`) — confirmed this last one fails with the reported `KeyError` before the
 fix, not just passes with it.
 
+## PARKED, NOT IMPLEMENTED: AOI Parameter/LocalTag `DefaultData` — encoding fully solved and doubly-verified; the AOI→blob link is not, and nothing has been coded
+
+A real report: `db_export_aoi()`/`db_get_aoi()` silently drop a LocalTag's stored default value
+entirely — real values (e.g. Unicode string literals for SQL connection identity) are invisible
+through every `db_*` read path, indistinguishable from a genuinely-blank tag. This already caused a
+real downstream mistake: analysis based on `db_export_aoi()`'s output wrongly concluded several
+fields "are never set anywhere," when Studio's own UI showed real, deliberate values the whole
+time. **Investigated extensively across two real projects and real Studio 5000 screenshots as
+ground truth — the on-disk ENCODING is now fully cracked and independently verified twice, byte-
+for-byte — but the mechanism that links a specific AOI to its own stored default data was not
+found despite exhausting every file/lookup this codebase currently understands. Per direct user
+instruction, this is parked here, not implemented, until that link is found or a different approach
+is chosen.** No code was changed for this investigation — this section exists purely so the next
+person picking this up doesn't have to re-derive any of the following from scratch.
+
+### What's SOLVED: the on-disk format
+
+Default values for an AOI's Parameters (excluding `Usage="Output"`/`"InOut"` — see below) and
+LocalTags live in a previously-undocumented, **project-wide** Comps.Dat collection,
+`RxDataCollection` — a child of the controller object, sibling to `RxDataTypeCollection`/
+`RxUDIDefinitionCollection`. It holds many `$hex$`-named blob child objects (43 in one real project,
+7 in another) — **not** structurally connected to the AOIs they belong to via `parent_id` (their
+parent is the shared `RxDataCollection` itself, not any specific AOI). Confusingly, **every AOI also
+has its own per-object `RxDataCollection` child** (sibling to its own `RxTagCollection`/
+`RxRoutineCollection`, matching the shape of 7 other always-empty per-object stub collections —
+`RxAlarmAnalogCollection`, `RxAlarmDigitalCollection`, `RxBEOCollection`, `RxChartCollection`,
+`RxEEOCollection`, `RxHMIBCCollection`, `RxMsgCollection`) — but this per-AOI one is a dead, unused
+78-byte stub with zero children in every real case checked; the REAL default-value blob for that
+AOI is one of the `$hex$`-named children under the OTHER, project-wide `RxDataCollection`, found in
+both real cases only by brute-force searching for an already-known value.
+
+Each real blob's own comps record has 3 normally-parsed extended records (`0x1`, `0x64`, `0x65`)
+plus one TRAILING record left unparsed by the same `RxGeneric` "always leaves the last declared
+attribute unparsed" quirk already established for a Tag's own value blob (see
+`_tag_value_blob_offset()`) — this trailing record IS the DefaultData payload, located via the exact
+same formula: `82 + sum(8 + len(v) for v in exts.values()) + 8`. The blob's own `comment_id` is a
+small number (6 in one sample, 4 in another) — unlike the large, hash-like `comment_id` values real
+tags/AOIs carry, suggesting a small per-project sequential counter specific to DefaultData blob
+creation, not a real unique identity. Its `cip_type` is `106` (`0x6a`) in BOTH real samples from BOTH
+projects — almost certainly a fixed "this is a DefaultData record" type marker.
+
+**Payload structure, confirmed via two fully independent real AOIs, matched byte-for-byte to real
+Studio 5000 screenshots** (`PE_SQL_Build_Login_Packet` in `Test_SQL_Ref.ACD`;
+`VAB_Real_To_Str` in `VAB_SQL.ACD`, both under `...\Bethel_Planer\source\`): a flat sequence of
+per-field "slots," one per eligible field, in **`member_ref` order** — the SAME real Rockwell
+order `AoiBuilder.build()` already sorts `.parameters`/`.local_tags` by (see "CRITICAL: AOI
+parameter order was scrambled on export" above) — walking the AOI's own Parameters first, then its
+LocalTags, **NOT** Studio's own Local Tags grid display order (which can be user-sorted, e.g.
+alphabetically, and was in one of the two real screenshots used here — a real trap for anyone
+trying to map slots against a screenshot without independently re-deriving the real order via
+`AoiBuilder` first). Two eligibility rules, both confirmed:
+- A Parameter with `Usage="Output"` or `Usage="InOut"` gets **no slot at all** — `Output` has no
+  real "default" concept (its value is always computed, never set by a caller), and `InOut` has no
+  instance storage at all (passed by reference — already established elsewhere in this file).
+- Every other Parameter and every LocalTag gets exactly one slot, unconditionally (including an
+  empty-string default, which is simply an all-zero slot — indistinguishable by content alone from
+  "no slot exists," which is why the eligibility rule above had to be confirmed structurally, not
+  inferred from content).
+
+Slot SIZE depends on the field's own type:
+- A scalar (`BOOL`/`DINT`/`REAL`): a bare **4-byte** slot, the raw value, no length prefix at all
+  (a `REAL` is the raw 4-byte IEEE-754 bit pattern, e.g. `123.5` = `0x42F70000`).
+- A `STRING`: a fixed **88-byte** slot — a 4-byte length-IN-BYTES prefix, then the text, then
+  zero-padding to fill the slot. Confirmed the text encoding is NOT consistent across the two real
+  samples: `Test_SQL_Ref.ACD`'s fields (all documented "(unicode)" in their own Description column)
+  are **UTF-16LE** (length-in-bytes always even, e.g. `"us_english"` → prefix `20`, 20 bytes of
+  UTF-16LE text); `VAB_SQL.ACD`'s fields (plain `STRING`, no "(unicode)" mention) are **single-byte
+  ASCII/Latin-1** (length-in-bytes always odd or matching char count exactly, e.g. `"abc"` → prefix
+  `3`, 3 raw bytes `'a','b','c'`, confirmed NOT UTF-16 since UTF-16 requires an even byte count and
+  3 is odd). **The actual discriminator bit/flag selecting which encoding a given STRING field uses
+  was never found** — nothing on the LocalTag/Parameter's own comps record, its `DataType` name
+  (both real samples are typed plain `"STRING"`, no distinguishing name), or anywhere else checked
+  differed between the two cases in an obvious way. A length-parity check (odd length-in-bytes can
+  only ever be single-byte; even length is ambiguous between the two encodings) is the only
+  currently-known heuristic, and is NOT a confirmed general rule — only two real samples exist,
+  each internally consistent, never cross-checked against a THIRD sample that might disprove it.
+
+**Verified end-to-end, exactly, on both real samples** (not just "looks plausible" — every single
+field's own value matched Studio's own Default column, AND the payload's own total byte length
+matched the SUM of each field's own computed slot size exactly, with zero slack):
+- `Test_SQL_Ref.ACD` / `PE_SQL_Build_Login_Packet` (AOI object_id `3527577334`; blob object_id
+  `3171609358`, name `$fcfdb37a$`, comment_id `6`, cip_type `106`): `AppName="PE_SQL_Insert"`
+  (UTF-16LE, prefix @ payload offset 12, text @ 16, length 26), `LibraryName="PE_SQL"` (prefix @
+  100, text @ 104, length 12), `Locale="us_english"` (prefix @ 188, text @ 192, length 20),
+  `ClientName="PESQL"` (prefix @ 488, text @ 492, length 10) — all 4 confirmed against a real
+  Studio 5000 Local Tags tab screenshot, including the `$`-escaped L5K literal convention
+  (`'P$00E$00S$00Q$00L$00'` → `"PESQL"`) already established elsewhere in this file for
+  `_l5k_string_padded()`.
+- `VAB_SQL.ACD` / `VAB_Real_To_Str` (AOI object_id `1212706368`; blob object_id `1869613336`, name
+  `$4994d58c$`, comment_id `4`, cip_type `106`, payload length exactly `560` bytes): `EnableIn`
+  (BOOL) `= 1` @ offset 0, `Source` (REAL) `= 123.5` @ 4, `DecimalPlaces` (DINT) `= 678` @ 8,
+  `ScaleFactor` (DINT) `= 963` @ 12, `Scaled` (DINT) `= 852` @ 16, `Sign` (STRING, empty) — all-zero
+  88-byte slot @ 20, `WholePart` (DINT) `= 654` @ 108, `FracPart` (DINT) `= 741` @ 112, `WholeStr`
+  (STRING, empty) — all-zero 88-byte slot @ 116, `FracStr` (STRING) `= "abc"` (Latin-1, prefix @
+  204, text @ 208, length 3), `PadZero` (STRING) `= "qwe"` (prefix @ 292, text @ 296, length 3),
+  `PeriodStr` (STRING) `= "asd"` (prefix @ 380, text @ 384, length 3), `Var_i` (DINT) `= 321` @
+  468, `TmpStr` (STRING, empty) — all-zero 88-byte slot @ 472, ending at payload offset `560`
+  (`472 + 88`), exactly the blob's own total payload length — confirming both the field-count AND
+  the slot-size formula are exactly right, not just individually plausible. `EnableOut` (BOOL,
+  `Usage="Output"`, default `0` in Studio) correctly has NO discoverable slot anywhere, matching the
+  eligibility rule above (a `0` value is indistinguishable from "no slot" by content, but its total
+  ABSENCE from the byte-count math — the sum without it matches exactly — confirms it really has
+  none, not just an unluckily-zero one). `Dest` (STRING, `Usage="InOut"`) likewise has no slot.
+  Real member_ref order for this AOI (from `AoiBuilder.build()`, confirmed to differ from Studio's
+  own — alphabetically-sorted-by-the-user — grid display order): `EnableIn, EnableOut, Source,
+  Dest, DecimalPlaces` (Parameters) then `ScaleFactor, Scaled, Sign, WholePart, FracPart, WholeStr,
+  FracStr, PadZero, PeriodStr, Var_i, TmpStr` (LocalTags).
+
+### What's UNSOLVED: the AOI → blob reference
+
+Both real blobs above were found ONLY by brute-force searching the whole project for an
+already-known default value — there is no known way to go the other direction (given an arbitrary
+AOI, find its own blob's object_id) without already knowing at least one of its real values, which
+defeats the entire purpose. **Every plausible location was checked and ruled out**, across BOTH real
+projects:
+- The AOI's own top-level comps record — every parsed extended record, AND its own trailing
+  RxGeneric-unparsed attribute (which held something else entirely each time: `0x67`/value
+  `0xad2a8531` in one project, `0x193`/value `2` in the other — neither resembling the blob's own
+  object_id, comment_id, or any composite of them).
+- The AOI's own per-object `RxDataCollection` stub (decoded field-by-field, all 78 bytes,
+  twice) — contains only a self-referential encoding of the AOI's OWN `object_id`/`comment_id`/
+  `cip_type`, no forward pointer to anything.
+- Every one of the AOI's other 7 always-empty per-object stub collections (same 78-byte shape).
+- Each individual LocalTag's own comps record (checked directly for all 4 STRING tags in the first
+  project).
+- `comment_id`/`cip_type` composite-key matching (`(comment_id << 16) | cip_type`, the same formula
+  Comments.Dat resolution already uses elsewhere in this file) in both directions — neither the
+  AOI's own composite, nor a synthesized `(AOI.comment_id << 16) | 106` (substituting the blob's
+  own fixed cip_type marker) appears anywhere connecting the two.
+- `Nameless.Dat` — both of the AOI's own nameless children (just the already-documented
+  created/edited-by metadata record `_parse_aoi_nameless()` already reads, nothing new).
+- `TagInfo.XML`/`QuickInfo.XML` — neither the AOI's own name, its object_id, nor the blob's
+  object_id appears in either file at all.
+- `Comments.Dat`, queried via the AOI's own `(comment_id << 16) | cip_type` parent key — found real,
+  expected entries (per-parameter/local-tag Description text, confirming the `member_ref` values
+  used above independently), but nothing referencing the blob object.
+- `XRefs.Dat` — the AOI's own `object_id` appears 105 times in this file (consistent with it being
+  a real, working cross-reference database for things like instance-tag call sites), but the
+  blob's own `object_id` appears **zero** times anywhere in the same file.
+
+**Most promising un-attempted next step**: `XRefs.Dat` is the one file in the whole container this
+codebase has genuinely never reverse-engineered at all (`record_format 132; DbExtract refuses it`,
+per the "ACD write-back" section above) — its own object_id NOT appearing as a raw little-endian
+`u32` doesn't rule it out as the real home of this link, it only rules out the simplest possible
+"grep for the raw bytes" check; the real reference could easily be encoded in some structured,
+not-yet-understood record shape specific to that file. This would be a substantial, open-ended
+investment (cracking a brand-new binary format from zero, the way `RegnLink.Idx`/the V38.02 Region
+Map layout/`_tag_value_blob_offset()` itself all originally were) — not attempted this round, by
+explicit user direction to park this investigation rather than continue.
+
+**If picking this back up**: the real project files (`Test_SQL_Ref.ACD`, `VAB_SQL.ACD`) and their
+exact object_ids/offsets above are enough to re-derive everything above without needing fresh
+ground truth for the ENCODING side of this — only the LINK side still needs new information (e.g.
+a third real sample, or successfully parsing `XRefs.Dat`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

@@ -5424,6 +5424,70 @@ Covered by `test_new_aoi_parameter_multi_dimensional`, `test_new_aoi_local_tag_m
 repro for point 3 above), `test_db_new_aoi_parameter_stateless_wrapper_accepts_multi_dimensional_string`,
 `test_new_aoi_local_tag_multi_dimensional_persists` (`test/test_project_db.py`).
 
+## Twentieth round: `ParameterBuilder`/`LocalTagBuilder` only ever decoded `dimension_1` -- a real, Studio-saved multi-dim AOI parameter silently collapsed to rank 1 on read
+
+Direct follow-up to the nineteenth round's WRITE-side multi-dim fix, this time on the READ (decode)
+side, and a real, well-isolated report: `db_get_aoi()` correctly showed `dimensions: "25,25"` for a
+brand-new InOut parameter set via `db_new_aoi_parameter(..., dimension="25,25")` and read back in the
+SAME session, and the exported L5X correctly showed `Dimensions="25 25"`. That same file was imported
+into real Studio 5000 (confirmed via Studio's own Properties dialog: `VAB_SQL_Value[25,25]`, genuinely
+2D, a 2-subscript `CPS(...)` reference against it compiled cleanly) and saved back. The user then deep
+deleted the project's `acd.db` sidecar entirely — ruling out a stale-cache explanation — and re-ran
+`db_get_aoi()` against the resulting real, Studio-saved `.ACD`: `dimensions: "25"`, collapsed back to
+rank 1, both in the DB read and in a fresh `export_aoi()`'s `Dimensions="25"`.
+
+**Root cause, confirmed directly**: `ParameterBuilder.build()`/`LocalTagBuilder.build()`
+(`acd/l5x/elements/builders_routine.py`) only ever read ONE u32 (`dimension_1`, raw record offset
+`0x1A`) for an AOI parameter/local tag's own array size — never `dimension_2`/`dimension_3`. This is
+the exact same three-field shape a regular Tag's own decode (`TagBuilder.build()`,
+`acd/l5x/elements/builders_tag.py`) already correctly reads via `r.main_record.dimension_1/_2/_3` —
+confirmed by tracing `RxGeneric`'s own generated Kaitai parser (`acd/generated/comps/rx_generic.py`):
+`main_record` is a 60-byte sub-record starting at raw offset 14 (right after the 14-byte
+`parent_id`/`unique_tag_identifier`/`record_format_version`/`cip_type`/`comment_id` header), with
+`dimension_1`/`dimension_2`/`dimension_3` at RELATIVE offsets 12/16/20 within it — i.e. raw absolute
+offsets `0x1A`/`0x1E`/`0x22`, exactly the same three fields, same order, same absolute positions a
+regular Tag already uses. `ParameterBuilder`/`LocalTagBuilder` were apparently only ever verified
+against single-dimension real AOIs, so the missing `dimension_2`/`dimension_3` read never surfaced
+until a genuinely 2D real AOI parameter was checked.
+
+**Why this was invisible for an AOI this library itself created**: `new_aoi_parameter()`'s own
+multi-dim `dimension="25,25"` string is stored and re-read verbatim through `proj_aoi_parameters`
+(a plain SQL column) — it never round-trips through this raw-binary decode path at all unless/until
+the AOI is materialized from a REAL, Studio-saved `.ACD` (see "Twelfth round" above: full
+materialization of real AOIs into `proj_aois`/`proj_aoi_parameters` via `AoiBuilder`/
+`ParameterBuilder`/`LocalTagBuilder`, the exact path this bug lives in). A fresh-session read of a
+DB-authored AOI's own parameter never exercises this code at all; only a rebuild against a real,
+Studio-saved `.ACD` does — exactly what the user's own "delete `acd.db`, force a clean rebuild" step
+correctly isolated.
+
+**Fix**: both `ParameterBuilder.build()` and `LocalTagBuilder.build()` now read all three
+`dimension_1`/`dimension_2`/`dimension_3` u32s (offsets `0x1A`/`0x1E`/`0x22`, each independently
+bounds-checked against `len(raw_rec)`) and join every non-zero one, in order, with `,` — the same
+`dim_parts`-list pattern `TagBuilder.build()` already uses, applied to the AOI-specific decode path
+for the first time.
+
+**Verified**: the new synthetic-record tests reproduce the real reported shape exactly (a 2D `[25,25]`
+parameter now decodes `dimensions == "25,25"`, not `"25"`), a 3D local tag case (`[4,3,2]`, not
+independently reported but not previously exercised either) decodes `"4,3,2"`, and a plain scalar
+parameter (all three raw dimension fields zero) still correctly decodes `dimensions is None` — the
+fix is a no-op for every 1D/scalar case, matching every pre-existing AOI test in the suite (all of
+which continue to pass unchanged).
+
+**Caveat, stated plainly since only one real 2D case has been checked**: the `dimension_1,
+dimension_2, dimension_3` ORDER (matching `TagBuilder.build()`'s own established, already-verified
+order for regular Tags) is trusted by direct analogy, not independently re-confirmed for AOI
+parameters specifically — the one real repro case (`[25,25]`, both dimensions equal) can't
+distinguish an order bug from a correct decode. If a future real, ASYMMETRIC multi-dim AOI parameter
+(e.g. `[10,20]`) is ever checked against real Studio ground truth and disagrees, re-investigate the
+order rather than assume this analogy holds.
+
+Covered by `test_aoi_builder_decodes_multi_dimensional_parameter` (the literal reported 2D case),
+`test_aoi_builder_decodes_three_dimensional_local_tag`, and
+`test_aoi_builder_scalar_parameter_still_decodes_no_dimensions` (non-regression for the common,
+unaffected case) — `test/test_elements_helpers.py`, using a `dim1`/`dim2`/`dim3`-extended
+`_aoi_tag_record()` synthetic-record helper (the same one the nineteenth round's ordering tests
+already use).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

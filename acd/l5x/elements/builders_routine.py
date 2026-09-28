@@ -30,12 +30,34 @@ class ParameterBuilder(L5xElementBuilder):
 
         data_type = _aoi_tag_data_type(self._cur, raw_rec)
 
-        # Dimensions (array size) at raw record offset 0x1A as u32; 0 means scalar.
-        dimensions: Union[str, None] = None
+        # Dimensions (array rank/size) at raw record offsets 0x1A/0x1E/0x22 as
+        # three u32s (dimension_1/2/3, 0 = unused) -- the same three fields
+        # and same absolute offsets a regular Tag's own RxGeneric main_record
+        # exposes as dimension_1/2/3 (see TagBuilder.build(), builders_tag.py).
+        # This code used to read only dimension_1 (0x1A), which happened to
+        # round-trip correctly for a multi-dim value THIS library itself
+        # wrote (single string stored/re-parsed verbatim, never actually
+        # re-encoded through this offset), but silently collapsed a genuine
+        # multi-dim parameter to rank 1 the moment it came from a real
+        # Studio 5000 save, which does populate dimension_2/3 for a real 2D/
+        # 3D AOI parameter -- confirmed via a real project (VAB_SQL.ACD,
+        # AOI VAB_SQL_ParseResponseColumns, parameter OutputRows,
+        # VAB_SQL_Value[25,25]) that round-tripped through a real Studio
+        # import/export and came back dimensions="25" instead of "25,25".
+        dim_parts = []
         if len(raw_rec) >= 0x1E:
-            dim_val = struct.unpack_from("<I", raw_rec, 0x1A)[0]
-            if dim_val:
-                dimensions = str(dim_val)
+            d1 = struct.unpack_from("<I", raw_rec, 0x1A)[0]
+            if d1:
+                dim_parts.append(str(d1))
+        if len(raw_rec) >= 0x22:
+            d2 = struct.unpack_from("<I", raw_rec, 0x1E)[0]
+            if d2:
+                dim_parts.append(str(d2))
+        if len(raw_rec) >= 0x26:
+            d3 = struct.unpack_from("<I", raw_rec, 0x22)[0]
+            if d3:
+                dim_parts.append(str(d3))
+        dimensions: Union[str, None] = ",".join(dim_parts) if dim_parts else None
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
@@ -126,12 +148,22 @@ class LocalTagBuilder(L5xElementBuilder):
 
         data_type = _aoi_tag_data_type(self._cur, raw_rec)
 
-        # Dimensions at raw record offset 0x1A.
-        dimensions: Union[str, None] = None
+        # Dimensions (array rank/size) at raw record offsets 0x1A/0x1E/0x22 --
+        # see the identical fix/rationale in ParameterBuilder.build() above.
+        dim_parts = []
         if len(raw_rec) >= 0x1E:
-            dim_val = struct.unpack_from("<I", raw_rec, 0x1A)[0]
-            if dim_val:
-                dimensions = str(dim_val)
+            d1 = struct.unpack_from("<I", raw_rec, 0x1A)[0]
+            if d1:
+                dim_parts.append(str(d1))
+        if len(raw_rec) >= 0x22:
+            d2 = struct.unpack_from("<I", raw_rec, 0x1E)[0]
+            if d2:
+                dim_parts.append(str(d2))
+        if len(raw_rec) >= 0x26:
+            d3 = struct.unpack_from("<I", raw_rec, 0x22)[0]
+            if d3:
+                dim_parts.append(str(d3))
+        dimensions: Union[str, None] = ",".join(dim_parts) if dim_parts else None
 
         try:
             r = RxGeneric.from_bytes(raw_rec)

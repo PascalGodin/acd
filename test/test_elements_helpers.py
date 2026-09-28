@@ -839,7 +839,8 @@ _AOI_TAG_RECORD_DEFAULT_DT_OID = 999900  # arbitrary, must match a comps row cal
 
 
 def _aoi_tag_record(member_ref: int, is_param: bool,
-                     data_type_oid: int = _AOI_TAG_RECORD_DEFAULT_DT_OID) -> bytes:
+                     data_type_oid: int = _AOI_TAG_RECORD_DEFAULT_DT_OID,
+                     dim1: int = 0, dim2: int = 0, dim3: int = 0) -> bytes:
     """Build a synthetic AOI RxTagCollection child (Parameter or LocalTag)
     comps record. `member_ref` (raw offset [14:18]) is the real Rockwell
     order key AoiBuilder now sorts by -- see its own docstring for how this
@@ -857,10 +858,17 @@ def _aoi_tag_record(member_ref: int, is_param: bool,
     any object_id with no matching comps row) to build a spurious,
     blank-DataType child, the same shape AoiBuilder now filters out (see
     `test_aoi_builder_skips_*_with_unresolvable_data_type` below).
+
+    `dim1`/`dim2`/`dim3` (raw offsets 0x1A/0x1E/0x22) are the same three
+    dimension_1/2/3 u32 fields a regular Tag's RxGeneric main_record already
+    exposes -- see the multi-dimensional AOI parameter/local tag decode fix.
     """
     header = struct.pack("<IIHHH", 0, 0, 40, 999, 0)  # 14 bytes
     main_record = bytearray(60)
     struct.pack_into("<I", main_record, 0, member_ref)  # this record's bytes [14:18]
+    struct.pack_into("<I", main_record, 12, dim1)  # this record's bytes [26:30] (0x1A)
+    struct.pack_into("<I", main_record, 16, dim2)  # this record's bytes [30:34] (0x1E)
+    struct.pack_into("<I", main_record, 20, dim3)  # this record's bytes [34:38] (0x22)
     struct.pack_into("<I", main_record, 28, data_type_oid)  # this record's bytes [42:46] (0x2A)
     ext01 = bytearray(0x210)
     if is_param:
@@ -991,6 +999,88 @@ def test_aoi_builder_orders_local_tags_by_member_ref_too():
     aoi = AoiBuilder(cur, AOI_ID).build()
 
     assert [lt.name for lt in aoi.local_tags] == ["LT_First", "LT_Second", "LT_Third"]
+
+
+def test_aoi_builder_decodes_multi_dimensional_parameter():
+    # Regression test for a real bug report: ParameterBuilder/LocalTagBuilder
+    # only ever read dimension_1 (raw offset 0x1A), the same single u32 this
+    # library's own new_aoi_parameter()/db_new_aoi_parameter() writer path
+    # always round-tripped correctly (since it just stores/re-parses its own
+    # comma-separated string verbatim, never actually re-encoding through
+    # this raw offset) -- so the bug was invisible for any AOI this library
+    # created and read back in-session. A REAL Studio 5000 save of a genuine
+    # 2D InOut parameter (VAB_SQL_ParseResponseColumns/OutputRows,
+    # VAB_SQL_Value[25,25], confirmed via Studio's own Properties dialog)
+    # populates dimension_2 (raw offset 0x1E) too, which the old code never
+    # read at all -- silently collapsing a real 2D array to dimensions="25"
+    # on decode. Fixed by also reading dimension_2/dimension_3 (0x1E/0x22),
+    # the same two fields TagBuilder.build() already reads for a regular Tag.
+    db = _make_aoi_db()
+    cur = db.cursor()
+
+    AOI_ID, TAG_COLL_ID, DT_ID, PARAM_ID = 900, 901, 902, 903
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (AOI_ID, 0, "TestAOI3", 0, 256, b"\x00" * 20))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (DT_ID, 0, "DINT", 0, 256, b""))
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (PARAM_ID, TAG_COLL_ID, "OutputRows", 0, 256,
+         _aoi_tag_record(10, is_param=True, data_type_oid=DT_ID, dim1=25, dim2=25)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+
+    assert len(aoi.parameters) == 1
+    assert aoi.parameters[0].dimensions == "25,25", (
+        "A real 2D AOI parameter must decode both dimension_1 AND "
+        "dimension_2, not collapse to rank 1 by only reading dimension_1"
+    )
+
+
+def test_aoi_builder_decodes_three_dimensional_local_tag():
+    # Same fix, LocalTagBuilder side, and a real 3rd dimension too (dim3,
+    # raw offset 0x22) -- not exercised by the 2D repro above.
+    db = _make_aoi_db()
+    cur = db.cursor()
+
+    AOI_ID, TAG_COLL_ID, DT_ID, LT_ID = 910, 911, 912, 913
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (AOI_ID, 0, "TestAOI4", 0, 256, b"\x00" * 20))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (DT_ID, 0, "DINT", 0, 256, b""))
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (LT_ID, TAG_COLL_ID, "Cube", 0, 256,
+         _aoi_tag_record(10, is_param=False, data_type_oid=DT_ID, dim1=4, dim2=3, dim3=2)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+
+    assert len(aoi.local_tags) == 1
+    assert aoi.local_tags[0].dimensions == "4,3,2"
+
+
+def test_aoi_builder_scalar_parameter_still_decodes_no_dimensions():
+    # Non-regression: a plain scalar parameter (dim1=dim2=dim3=0) must still
+    # decode dimensions=None, not "0" or "".
+    db = _make_aoi_db()
+    cur = db.cursor()
+
+    AOI_ID, TAG_COLL_ID, DT_ID, PARAM_ID = 920, 921, 922, 923
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (AOI_ID, 0, "TestAOI5", 0, 256, b"\x00" * 20))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (DT_ID, 0, "DINT", 0, 256, b""))
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (PARAM_ID, TAG_COLL_ID, "Scalar", 0, 256,
+         _aoi_tag_record(10, is_param=True, data_type_oid=DT_ID)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+
+    assert aoi.parameters[0].dimensions is None
 
 
 def _make_aoi_db():

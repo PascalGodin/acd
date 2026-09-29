@@ -5528,6 +5528,79 @@ that original check).
 Covered by `test_aoi_builder_skips_hex_named_local_tag_even_when_data_type_resolves_to_garbage`
 (`test/test_elements_helpers.py`).
 
+## Twenty-second round: ST line ordering was never reliable beyond `seq` -- a real region-stub ordered list was there the whole time, undecoded
+
+A real, well-diagnosed report on the exact same class of problem this file's own "AOI Parameter/
+LocalTag ordering" round (2026-08-20-ish, see "CRITICAL: AOI parameter order was scrambled on
+export" above) already solved for a completely different object kind: `_st_routine_lines()`
+(`acd/l5x/elements/builders_routine.py`) sorted a Structured Text routine's source lines purely by
+their own `seq` field (raw offset 0x14 on each Nameless.Dat line record) — reliable for every
+routine checked until a user hand-reordered a real `CASE` statement directly in Studio 5000's own ST
+editor (`VAB_SQL.ACD`, AOI `VAB_SQL_BuildParamString`/`Logic`) and saved. `db_get_routine()`'s
+`st_lines` afterward returned all 28 real lines, none missing or duplicated, but badly scrambled:
+case 3's own body line separated from its label by 20+ other lines, cases 1 and 2 relocated to
+after `END_CASE`/`end_for` entirely.
+
+**Root cause, confirmed directly against the real project** (read-only, via a scratch
+`ExportL5x(..., _temp_dir=...)`, never touching the project's own persistent `acd.db`): the touched
+lines (case 1's header/body, case 2's header/body, case 3's now-orphaned body line) all carry `seq`
+values in a completely different, much larger range (1429-1443) than the routine's other, untouched
+lines (a tight 94-134 range) — Studio's ST editor evidently assigns freshly-touched/reordered lines
+BRAND NEW sequence numbers drawn from wherever the project's running internal counter happens to sit
+at edit time, rather than renumbering the whole routine to reflect the new display order. Sorting by
+`seq` then puts the touched lines wherever that arbitrary counter value happens to land, not where
+they actually belong.
+
+**The real, authoritative order was findable, not just detectable-as-wrong**: the "region" node that
+owns a routine's line records (documented, but previously only as a type to FILTER OUT of the line
+walk — `_st_routine_lines()`'s own tree-walk visits it, since it's an intermediate parent, but had
+never actually looked inside its record before) turns out to carry its own explicit, ordered list of
+its child line object ids: a u16 COUNT at record offset 24, followed by exactly that many
+little-endian u32 object ids, consuming the record's remaining bytes EXACTLY. Found by noticing the
+real region-stub record's own trailing byte count (`202` bytes total) matched `26 + 44*4` for the
+`count=44` value sitting at offset 24 — decoded, this list reproduces the user's own real,
+Studio-displayed line order EXACTLY (verified against their screenshot, tab-for-tab), while `seq`
+sorting does not. Cross-checked against the small, already-passing `ACDTestsNonRedundant.ACD` ST
+fixture too: that routine's own region stub carries the identical shape, and its ordered list
+reproduces the exact same order the pre-existing `seq`-sort already produced for that (never
+hand-reordered) routine — confirming this mechanism is general, not specific to the one edited case,
+and that `seq`-sorting only ever "worked" because it happens to agree with the real order for a
+routine nobody has interactively reordered since it was first written.
+
+**Fix**: `_st_routine_lines()` now detects this region-stub shape (`_st_line_order_index()`, a small,
+self-validating structural fingerprint — `len(rec) >= 26`, `count = u16@24`, `26 + count*4 ==
+len(rec)` exactly, `count > 0` to exclude a spurious empty-list match on an all-sentinel
+shadow/compiled-copy region) for every node visited during its existing breadth-first walk, and
+builds an `oid -> position` index from any list found. Final line ordering now sorts by that index
+first; a line whose own object id has no entry (no order list found anywhere for its parent — e.g.
+an unverified older shape) falls back to `seq`-sorting among itself and any other such lines, sorted
+after every order-list-backed line, preserving the exact prior behavior for that case rather than
+guessing.
+
+**Verified end-to-end against the real, reported routine**: `_st_routine_lines()`'s output (with
+`@hexid@` tag references resolved) now matches the user's own Studio 5000 screenshot line-for-line,
+including tab indentation — case 1/2/3's labels and bodies all in the correct position, `END_CASE`/
+`CONCAT(Dest,...)`/the trailing `IF`/`end_for` block all correctly following the CASE, not preceding
+parts of it. The full existing ST-routine test suite (36 tests, spanning the small fixtures'
+unedited routines) passes unchanged, confirming the fix is a no-op whenever `seq` already agrees
+with the real order — which, per the investigation above, is every case previously verified.
+
+Covered by `test_st_line_order_index_detects_region_stub_shape`,
+`test_st_line_order_index_rejects_non_matching_shapes` (including the empty-list exclusion),
+`test_st_routine_lines_uses_region_order_list_not_scrambled_seq_numbers` (the literal reported
+shape: three lines with seq values in the WRONG order, only recoverable via the region's own
+ordered list), and `test_st_routine_lines_falls_back_to_seq_when_no_order_list_present`
+(non-regression for the case no order list is found at all) — `test/test_elements_helpers.py`.
+
+**Caveat, stated plainly**: this is strong, real-project-confirmed evidence for ONE real edited
+routine (matched exactly against Studio's own displayed content) plus a general cross-check against
+the small fixtures' own unedited routines (where old and new behavior agree) — not independently
+re-confirmed against a SECOND real hand-reordered routine in a different project. If a future
+reordered-in-Studio routine's `st_lines` still looks wrong after this fix, re-investigate the
+region-stub shape rather than assume this one sample generalizes perfectly to every possible Studio
+ST-editor operation (e.g. reordering across two different region nodes in the same routine, not
+observed here — the real case had exactly one region node owning every real line).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

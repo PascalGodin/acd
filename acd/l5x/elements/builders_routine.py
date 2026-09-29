@@ -503,6 +503,30 @@ def _parse_fffeff(data: bytes, offset: int):
 # the nameless table.
 _ST_LINE_RECORD_TYPE = 0x01000002
 
+def _st_line_order_index(rec: bytes) -> Union[List[int], None]:
+    """If `rec` is a "region stub" node's own record and it carries an
+    ordered child-object-id list, return that list (in real source order);
+    otherwise None.
+
+    The shape (found by direct investigation, not documented anywhere): a
+    u16 COUNT at offset 24, immediately followed by exactly `count` u32
+    little-endian object ids that consume the record's remaining bytes
+    EXACTLY (`26 + count * 4 == len(rec)`) -- a strong, self-validating
+    fingerprint (a coincidental false match would need the record's total
+    length to happen to equal 26 plus 4 times whatever u16 happens to sit
+    at offset 24, vanishingly unlikely for an unrelated record shape).
+    `count == 0` is excluded since an all-sentinel shadow/compiled-copy
+    region's own stub record can spuriously satisfy the same arithmetic
+    with an empty list.
+    """
+    if len(rec) < 26:
+        return None
+    count = struct.unpack_from("<H", rec, 24)[0]
+    if count == 0 or 26 + count * 4 != len(rec):
+        return None
+    return [struct.unpack_from("<I", rec, 26 + i * 4)[0] for i in range(count)]
+
+
 def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
     """Extract a Structured Text routine's source lines.
 
@@ -510,31 +534,62 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
     Nameless.Dat, one record per source line. A line record carries:
 
       offset 0x04  u32  record type -- ``_ST_LINE_RECORD_TYPE``
-      offset 0x14  u32  sequence number -- source order within the routine
+      offset 0x14  u32  sequence number -- source order the line was
+                         (re)written to disk in, NOT reliably its real
+                         display position -- see below
       offset 0x18       fffeff-encoded UTF-16 line text
 
     Line records hang a few levels below the routine in the nameless
     parent tree (routine -> map -> region -> line), so walk it
-    breadth-first from the routine's object id and collect every line
-    record encountered, then sort by sequence number.
+    breadth-first from the routine's object id, collecting every line
+    record encountered.
+
+    Real display order comes from the owning "region" node's OWN record
+    (see ``_st_line_order_index()``) -- an explicit, ordered list of its
+    child line object ids -- NOT from sorting by sequence number, despite
+    that having looked like a safe, general rule (and matching real order
+    exactly) for every ST routine checked before a user's own interactive
+    edit in Studio's ST editor exposed the gap: touching/reordering lines
+    (e.g. reordering CASE branches) makes Studio assign the touched lines
+    FRESH sequence numbers from whatever the project's running internal
+    counter happens to be at that point (observed jumping from a tight
+    ~94-134 range to 1429-1443 for exactly the touched lines in one real
+    routine) rather than renumbering the whole routine to reflect the new
+    order -- sorting by sequence number then scrambles the routine outright
+    (moved/edited CASE branches relocated to the wrong position, a label
+    separated from its own body). Confirmed via a real project
+    (VAB_SQL.ACD, AOI VAB_SQL_BuildParamString/Logic) where the region
+    node's own ordered list reproduces the user's real, Studio-displayed
+    order exactly, while sequence-number sorting does not. Falls back to
+    sequence-number sorting only when no order list is found for a given
+    line's own parent (e.g. a routine whose owning region predates this
+    structure, or a shape this hasn't been verified against) -- this
+    matches every case checked so far, including the small local fixtures'
+    own unedited routines, where both orderings happen to already agree.
 
     Tag references appear as ``@hexid@`` placeholders (the referenced
     comps object id in hex); they are batch-resolved to component names,
     mirroring how rung text resolves ``&hexid:`` module references."""
-    lines: List[Tuple[int, str]] = []
+    lines: List[Tuple[int, int, str]] = []  # (parent_id, seq, text)
+    order_index: Dict[int, int] = {}  # child object_id -> position in its region's real order
     frontier: List[int] = [routine_object_id]
     for _depth in range(6):
         if not frontier:
             break
         qmarks = ",".join("?" * len(frontier))
         cur.execute(
-            f"SELECT object_id, record FROM nameless WHERE parent_id IN ({qmarks})",
+            f"SELECT object_id, parent_id, record FROM nameless WHERE parent_id IN ({qmarks})",
             frontier,
         )
         rows = cur.fetchall()
         frontier = []
-        for oid, rec in rows:
+        for oid, parent_id, rec in rows:
+            rec = bytes(rec)
             frontier.append(oid)
+            child_order = _st_line_order_index(rec)
+            if child_order is not None:
+                for pos, child_oid in enumerate(child_order):
+                    order_index[child_oid] = pos
             if len(rec) < 24:
                 continue
             if struct.unpack_from("<I", rec, 4)[0] != _ST_LINE_RECORD_TYPE:
@@ -552,11 +607,17 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
                 # routine, textually identical once these are excluded.
                 continue
             text, _ = _parse_fffeff(rec, 24)
-            lines.append((seq, text))
+            lines.append((oid, seq, text))
     if not lines:
         return []
-    lines.sort()
-    texts = [text for _seq, text in lines]
+    # Real order (via the owning region's own ordered list) whenever
+    # available; a line whose own object id has no entry (no order list
+    # found for its parent) falls back to sequence-number order among
+    # itself and any other such lines, sorted after every order-list-backed
+    # line -- see the function's own docstring for why sequence number
+    # alone is not a reliable general ordering.
+    lines.sort(key=lambda t: (0, order_index[t[0]]) if t[0] in order_index else (1, t[1], t[2]))
+    texts = [text for _oid, _seq, text in lines]
 
     # Batch-resolve @hexid@ tag references to comp names.
     all_hex = set(re.findall(r"@([0-9a-fA-F]{1,8})@", " ".join(texts)))

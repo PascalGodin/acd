@@ -1260,3 +1260,109 @@ def test_aoi_builder_decodes_execute_flags_bitmask(flags_byte, expected):
 
     aoi = AoiBuilder(cur, AOI_ID).build()
     assert (aoi.execute_prescan, aoi.execute_postscan, aoi.execute_enable_in_false) == expected
+
+
+def _st_line_record(seq: int, text: str) -> bytes:
+    """Build a synthetic Structured Text source-line record: a 24-byte
+    header (bytes[4:8] = _ST_LINE_RECORD_TYPE, bytes[20:24] = seq) followed
+    by an fffeff-encoded UTF-16 line (the short, <=254-char form)."""
+    header = bytearray(24)
+    struct.pack_into("<I", header, 4, 0x01000002)
+    struct.pack_into("<I", header, 20, seq)
+    encoded_text = text.encode("utf-16-le")
+    body = b"\xff\xfe\xff" + bytes([len(text)]) + encoded_text
+    return bytes(header) + body
+
+
+def _st_region_stub_record(child_object_ids) -> bytes:
+    """Build a synthetic "region stub" record carrying the real, ordered
+    child-line-object-id list (see `_st_line_order_index()`): a 24-byte
+    header (record type deliberately NOT `_ST_LINE_RECORD_TYPE`, so it's
+    never mistaken for a line record), a u16 count at offset 24, then that
+    many little-endian u32 object ids."""
+    header = bytearray(24)
+    struct.pack_into("<I", header, 4, 2)  # any value != _ST_LINE_RECORD_TYPE
+    count_and_list = struct.pack("<H", len(child_object_ids))
+    for oid in child_object_ids:
+        count_and_list += struct.pack("<I", oid)
+    return bytes(header) + count_and_list
+
+
+def test_st_line_order_index_detects_region_stub_shape():
+    from acd.l5x.elements.builders_routine import _st_line_order_index
+
+    rec = _st_region_stub_record([111, 222, 333])
+    assert _st_line_order_index(rec) == [111, 222, 333]
+
+
+def test_st_line_order_index_rejects_non_matching_shapes():
+    from acd.l5x.elements.builders_routine import _st_line_order_index
+
+    # A real line record must never be misdetected as an order-list record.
+    assert _st_line_order_index(_st_line_record(5, "XIC(A)OTE(B);")) is None
+    # Too short to even hold the count field.
+    assert _st_line_order_index(b"\x00" * 10) is None
+    # An empty list (count=0) -- excluded deliberately, see the function's
+    # own docstring (an all-sentinel shadow region can spuriously satisfy
+    # the length arithmetic with zero entries).
+    assert _st_line_order_index(_st_region_stub_record([])) is None
+
+
+def test_st_routine_lines_uses_region_order_list_not_scrambled_seq_numbers():
+    # Regression test for a real, well-diagnosed report: after a user
+    # hand-reordered a CASE statement directly in Studio 5000's ST editor,
+    # Studio assigned the touched lines fresh, much-larger sequence numbers
+    # (observed jumping from a tight ~94-134 range to 1429-1443 in the real
+    # project) rather than renumbering the whole routine -- sorting by
+    # sequence number alone (the old behavior) then scrambled the routine's
+    # real order outright. The owning region's OWN record carries the real,
+    # authoritative order as an explicit child-object-id list; this must be
+    # used in preference to sequence-number sorting whenever it's present.
+    #
+    # Three lines, deliberately inserted with seq numbers in the WRONG
+    # (reverse) order relative to their real, intended position -- only the
+    # region stub's own ordered list says the real order is A, B, C.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE nameless(object_id int, parent_id int, record BLOB NOT NULL)"
+    )
+    cur = db.cursor()
+
+    ROUTINE_ID, REGION_ID = 1, 2
+    LINE_A, LINE_B, LINE_C = 10, 11, 12
+
+    cur.execute(
+        "INSERT INTO nameless VALUES (?,?,?)",
+        (REGION_ID, ROUTINE_ID, _st_region_stub_record([LINE_A, LINE_B, LINE_C])),
+    )
+    # Real order: A, B, C -- but seq numbers say C, B, A (as if C and A were
+    # the ones freshly touched/reordered by an interactive Studio edit).
+    cur.execute("INSERT INTO nameless VALUES (?,?,?)", (LINE_A, REGION_ID, _st_line_record(9000, "A;")))
+    cur.execute("INSERT INTO nameless VALUES (?,?,?)", (LINE_B, REGION_ID, _st_line_record(50, "B;")))
+    cur.execute("INSERT INTO nameless VALUES (?,?,?)", (LINE_C, REGION_ID, _st_line_record(9001, "C;")))
+    db.commit()
+
+    from acd.l5x.elements.builders_routine import _st_routine_lines
+
+    assert _st_routine_lines(cur, ROUTINE_ID) == ["A;", "B;", "C;"]
+
+
+def test_st_routine_lines_falls_back_to_seq_when_no_order_list_present():
+    # Non-regression: a routine whose lines hang directly off a parent with
+    # NO region-stub order-list record at all (e.g. an older/unverified
+    # shape) must still work via the original sequence-number sort, not
+    # silently return nothing or the wrong order.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE nameless(object_id int, parent_id int, record BLOB NOT NULL)"
+    )
+    cur = db.cursor()
+
+    ROUTINE_ID = 1
+    cur.execute("INSERT INTO nameless VALUES (?,?,?)", (10, ROUTINE_ID, _st_line_record(2, "second;")))
+    cur.execute("INSERT INTO nameless VALUES (?,?,?)", (11, ROUTINE_ID, _st_line_record(1, "first;")))
+    db.commit()
+
+    from acd.l5x.elements.builders_routine import _st_routine_lines
+
+    assert _st_routine_lines(cur, ROUTINE_ID) == ["first;", "second;"]

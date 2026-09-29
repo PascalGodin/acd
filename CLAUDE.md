@@ -5488,6 +5488,46 @@ unaffected case) — `test/test_elements_helpers.py`, using a `dim1`/`dim2`/`dim
 `_aoi_tag_record()` synthetic-record helper (the same one the nineteenth round's ordering tests
 already use).
 
+## Twenty-first round: a `$hex$`-named AOI local tag whose DataType OID resolves to GARBAGE (not nothing) still slipped past the round-16 junk filter
+
+Direct follow-up to the sixteenth round's "spurious clone/rename bookkeeping" fix, on the exact same
+real AOI class of problem but a case that fix didn't fully cover. Real repro: after the user deleted
+two members from `VAB_SQL_Value` (a UDT) and a couple of unused local tags directly from
+`VAB_SQL_ParseResponseColumns`' own Local Tags grid in real Studio 5000, a fresh `db_get_aoi()`/
+`db_export_aoi()` against the resulting project both broke completely — `db_get_aoi()`'s own
+`local_tags` list contained a child literally named `'$ff73badc$'` whose `data_type` decoded to a
+single stray Unicode combining-accent character (not a real type name, not resolvable to anything),
+and `db_export_aoi()`'s own `_validate_type_graph_resolves()` correctly refused to export it rather
+than silently render a bare zero — but nothing skipped it either, so both read paths were completely
+blocked for this AOI, with no workaround (even `repr()`-printing the raw local_tags list to inspect
+it threw a second, unrelated `UnicodeEncodeError` on Windows' cp1252 console).
+
+**Why the round-16 fix (`if not parameter.data_type`/`if not local_tag.data_type`) didn't catch
+this**: that fix only catches a DataType OID pointer that DANGLES — `_aoi_tag_data_type()` returns
+`""` when the OID resolves to no comps row at all. This new case's OID does NOT dangle — it resolves
+to a DIFFERENT, unrelated garbage/tombstone comps row (whose own `comp_name` happens to be a single
+stray combining-accent character), so `_aoi_tag_data_type()` returns a non-empty (garbage) string,
+and the blank-string check never fires.
+
+**Fix**: both filters in `AoiBuilder.build()` now ALSO skip any child whose own name matches the
+`$hex$` prefix/suffix pattern already established elsewhere in this codebase as the Rockwell-
+internal-placeholder-name convention (`builders_module.py`'s own hex-named-connection skip, a
+Module's own unnamed `comp_name` — see "Connection Type / RPI" above) — unconditionally,
+independent of whether its DataType OID happens to dangle or happens to resolve to more garbage. The
+local tag reported here (`$ff73badc$`) is itself named exactly this pattern, matching every other
+`$hex$`-placeholder object already documented in this codebase; this is the same class of
+Rockwell-internal tombstone bookkeeping, just a second, previously-uncovered shape of it.
+
+**Verified**: a synthetic reproduction (a child named `$ff73badc$` whose DataType OID resolves to a
+real comps row named `"̀"`, the exact garbage shape reported) is now skipped with no crash and
+no export-time `ValueError`; every pre-existing round-16 test (dangling-OID junk, colliding-name
+junk) continues to pass unchanged, confirming this is additive, not a replacement for the existing
+blank-`data_type` check (a future case with a NON-`$hex$`-named dangling pointer would still need
+that original check).
+
+Covered by `test_aoi_builder_skips_hex_named_local_tag_even_when_data_type_resolves_to_garbage`
+(`test/test_elements_helpers.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

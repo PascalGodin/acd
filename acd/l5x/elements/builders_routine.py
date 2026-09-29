@@ -844,6 +844,31 @@ class AoiBuilder(L5xElementBuilder):
                     # (to_controller(), export_aoi(), this SQL
                     # materialization, ...) is protected uniformly. See
                     # CLAUDE.md for the full investigation.
+                    # A `$hex$`-named child (e.g. "$ff73badc$") is the same
+                    # Rockwell-internal placeholder-name convention already
+                    # used elsewhere in this codebase (a Module's own unnamed
+                    # comp_name, a cached-MSG connection -- see
+                    # builders_module.py) -- skipped unconditionally, even
+                    # when its own DataType OID pointer happens to resolve
+                    # to SOME comps row. Found via a real, well-diagnosed
+                    # follow-up report: after the user deleted local tags
+                    # directly in Studio's AOI editor, one leftover tombstone
+                    # child (name "$ff73badc$") had a DataType OID that,
+                    # unlike the round-16 case above, did NOT dangle -- it
+                    # resolved to a DIFFERENT garbage/tombstone comps row
+                    # whose own comp_name is a single stray Unicode
+                    # combining-accent character, not a real type name at
+                    # all -- so the `not parameter.data_type`/
+                    # `not local_tag.data_type` check alone (blank string)
+                    # never caught it, and _validate_*_resolve() correctly
+                    # refused to render it, blocking export entirely.
+                    if parameter.name.startswith("$") and parameter.name.endswith("$"):
+                        log.info(
+                            f"AOI {name!r}: skipping spurious parameter-shaped child "
+                            f"{parameter.name!r} (object_id={child_oid}) -- hex-placeholder "
+                            "name, Rockwell-internal bookkeeping, not a real parameter"
+                        )
+                        continue
                     if not parameter.data_type:
                         log.info(
                             f"AOI {name!r}: skipping spurious parameter-shaped child "
@@ -856,6 +881,13 @@ class AoiBuilder(L5xElementBuilder):
                     try:
                         local_tag = LocalTagBuilder(self._cur, child_oid).build()
                     except Exception:
+                        continue
+                    if local_tag.name.startswith("$") and local_tag.name.endswith("$"):
+                        log.info(
+                            f"AOI {name!r}: skipping spurious local-tag-shaped child "
+                            f"{local_tag.name!r} (object_id={child_oid}) -- hex-placeholder "
+                            "name, Rockwell-internal bookkeeping, not a real local tag"
+                        )
                         continue
                     if not local_tag.data_type:
                         log.info(

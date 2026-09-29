@@ -1161,6 +1161,41 @@ def test_aoi_builder_skips_colliding_named_junk_children_without_crashing():
     assert aoi.local_tags == []
 
 
+def test_aoi_builder_skips_hex_named_local_tag_even_when_data_type_resolves_to_garbage():
+    # Follow-up report, same failure shape as the two tests above but a real
+    # data_type OID that does NOT dangle: after the user deleted local tags
+    # directly in Studio's AOI editor, a leftover tombstone child named
+    # "$ff73badc$" had its own DataType OID pointer resolve to a DIFFERENT
+    # garbage/tombstone comps row (comp_name a single stray Unicode
+    # combining-accent character) rather than to nothing at all -- so
+    # `not local_tag.data_type` (blank-string check) never caught it, and
+    # _validate_type_graph_resolves() correctly refused to export a member
+    # whose type doesn't resolve to anything real, blocking db_get_aoi()/
+    # db_export_aoi() entirely for this AOI. Fixed by also skipping any
+    # child whose own name matches the same "$hex$" Rockwell-internal
+    # placeholder convention already used elsewhere in this codebase
+    # (builders_module.py), unconditionally -- regardless of whether its
+    # DataType OID happens to dangle or happens to resolve to more garbage.
+    db = _make_aoi_db()
+    cur = db.cursor()
+    AOI_ID, TAG_COLL_ID, GARBAGE_TYPE_ID, JUNK_ID = 1600, 1601, 1602, 1603
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (AOI_ID, 0, "TestAOI6", 0, 256, b"\x00" * 20))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""))
+    # The garbage-named comps row the dangling-looking OID actually resolves
+    # to -- a single stray Unicode combining-accent character, not blank and
+    # not a real type name either.
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (GARBAGE_TYPE_ID, 0, "̀", 0, 256, b""))
+    cur.execute(
+        "INSERT INTO comps VALUES (?,?,?,?,?,?)",
+        (JUNK_ID, TAG_COLL_ID, "$ff73badc$", 0, 256,
+         _aoi_tag_record(10, is_param=False, data_type_oid=GARBAGE_TYPE_ID)),
+    )
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+    assert aoi.local_tags == []
+
+
 def _build_aoi_record(flags_byte: int) -> bytes:
     """Build a synthetic top-level AOI comps record with a given
     ExecutePrescan/ExecutePostscan/ExecuteEnableInFalse bitmask byte at

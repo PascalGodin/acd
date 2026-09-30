@@ -2254,6 +2254,140 @@ def test_db_new_aoi_local_tag_stateless_wrapper_and_export(acd_copy, tmp_path):
     assert 'Name="Scratch1"' in content
 
 
+def test_edit_aoi_local_tag_updates_only_passed_fields(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_EALT_AOI")
+        db.new_aoi_local_tag("PDB_EALT_AOI", "Scratch1", "DINT", description="original")
+
+        db.edit_aoi_local_tag("PDB_EALT_AOI", "Scratch1", description="updated")
+
+        aoi = db.get_aoi("PDB_EALT_AOI")
+        lt = next(t for t in aoi["local_tags"] if t["name"] == "Scratch1")
+        assert lt["description"] == "updated"
+        assert lt["data_type"] == "DINT"  # untouched
+    finally:
+        db.close()
+
+
+def test_edit_aoi_local_tag_re_derives_radix_on_data_type_change(acd_copy):
+    # Regression test mirroring edit_aoi_parameter()'s own analogous check:
+    # editing data_type without also passing radix must re-derive the NEW
+    # type's own correct radix, not leave a stale one from the old type
+    # (e.g. a real SINT->USINT retype, the literal motivating report).
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_EALT_AOI2")
+        db.new_aoi_local_tag("PDB_EALT_AOI2", "Flags", "SINT")
+        before = db.get_aoi("PDB_EALT_AOI2")
+        before_radix = next(t for t in before["local_tags"] if t["name"] == "Flags")["radix"]
+
+        db.edit_aoi_local_tag("PDB_EALT_AOI2", "Flags", data_type="REAL")
+
+        aoi = db.get_aoi("PDB_EALT_AOI2")
+        lt = next(t for t in aoi["local_tags"] if t["name"] == "Flags")
+        assert lt["data_type"] == "REAL"
+        assert lt["radix"] != before_radix
+        assert lt["radix"] == "Float"
+    finally:
+        db.close()
+
+
+def test_edit_aoi_local_tag_multi_dimensional_survives_unrelated_edit(acd_copy):
+    # Same "cur_dims passed straight through, not int()-converted" fix as
+    # edit_aoi_parameter()'s own equivalent test -- editing an unrelated
+    # field on a local tag with an already-stored multi-dim value must not
+    # crash and must leave the dimension untouched.
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_EALT_AOI3")
+        db.new_aoi_local_tag("PDB_EALT_AOI3", "Matrix", "DINT", dimension="10,20")
+
+        db.edit_aoi_local_tag("PDB_EALT_AOI3", "Matrix", description="a 2D table")
+
+        aoi = db.get_aoi("PDB_EALT_AOI3")
+        lt = next(t for t in aoi["local_tags"] if t["name"] == "Matrix")
+        assert lt["dimensions"] == "10,20"
+        assert lt["description"] == "a 2D table"
+    finally:
+        db.close()
+
+
+def test_edit_aoi_local_tag_missing_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_EALT_AOI4")
+        with pytest.raises(KeyError):
+            db.edit_aoi_local_tag("PDB_EALT_AOI4", "NoSuchLocalTag", description="x")
+    finally:
+        db.close()
+
+
+def test_edit_aoi_local_tag_on_real_pre_existing_aoi(aoi_acd_copy):
+    # Works against a real, already-imported project AOI's own local tag
+    # exactly the same as a db_new_aoi_local_tag()-created one -- the
+    # literal motivating report's use case (retyping a local tag on a real
+    # AOI already in production use).
+    reference = load_acd(str(aoi_acd_copy), verbose=False)
+    real_aoi_name = reference.controller.aois[0].name
+
+    db = open_project_db(str(aoi_acd_copy), verbose=False)
+    try:
+        db.edit_aoi_local_tag(real_aoi_name, "AOIDINTLocalTag", description="retyped")
+
+        aoi = db.get_aoi(real_aoi_name)
+        lt = next(t for t in aoi["local_tags"] if t["name"] == "AOIDINTLocalTag")
+        assert lt["description"] == "retyped"
+        assert lt["data_type"] == "DINT"  # untouched
+    finally:
+        db.close()
+
+
+def test_delete_aoi_local_tag_removes_it(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_DALT_AOI")
+        db.new_aoi_local_tag("PDB_DALT_AOI", "Scratch1", "DINT")
+        db.new_aoi_local_tag("PDB_DALT_AOI", "Scratch2", "DINT")
+
+        db.delete_aoi_local_tag("PDB_DALT_AOI", "Scratch1")
+
+        aoi = db.get_aoi("PDB_DALT_AOI")
+        assert [t["name"] for t in aoi["local_tags"]] == ["Scratch2"]
+    finally:
+        db.close()
+
+
+def test_delete_aoi_local_tag_missing_raises_key_error(acd_copy):
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        db.new_aoi("PDB_DALT_AOI2")
+        with pytest.raises(KeyError):
+            db.delete_aoi_local_tag("PDB_DALT_AOI2", "NoSuchLocalTag")
+    finally:
+        db.close()
+
+
+def test_db_edit_aoi_local_tag_and_delete_aoi_local_tag_stateless_wrappers(acd_copy):
+    from acd import db_delete_aoi_local_tag, db_edit_aoi_local_tag
+
+    db_new_aoi(str(acd_copy), "PDB_EALT_WRAP_AOI")
+    db_new_aoi_local_tag(str(acd_copy), "PDB_EALT_WRAP_AOI", "Scratch1", "DINT",
+                          description="original")
+    db_new_aoi_local_tag(str(acd_copy), "PDB_EALT_WRAP_AOI", "Scratch2", "DINT")
+
+    db_edit_aoi_local_tag(str(acd_copy), "PDB_EALT_WRAP_AOI", "Scratch1", description="edited")
+    db_delete_aoi_local_tag(str(acd_copy), "PDB_EALT_WRAP_AOI", "Scratch2")
+
+    db = open_project_db(str(acd_copy), verbose=False)
+    try:
+        aoi = db.get_aoi("PDB_EALT_WRAP_AOI")
+        assert [t["name"] for t in aoi["local_tags"]] == ["Scratch1"]
+        assert aoi["local_tags"][0]["description"] == "edited"
+    finally:
+        db.close()
+
+
 def test_export_program_stateless_wrapper_includes_every_routine(acd_copy, tmp_path):
     output_path = tmp_path / "branching.L5X"
     db_export_program(str(acd_copy), "Branching", str(output_path))

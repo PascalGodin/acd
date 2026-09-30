@@ -1946,6 +1946,79 @@ class ProjectDB:
         if not self._in_transaction:
             self._conn.commit()
 
+    def edit_aoi_local_tag(self, aoi_name: str, name: str,
+                            data_type: Union[str, None] = None,
+                            dimension: Union[int, str, None] = None,
+                            description: Union[str, None] = None) -> None:
+        """Update an existing AOI local tag's fields in place -- only the
+        fields actually passed (non-`None`) are changed, same "only what
+        you pass" convention as `edit_tag()`/`edit_aoi_parameter()`. Added
+        after a real report: an iterative AOI design pass needing to
+        retype a local tag (e.g. `SINT` -> `USINT` to fix a signedness bug
+        reading raw unsigned wire bytes) had no fix short of creating a new
+        tag under a new name and abandoning the old one -- the exact same
+        "added with the wrong shape" gap `edit_aoi_parameter()` already
+        closed for Parameters, now closed for LocalTags too.
+
+        Re-runs `new_aoi_local_tag()`'s own default-derivation logic (radix
+        from `data_type`) against the MERGED (existing + overridden) field
+        set, so e.g. editing `data_type` from `SINT` to `USINT` re-derives
+        the correct radix rather than leaving a stale one from the old
+        type behind. A LocalTag has none of a Parameter's `Usage`/
+        `Required`/`Visible`/array-on-elementary-type-only constraints (see
+        `new_aoi_local_tag()`'s own docstring), so there's nothing else to
+        re-validate here.
+
+        `dimension` accepts a plain `int` (single dimension) or a comma-
+        separated `str` (e.g. `"25,30"`) for a genuine multi-dimensional
+        array, same convention as `new_aoi_local_tag()`.
+
+        CAVEAT, same shape as `edit_tag()`/`edit_aoi_parameter()`'s own
+        documented one: `dimension=None` means "leave the current
+        dimension unchanged," NOT "clear it back to scalar" -- delete and
+        recreate the local tag instead if you genuinely need that.
+
+        Works identically against a real, pre-existing project AOI's own
+        local tag or one created via `new_aoi_local_tag()`/
+        `db_new_aoi_local_tag()` -- `proj_aoi_local_tags` is the single
+        source of truth for every AOI's own local tags after full
+        materialization (see "Twelfth round" in CLAUDE.md).
+
+        Raises `KeyError` if `aoi_name`/`name` doesn't resolve to an
+        existing AOI local tag.
+        """
+        aoi_id = self._aoi_id(aoi_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id, data_type_name, dimensions, description FROM proj_aoi_local_tags "
+            "WHERE aoi_id=? AND name=? COLLATE NOCASE",
+            (aoi_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No local tag named {name!r} on AOI {aoi_name!r}")
+        (local_tag_id, cur_dtype, cur_dims, cur_description) = row
+
+        effective_dtype = data_type if data_type is not None else cur_dtype
+        # cur_dims is already in new_aoi_local_tag()'s own accepted string
+        # form -- passed straight through rather than int()-converted, same
+        # reasoning as edit_aoi_parameter()'s own identical handling.
+        effective_dimension = dimension if dimension is not None else cur_dims
+        effective_description = description if description is not None else cur_description
+
+        local_tag = _new_aoi_local_tag(
+            name, effective_dtype, dimension=effective_dimension,
+            description=effective_description,
+        )
+        cur.execute(
+            "UPDATE proj_aoi_local_tags SET data_type_name=?, dimensions=?, radix=?, "
+            "description=? WHERE id=?",
+            (local_tag.data_type, local_tag.dimensions, local_tag.radix,
+             local_tag._description, local_tag_id),
+        )
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
     def new_routine(self, routine_name: str, routine_type: str,
                      program_name: Union[str, None] = None,
                      description: Union[str, None] = None,
@@ -2409,6 +2482,36 @@ class ProjectDB:
         if row is None:
             raise KeyError(f"No parameter named {name!r} on AOI {aoi_name!r}")
         cur.execute("DELETE FROM proj_aoi_parameters WHERE id=?", (row[0],))
+        cur.execute("UPDATE proj_meta SET dirty=1")
+        if not self._in_transaction:
+            self._conn.commit()
+
+    def delete_aoi_local_tag(self, aoi_name: str, name: str) -> None:
+        """Remove a local tag from an AOI (a real project AOI or one
+        created via `new_aoi()`/`db_new_aoi()`, uniformly -- same real-
+        `.ACD` caveat as `delete_tag()`/`delete_aoi_parameter()`: this only
+        cleans up this project DB's own bookkeeping, not a real Studio
+        project -- there's no "un-import" for a local tag Studio has
+        already accepted, a manual delete in Studio's own Local Tags grid
+        is still the only way to remove it from a project that's already
+        been imported). Pairs with `edit_aoi_local_tag()` above for the
+        same "iterative design leaves abandoned local tags behind, no way
+        to clean them up" gap real-usage feedback flagged -- a local tag
+        that's been superseded by a retype/rename can now be deleted
+        outright instead of accumulating as permanent dead-tag clutter.
+
+        Raises `KeyError` if `aoi_name`/`name` doesn't resolve to an
+        existing AOI local tag.
+        """
+        aoi_id = self._aoi_id(aoi_name)
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM proj_aoi_local_tags WHERE aoi_id=? AND name=? COLLATE NOCASE",
+            (aoi_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No local tag named {name!r} on AOI {aoi_name!r}")
+        cur.execute("DELETE FROM proj_aoi_local_tags WHERE id=?", (row[0],))
         cur.execute("UPDATE proj_meta SET dirty=1")
         if not self._in_transaction:
             self._conn.commit()
@@ -3224,6 +3327,23 @@ def db_new_aoi_local_tag(acd_path, aoi_name: str, name: str, data_type: str,
     return _run(acd_path, project_dir, verbose, lambda db: db.new_aoi_local_tag(
         aoi_name, name, data_type, dimension=dimension, description=description, index=index,
     ))
+
+
+def db_edit_aoi_local_tag(acd_path, aoi_name: str, name: str,
+                           data_type: Union[str, None] = None,
+                           dimension: Union[int, str, None] = None,
+                           description: Union[str, None] = None,
+                           project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.edit_aoi_local_tag()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.edit_aoi_local_tag(
+        aoi_name, name, data_type=data_type, dimension=dimension, description=description,
+    ))
+
+
+def db_delete_aoi_local_tag(acd_path, aoi_name: str, name: str,
+                             project_dir=None, verbose: bool = False) -> None:
+    """Stateless equivalent of `ProjectDB.delete_aoi_local_tag()` -- see its docstring."""
+    _run(acd_path, project_dir, verbose, lambda db: db.delete_aoi_local_tag(aoi_name, name))
 
 
 def db_new_routine(acd_path, routine_name: str, routine_type: str,

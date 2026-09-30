@@ -307,6 +307,23 @@ EDITS -- durable the moment the call returns (see above), each raising
     LocalTag is never a public pin. `dimension` accepts the same plain
     `int`-or-comma-separated-`str` (e.g. `"25,30"`) multi-dimensional form
     as `db_new_aoi_parameter()` above.
+  - `db_edit_aoi_local_tag(acd_path, aoi_name, name, data_type=None,
+    dimension=None, description=None)` -- update an existing AOI local
+    tag's fields in place; only the fields actually passed (non-`None`)
+    are changed, same "only what you pass" convention as
+    `db_edit_aoi_parameter()`. Re-derives radix from `data_type` on the
+    MERGED field set (e.g. editing `data_type` from `SINT` to `USINT`
+    re-derives the correct radix rather than leaving a stale one behind).
+    Works against a real, pre-existing project AOI's own local tag exactly
+    the same as a `db_new_aoi_local_tag()`-created one. CAVEAT:
+    `dimension=None` means "leave unchanged," not "clear back to scalar."
+  - `db_delete_aoi_local_tag(acd_path, aoi_name, name)` -- remove a local
+    tag from an AOI (real or `db_new_aoi()`-created, uniformly). Same
+    real-`.ACD` caveat as `db_delete_aoi_parameter()` above (bookkeeping
+    cleanup only) -- pairs with `db_edit_aoi_local_tag()` for the "an
+    iterative design pass (e.g. retyping a local tag SINT -> USINT) leaves
+    the old, abandoned tag behind with no way to clean it up" gap real
+    downstream usage flagged.
   - `db_new_routine(acd_path, routine_name, routine_type,
     program_name=None, description=None, aoi_name=None)` -- create a new,
     empty routine (`routine_type` `"RLL"` or `"ST"`) in an EXISTING program
@@ -554,6 +571,8 @@ from acd.l5x.project_db import (  # noqa: F401
     db_edit_aoi_parameter,
     db_delete_aoi_parameter,
     db_new_aoi_local_tag,
+    db_edit_aoi_local_tag,
+    db_delete_aoi_local_tag,
     db_new_routine,
     db_insert_rung,
     db_delete_rung,

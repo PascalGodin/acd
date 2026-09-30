@@ -5601,6 +5601,49 @@ region-stub shape rather than assume this one sample generalizes perfectly to ev
 ST-editor operation (e.g. reordering across two different region nodes in the same routine, not
 observed here — the real case had exactly one region node owning every real line).
 
+## Twenty-third round: `db_edit_aoi_local_tag()`/`db_delete_aoi_local_tag()` -- the same edit/delete gap `db_edit_aoi_parameter()`/`db_delete_aoi_parameter()` already closed for Parameters, now closed for LocalTags
+
+A real, well-scoped feature request (not a bug): `db_new_aoi_local_tag()` existed, but there was no
+`db_edit_aoi_local_tag()`/`db_delete_aoi_local_tag()` -- unlike AOI Parameters, which already got
+both in the fifth round (see "Fifth round: AOI parameter edit/delete" above). Concrete pain point:
+an iterative AOI design pass that needs to retype a local tag (e.g. `SINT` -> `USINT` to correctly
+handle raw unsigned wire bytes, or fix an earlier signedness bug) had no way to fix the original in
+place -- the only option was creating a brand-new tag under a new name and abandoning the old one,
+which a real project (`VAB_SQL_ParseResponseColumns`) had already done a dozen-plus times, leaving a
+pile of dead/unreferenced local tags with no cleanup path short of a manual delete in Studio's own
+Local Tags grid.
+
+Added `ProjectDB.edit_aoi_local_tag()`/`db_edit_aoi_local_tag()` and
+`ProjectDB.delete_aoi_local_tag()`/`db_delete_aoi_local_tag()` (`acd/l5x/project_db.py`), mirroring
+`edit_aoi_parameter()`/`delete_aoi_parameter()`'s own shape exactly:
+- `edit_aoi_local_tag()` updates only the fields actually passed (non-`None`), same "only what you
+  pass" convention as every other `edit_*` method in this subsystem. Unlike `edit_aoi_parameter()`,
+  there's no `Usage`/`Required`/`Visible`/array-on-elementary-type-only constraint to re-validate
+  (`LocalTag` has none of those -- see `new_aoi_local_tag()`'s own docstring) -- the only thing worth
+  re-deriving on a merged edit is `radix` from `data_type`, so a `SINT`->`USINT`/`SINT`->`REAL`-style
+  retype doesn't leave a stale radix from the old type behind. Same `dimension=None`-means-
+  "unchanged" caveat as every other multi-dim-aware edit method in this file.
+- `delete_aoi_local_tag()` is a straightforward `DELETE FROM proj_aoi_local_tags`, same real-`.ACD`
+  caveat as `delete_tag()`/`delete_aoi_parameter()` (bookkeeping cleanup only -- no "un-import" of a
+  local tag Studio has already accepted; a manual Studio delete is still needed to actually remove it
+  from an already-imported project, this only stops it from permanently cluttering this project DB's
+  own bookkeeping/every future `db_get_aoi()`/`db_export_aoi()` call).
+
+Both work identically against a real, pre-existing project AOI's own local tag or one created via
+`new_aoi_local_tag()`/`db_new_aoi_local_tag()` -- `proj_aoi_local_tags` has been the single source of
+truth for every AOI's own local tags (real or new) since full materialization landed (see "Twelfth
+round" above), so there was no v1-scope split to reconcile the way earlier AOI features needed.
+
+Covered by `test_edit_aoi_local_tag_updates_only_passed_fields`,
+`test_edit_aoi_local_tag_re_derives_radix_on_data_type_change` (the literal motivating
+`SINT`->`REAL`-style retype shape), `test_edit_aoi_local_tag_multi_dimensional_survives_unrelated_edit`,
+`test_edit_aoi_local_tag_missing_raises_key_error`,
+`test_edit_aoi_local_tag_on_real_pre_existing_aoi` (against the real `AddOnInstruction` AOI in
+`ACDTestsWithAOI.ACD`), `test_delete_aoi_local_tag_removes_it`,
+`test_delete_aoi_local_tag_missing_raises_key_error`, and
+`test_db_edit_aoi_local_tag_and_delete_aoi_local_tag_stateless_wrappers`
+(`test/test_project_db.py`).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

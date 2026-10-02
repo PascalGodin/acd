@@ -344,6 +344,62 @@ def test_decode_single_udt_element_still_truncates_beyond_max_depth():
     assert result == {"b": {"c": {"d": {"e": {}}}}}
 
 
+def test_decode_single_udt_element_unsigned_integer_members_not_empty_dict():
+    # Regression test for a real, severe report: USINT/UINT/UDINT/ULINT were
+    # entirely missing from _PRIM (types.py) -- _decode_scalar_member() fell
+    # through to data_types_map.get("USINT"), which resolves to a REAL but
+    # EMPTY (cls="ProductDefined", zero members) DataType ControllerBuilder
+    # seeds for every RxDataTypeCollection entry including Rockwell's own
+    # placeholder records for primitive type names -- so a USINT member
+    # silently decoded to {} (an empty dict, from looping over zero members)
+    # instead of a real int. Downstream, _udt_scalar_to_xml() then treated
+    # the empty dict as a nested UDT, got nothing back, and silently dropped
+    # the member from Decorated output entirely -- confirmed against a real
+    # AOI instance (VAB_SQL_ParseTDSResponse_Inst/LastErrorClass+LastErrorState,
+    # both USINT) where this caused Studio 5000 to reject the exported L5X
+    # ("Data type mismatch") since the L5K and Decorated blocks for the same
+    # tag disagreed. Fixed by adding all four unsigned types to _PRIM with
+    # the same raw byte format/size as their BYTE/WORD/DWORD/LWORD siblings.
+    outer_dt = DataType(
+        "Outer", "Outer", "NoFamily", "User",
+        [
+            _member("A", "USINT", byte_offset=0),
+            _member("B", "UINT", byte_offset=1),
+            _member("C", "UDINT", byte_offset=4),
+            _member("D", "ULINT", byte_offset=8),
+        ],
+    )
+    data_types_map = {"OUTER": outer_dt}
+    blob = bytearray(16)
+    struct.pack_into("<B", blob, 0, 200)        # A: USINT, > 127 -- would be negative if misread as signed SINT
+    struct.pack_into("<H", blob, 1, 50000)      # B: UINT, > 32767 -- would be negative if misread as signed INT
+    struct.pack_into("<I", blob, 4, 3000000000)  # C: UDINT, > 2^31 -- would be negative if misread as signed DINT
+    struct.pack_into("<Q", blob, 8, 10000000000000000000)  # D: ULINT, > 2^63
+    blob = bytes(blob)
+
+    result = _decode_single_udt_element(blob, 0, outer_dt, data_types_map, 0)
+
+    assert result == {"A": 200, "B": 50000, "C": 3000000000, "D": 10000000000000000000}
+
+
+def test_get_type_size_unsigned_integer_types():
+    assert _get_type_size("USINT", {}) == 1
+    assert _get_type_size("UINT", {}) == 2
+    assert _get_type_size("UDINT", {}) == 4
+    assert _get_type_size("ULINT", {}) == 8
+
+
+def test_udt_scalar_to_xml_renders_unsigned_integer_member():
+    outer_dt = DataType(
+        "Outer", "Outer", "NoFamily", "User", [_member("LastErrorClass", "USINT")],
+    )
+    data_types_map = {"OUTER": outer_dt}
+
+    xml = _udt_scalar_to_xml("OUTER", {"LastErrorClass": 5}, data_types_map)
+
+    assert '<DataValueMember Name="LastErrorClass" DataType="USINT" Radix="Decimal" Value="5"/>' == xml
+
+
 def test_zero_value_for_member_scalar_primitive():
     assert _zero_value_for_member(_member("Max_Qty", "DINT"), {}) == 0
     assert _zero_value_for_member(_member("Ratio", "REAL"), {}) == 0.0

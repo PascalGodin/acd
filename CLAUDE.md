@@ -5871,6 +5871,66 @@ half) in `test/test_api.py`; and
 real fixture routine (`Branching/B002_Timers`) and a `db_new_routine()`-created one as JSR targets of
 a third, freshly-created target routine.
 
+## `_PRIM` was missing USINT/UINT/UDINT/ULINT entirely — not actually the "unsolved AOI instance value" gap, a narrow, now-fixed decode bug
+
+A real downstream report, initially (wrongly) diagnosed as a re-surfacing of the long-standing,
+deliberately-parked "AOI instance value decoding is measurably wrong" gap documented earlier in this
+file (the `AOI_RPMtoFPM`/`TestFPM` investigation): exporting a routine referencing a real AOI instance
+tag (`VAB_SQL_ParseTDSResponse_Inst`) produced an L5X Studio 5000 rejected with "Data type mismatch" —
+the `<Data Format="Decorated">` block only showed 10 of the AOI's real members (`EnableIn`/`EnableOut`
++ every `Output`-usage parameter), completely missing all local-tag-backed members, while the sibling
+`<Data Format="L5K">` block was clearly much larger.
+
+**Retraction of the initial diagnosis, once real Studio ground truth arrived**: the user supplied a
+real Studio 5000 "Export Tag" L5X for this exact tag. Direct comparison found the REAL Decorated
+block ALSO only shows those exact same 12 members (10 + `LastErrorClass`/`LastErrorState`, both
+`USINT`) — i.e. the "Decorated shows fewer members than L5K" SHAPE is correct and expected (matching
+what the older `TestFPM` investigation already established as normal Rockwell behavior, not a bug) —
+but our own output was missing `LastErrorClass`/`LastErrorState` specifically, which the real export
+DOES include. This is a different, narrower, independently real bug, not the old parked gap.
+
+**Root cause, confirmed precisely**: `_PRIM` (`acd/l5x/elements/types.py`, the raw-byte decode table
+for every primitive Logix type) never had entries for `USINT`/`UINT`/`UDINT`/`ULINT` at all — only the
+signed integer types (`SINT`/`INT`/`DINT`/`LINT`) and the "bit string" types (`BYTE`/`WORD`/`DWORD`/
+`LWORD`, which share the exact same raw byte format). `_decode_scalar_member()` (`decode.py`), on a
+`_PRIM` miss, falls through to `data_types_map.get("USINT")` — which resolves to a REAL, but EMPTY
+(`cls="ProductDefined"`, zero members) `DataType` object, since `ControllerBuilder` seeds every
+`RxDataTypeCollection` entry into the shared map regardless of `cls` (Rockwell's own Comps.Dat
+apparently carries placeholder entries for primitive type names, already documented elsewhere in this
+file for the same reason an AOI's own instance-shape type lives in this same map). `_decode_single_udt_element()`
+then looped over that empty type's zero members and returned `{}` — an empty dict, not `None` and not a
+real int. Downstream, `_udt_scalar_to_xml()` treated `isinstance(val, dict)` as "this is a nested UDT,"
+recursed with `data_type="USINT"` (not a real struct), got nothing back, and silently dropped the member
+from Decorated output entirely — and `_get_type_size()` has the exact same `_PRIM`-miss fallback, so
+any `USINT`/`UINT`/`UDINT`/`ULINT`-typed array or struct-size calculation was also silently wrong
+(always `0`). `_PRIMITIVE_RADIX`/`_PRIMITIVE_L5K_ZERO`/`_PRIMITIVE_DECORATED_ZERO` (`rendering.py`)
+already had correct entries for all four types — only the raw-byte decode table itself was missing
+them, meaning the rendering *shape* was always ready and waiting for a value that never arrived.
+
+**Fix**: added all four to `_PRIM` with the same raw struct format/size as their `BYTE`/`WORD`/
+`DWORD`/`LWORD` siblings (`USINT`→`'B',1`, `UINT`→`'<H',2`, `UDINT`→`'<I',4`, `ULINT`→`'<Q',8`) — same
+underlying bit pattern, Rockwell just uses a different display name depending on whether a tag/member
+is meant to be read as a typed unsigned integer vs. a raw bit string.
+
+**Verified byte-for-byte exact against the real Studio ground truth**: both `<Data Format="Decorated">`
+(all 12 members, correct order, correct values) and `<Data Format="L5K">` (8865-character literal,
+confirmed via direct Python string comparison: `ours == real` is `True`) now match the real Studio
+5000 "Export Tag" output for `VAB_SQL_ParseTDSResponse_Inst` exactly — the strongest verification
+standard used anywhere in this file (most fixes are verified structurally or by spot-checking specific
+values; this one is a complete, automated, character-for-character match against real ground truth).
+
+**Worth re-examining, not yet done**: whether this same bug explains some or all of the OLDER,
+still-parked `TestFPM`/`AOI_RPMtoFPM` discrepancy (17 real L5K values vs. our 8) — if that AOI has any
+`USINT`/`UINT`/`UDINT`/`ULINT`-typed parameters/local tags, this fix may close some of that gap too,
+though the "leading value 3" mystery and any other still-unexplained pieces from that investigation are
+NOT claimed to be resolved by this fix alone — re-verify against real `TestFPM` ground truth before
+declaring that older investigation closed.
+
+Covered by `test_decode_single_udt_element_unsigned_integer_members_not_empty_dict` (constructs values
+large enough to be unambiguous — e.g. `200` for `USINT`, which would read as negative if the bytes were
+ever misinterpreted as signed `SINT`), `test_get_type_size_unsigned_integer_types`, and
+`test_udt_scalar_to_xml_renders_unsigned_integer_member` — `test/test_elements_helpers.py`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

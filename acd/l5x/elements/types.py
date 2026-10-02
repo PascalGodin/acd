@@ -16,6 +16,34 @@ _PRIM = {
     'LWORD': ('<Q',  8),
     'REAL':  ('<f',  4),
     'LREAL': ('<d',  8),
+    # Unsigned integer types -- same raw byte format/size as their
+    # BYTE/WORD/DWORD/LWORD siblings above (same bit pattern, just
+    # Rockwell's "typed integer" naming rather than its "bit string"
+    # naming), simply missing from this table entirely until a real report
+    # traced a USINT-typed AOI member (LastErrorClass/LastErrorState on
+    # VAB_SQL_ParseTDSResponse) silently decoding to an empty dict `{}`
+    # instead of a real int. Root cause: with no _PRIM entry,
+    # _decode_scalar_member() fell through to `data_types_map.get("USINT")`
+    # -- which resolves to a REAL, but EMPTY (cls="ProductDefined", zero
+    # members), DataType object (ControllerBuilder seeds every
+    # RxDataTypeCollection entry, not just user ones -- Rockwell's own
+    # Comps.Dat has placeholder entries for primitive type names like this)
+    # -- so _decode_single_udt_element() ran its member loop over zero
+    # members and returned `{}`. Downstream, _udt_scalar_to_xml() then took
+    # `isinstance(val, dict)` as "nested UDT", recursed with data_type
+    # "USINT" (not a real struct), got back an empty string, and silently
+    # dropped the member from Decorated output entirely -- while
+    # _get_type_size()'s identical fallback meant any USINT/UINT/UDINT/
+    # ULINT-typed array or struct-size calculation was also silently
+    # wrong (always 0). Affects every one of these four types project-wide,
+    # not just this one AOI -- _PRIMITIVE_RADIX/_PRIMITIVE_L5K_ZERO/
+    # _PRIMITIVE_DECORATED_ZERO (rendering.py) already had entries for all
+    # four, so the rendering *shape* was always ready; only the raw-byte
+    # decode table itself was missing them.
+    'USINT': ('B',   1),
+    'UINT':  ('<H',  2),
+    'UDINT': ('<I',  4),
+    'ULINT': ('<Q',  8),
 }
 
 def _is_bit_overlay(member: "Member") -> bool:

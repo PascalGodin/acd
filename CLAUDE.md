@@ -5701,6 +5701,72 @@ literal reported shape: a hand-built `MESSAGE` value including a string-family-s
 and `test_tag_to_xml_omits_data_for_skip_decorated_type_with_no_decoded_value` (non-regression for
 the already-correct no-value fallback case) — `test/test_api.py`.
 
+## PARKED, NOT IMPLEMENTED: a real, genuine duplicate live rung in Region Map/RegnLink.Dat that Studio's own UI doesn't show — no distinguishing raw-data signal found despite checking every mechanism this codebase currently understands
+
+A real report: `db_get_routine()` on a real routine (`VAB_SQL.ACD`, `MainRoutine`/`MainProgram`)
+returned 3 rungs, with rungs 1 and 2 byte-for-byte identical RLL text — but the SAME, confirmed-
+unmodified `.ACD` file, open live in real Studio 5000, shows only 2 rungs (0 and 1). The user
+directly confirmed no changes were made in Studio between saving that file and taking the
+screenshot, ruling out the obvious "stale/unsaved-edit timing mismatch" explanation. **Investigated
+thoroughly against the real file; genuinely unresolved, not guessed at.**
+
+**Every mechanism this codebase currently trusts agrees the duplicate is real, with no dissenting
+signal anywhere:**
+- **Region Map** has 4 entries for this routine (`unknown` field, the already-proven real display-
+  order key — see "Region Map format change" above — reads 0,1,2,3, no gaps, no duplicated slot
+  index): (0) a real `VAB_SKT_AOI_TCP_CLIENT(...)` rung, (1) `XIC(...)JSR(VAB_SQL_ReadResponse,0);`,
+  (2) the SAME text again under a DIFFERENT object id, (3) an entry with NO matching `SbRegion.Dat`
+  text at all (correctly already filtered by the existing `LEFT JOIN ... WHERE r.rung IS NOT NULL`
+  logic — not part of this bug).
+- **`RegnLink.Dat`'s own chain** (`own_rung -> next_rung`, already independently verified elsewhere
+  in this file as authoritative for recovering true rung order) reproduces the EXACT same sequence
+  end-to-end: the routine's own head pointer -> rung 0 -> rung 1 -> the duplicate -> the dangling
+  entry -> end-of-chain sentinel. No fork, no alternate path, no stale/abandoned branch anywhere in
+  the chain — a single, complete, self-consistent sequence that includes both the real rung 1 and
+  its duplicate as adjacent, intentional-looking chain links.
+- **`SbRegion.Idx`** (never previously reverse-engineered by this codebase at all, same tier of
+  effort as `XRefs.Dat`) was decoded for the first time for this investigation: a dense, 40-ish-byte
+  index entry per rung record — `[offset into SbRegion.Dat][object_id]["RUNG NT" ASCII, zero-
+  padded]`, found by searching for the two duplicate rungs' own computed `SbRegion.Dat` byte offsets
+  as raw little-endian u32s and confirming each hit's trailing bytes decode to the record's own
+  known object_id and the literal "RUNG NT" marker. Both duplicate rungs are indexed **identically**
+  — same entry shape, no extra flag field, no omission of one versus the other.
+- Both duplicate-text `SbRegion.Dat` records are physically **adjacent** (consecutive record
+  indices, written in the same small batch — consistent with the user's own narrative: a hand-typed
+  workaround rung plus a separate, failed `db_export_routine()`-generated-L5X import attempt around
+  the same time, though which artifact belongs to which action isn't determinable from the data
+  alone), both carry a live `"Rung NT"` marker (not the `0xFDFD`/65021 dead-record identifier the
+  generic `.Dat`-record dispatcher already filters out for every file this library reads).
+
+**What this rules out**: this is NOT the same class of bug as the tombstone-filtering fixes earlier
+this session (DataType member `record_type=512`, AOI local-tag `$hex$`/`__CLONE` placeholders,
+`ZZZZZ_TEMPORARY_IMPORT_DATATYPE_NAME` duplicates, etc.) — every one of those had a real, checkable
+"this is a known-dead-shape" signal once found. Here, there is no such signal in any of the three
+independent sources (Region Map, RegnLink.Dat, SbRegion.Idx) checked — they all agree, unanimously,
+that the file itself contains 3 real, live, correctly-sequenced rungs including a genuine duplicate.
+A guessed fix (e.g. "collapse adjacent byte-identical rungs") was deliberately NOT implemented: it
+would risk real data loss for a different, legitimately-duplicate rung in someone else's project,
+and there's no confirmed way to know which of the two object ids (`1217858536`/`3822594980`) is the
+one Studio's own UI considers "real" versus a leftover artifact — guessing wrong in either direction
+is a real regression, not a neutral no-op.
+
+**Leading, unconfirmed hypothesis, not acted on**: the routine's own comps record carries a single
+byte already documented elsewhere in this file as a compile-state/"dirty" flag (flips `0x03 -> 0x00`
+on a real Studio save per the "ACD write-back" three-way-diff investigation above) — a routine still
+marked "needs recompile" might have on-disk Region Map/SbRegion.Dat content that hasn't yet been
+reconciled by a real compile pass, with Studio's LIVE in-memory view (which recompiles on open)
+showing the true, de-duplicated result while the raw file still carries leftover pre-compile debris.
+This was NOT independently confirmed (no second, differently-dirty-flagged real sample was available
+to calibrate what a genuinely "clean"/compiled value looks like for comparison) — flagged here as
+the most promising next lead, not a verified explanation.
+
+**If picking this back up**: the real `VAB_SQL.ACD` project (already used throughout this session's
+history) reproduces this exactly — `MainProgram/MainRoutine`, rung object ids `1217858536` (the one
+Region Map/RegnLink order as "rung 1") and `3822594980` (ordered as "rung 2", identical text). A
+second real sample exhibiting the same shape (ideally with the project's own edit history known
+precisely, unlike this one) would help distinguish the "dirty flag"/stale-pre-compile-debris theory
+from something else entirely.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

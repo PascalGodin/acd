@@ -415,6 +415,13 @@ CREATE TABLE proj_tag_comments (
 -- row was designed to avoid for controller-scope tags; a partial index
 -- (WHERE program_id/aoi_id IS NOT NULL) sidesteps it without needing an
 -- equivalent sentinel AOI row here.
+-- source_object_id (like proj_tags'/proj_rungs' own column of the same
+-- name) is the routine's real Comps.Dat object_id when it was decoded from
+-- the real ACD, or NULL when it was created fresh via new_routine()/
+-- db_new_routine() and has never actually been imported into any real
+-- Studio 5000 project. Load-bearing, not just for traceability: a JSR-
+-- called sibling routine that isn't real yet must never be exported as a
+-- bare Use="Reference" stub -- see _referenced_called_routines() (acd/api.py).
 CREATE TABLE proj_routines (
     id INTEGER PRIMARY KEY,
     program_id INTEGER REFERENCES proj_programs(id),
@@ -422,6 +429,7 @@ CREATE TABLE proj_routines (
     name TEXT NOT NULL,
     type TEXT NOT NULL,
     description TEXT,
+    source_object_id INTEGER,
     CHECK ((program_id IS NULL) != (aoi_id IS NULL))
 );
 CREATE UNIQUE INDEX idx_proj_routines_scope_name ON proj_routines(program_id, name COLLATE NOCASE)
@@ -554,9 +562,10 @@ def _materialize(db: sqlite3.Connection, project: RSLogix5000Content, acd_path) 
         # _load_routines_where()'s own SELECT.
         try:
             cur.execute(
-                f"INSERT INTO proj_routines ({owner_column}, name, type, description) "
-                "VALUES (?, ?, ?, ?)",
-                (owner_id, routine.name, routine.type, routine._description),
+                f"INSERT INTO proj_routines ({owner_column}, name, type, description, "
+                "source_object_id) VALUES (?, ?, ?, ?, ?)",
+                (owner_id, routine.name, routine.type, routine._description,
+                 routine._source_object_id),
             )
         except sqlite3.IntegrityError as e:
             raise sqlite3.IntegrityError(
@@ -2572,12 +2581,12 @@ class ProjectDB:
         input, so the f-string column name here is safe.
         """
         rows = cur.execute(
-            f"SELECT id, name, type, description FROM proj_routines WHERE {owner_column}=? "
-            "ORDER BY id",
+            f"SELECT id, name, type, description, source_object_id FROM proj_routines "
+            f"WHERE {owner_column}=? ORDER BY id",
             (owner_id,),
         ).fetchall()
         routines: List[Routine] = []
-        for (rid, name, rtype, description) in rows:
+        for (rid, name, rtype, description, source_object_id) in rows:
             rung_rows = cur.execute(
                 "SELECT text, comment, source_object_id FROM proj_rungs WHERE routine_id=? "
                 "ORDER BY rung_index",
@@ -2593,6 +2602,7 @@ class ProjectDB:
                 _rung_comments={i: r[1] for i, r in enumerate(rung_rows) if r[1] is not None},
                 _description=description,
                 _st_lines=[r[0] for r in st_rows],
+                _source_object_id=source_object_id,
             )
             routines.append(routine)
         return routines

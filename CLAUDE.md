@@ -5792,6 +5792,85 @@ second real sample exhibiting the same shape (ideally with the project's own edi
 precisely, unlike this one) would help distinguish the "dirty flag"/stale-pre-compile-debris theory
 from something else entirely.
 
+## `export_routine()` crashed real Logix Designer outright — a JSR-called sibling routine that was never actually imported anywhere still got a lying `Use="Reference"` stub
+
+A real, severe downstream report: a routine built entirely through `db_*` calls (`db_delete_rung()`
+x3, `db_insert_rung()` once) read back completely correctly via `db_get_routine()` — clean rungs,
+sensible content — but importing its `db_export_routine()` output into real Studio 5000 (v38.02.00)
+produced an immediate FATAL ERROR dialog, not a normal import rejection: `0x80042001 RxE_NOT_FOUND —
+Requested item could not be found`, Logix Designer itself closing. A `.dmp` crash file was generated.
+This is categorically more severe than every other `export_*` bug this session — a graceful "Import
+failed, no changes were made" message versus the whole application crashing.
+
+**Root cause, confirmed directly against the real project** (`VAB_SQL.ACD`, `MainRoutine`/
+`MainProgram` — the SAME routine already used throughout this session for the (unrelated, since-
+retracted) duplicate-rung investigation; the two share a project but not a root cause): the new rung
+called `JSR(VAB_SQL_Connect,0)`, where `VAB_SQL_Connect` was a BRAND-NEW routine the downstream
+session had created via `db_new_routine()` + many `db_insert_st_line()` calls (75 real ST lines) —
+never actually imported into any real Studio 5000 project at the time of the crash.
+`_referenced_called_routines()` (`acd/api.py`) resolves a JSR target purely by NAME against
+`program.routines` — with zero distinction between a routine Studio already has a real record of and
+one that exists ONLY in this library's own persistent project DB. The render site then always emitted
+a bare `<Routine Use="Reference" Name="VAB_SQL_Connect"></Routine>` stub — which, per this codebase's
+own already-verified convention (see "Partial/context L5X exports" above), correctly tells Studio
+"this already exists for real, just reference it" for an ALREADY-REAL called routine (confirmed
+against Rockwell's own native "Export Routine" output) — but is an outright LIE for a routine Studio
+has never heard of. Unlike a normal unresolvable-reference validation failure (which Studio handles
+gracefully), this specific lie apparently hits an unguarded internal lookup in Logix Designer's own
+import engine, crashing the whole application rather than rejecting the file.
+
+**Confirmed, not guessed**: direct inspection of the shared, real `acd.db` project sidecar (same
+physical file path the downstream session used — `proj_meta.dirty=1`, their uncommitted edits still
+present) showed `VAB_SQL_Connect` as a genuine `proj_routines` row with 75 real `proj_st_lines` rows —
+a real, substantial routine, not a stub or placeholder. The ORIGINAL raw `.ACD`'s own `Comps.Dat`
+(checked earlier this session for the unrelated duplicate-rung investigation) confirmed `VAB_SQL_Connect`
+did NOT exist in `MainProgram`'s `RxRoutineCollection` at that point — only `MainRoutine` and
+`VAB_SQL_ReadResponse` (both real) did. The crash reproduced cleanly on a scratch copy by creating an
+analogous not-yet-real routine and a target routine JSR-calling it.
+
+**Fix, three parts**:
+1. **`Routine` gained a new `_source_object_id: Union[int, None]` field** (`acd/l5x/elements/model.py`)
+   — the routine's own real Comps.Dat object_id when decoded from a real ACD, or `None` when created
+   fresh via `new_routine()`/`db_new_routine()` and never imported. Set by `RoutineBuilder.build()`
+   (`builders_routine.py`) from its own already-in-hand `self._object_id` for every real decode —
+   `new_routine()` (`model.py`) leaves it at the default `None`, correctly, with no change needed there.
+2. **`proj_routines` gained a matching `source_object_id` column** (`acd/l5x/project_db.py`), populated
+   by `_insert_routine()`'s own INSERT (the shared Program/AOI routine-materialization closure, using
+   `routine._source_object_id` from the just-decoded real `Routine`) and left `NULL` by `new_routine()`'s
+   own two INSERT statements (unchanged, nothing to add — SQLite defaults an unmentioned column to
+   `NULL`). `_load_routines_where()` (the shared rehydration function behind `to_controller()`) reads it
+   back into the rehydrated `Routine._source_object_id` for both Program- and AOI-owned routines alike.
+3. **`export_routine()`'s own dependency-discovery and render logic** (`acd/api.py`) now distinguishes
+   the two cases at the render site: a JSR target with a real `_source_object_id` still gets the
+   existing, already-verified bare `Use="Reference"` stub; one with `_source_object_id is None` gets its
+   REAL content embedded instead (`r.to_xml()`, no individual `Use=` at all — the exact same convention
+   `export_program()` already uses for every routine inside its own target Program), so Studio receives
+   real content to create rather than a false "already exists" claim. The routine-discovery step itself
+   was rewritten as a small worklist (previously a single, flat `_referenced_called_routines(routine_lines,
+   program)` call) so a not-yet-real routine's OWN lines get folded into the dependency scan BEFORE tag/
+   module/UDT/AOI resolution runs — its own tag/type references need to be present as context too, now
+   that its full content is embedded, the same way `export_program()` already unions dependencies across
+   every routine in a Program. Without this second half of the fix, the crash would have been fixed but
+   replaced by a quieter, separate "tag not found" gap for any not-yet-real routine with its own
+   additional dependencies beyond what the calling routine already references.
+
+**Verified end-to-end against the real project** (scratch copy, never the downstream session's own
+live project/sidecar): a target routine JSR-calling both a real routine (bare `Reference` stub,
+unchanged) and a synthetic not-yet-real one (full `<STContent>` embedded, including a tag reference
+only the not-yet-real routine itself uses) produces well-formed, `validate=True`-passing XML with
+correct dependency closure — confirmed structurally; not yet re-confirmed by an actual live Studio
+5000 import of this exact fix (unlike several other `export_*` fixes in this file that went through a
+live-import round-trip) since the crash itself makes that step unusually costly to repeat casually.
+
+Covered by `test_export_routine_embeds_full_content_for_not_yet_real_jsr_target` (the core fix: real
+vs. not-yet-real JSR targets rendered differently) and
+`test_export_routine_not_yet_real_jsr_targets_own_dependencies_are_included` (the dependency-closure
+half) in `test/test_api.py`; and
+`test_db_export_routine_embeds_full_content_for_not_yet_real_jsr_target`
+(`test/test_project_db.py`) — the literal reported shape through the real `db_*` surface, mixing a
+real fixture routine (`Branching/B002_Timers`) and a `db_new_routine()`-created one as JSR targets of
+a third, freshly-created target routine.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

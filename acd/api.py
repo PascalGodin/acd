@@ -1461,6 +1461,32 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # whichever one is actually populated, so every dependency scan below
     # (tags, modules, called routines) works the same way for either type.
     routine_lines = _routine_lines(routine)
+
+    # Transitively discover every JSR-called routine (same program only --
+    # native ladder logic can't cross program boundaries) reachable from the
+    # target routine's own text, OR from the text of a NOT-YET-REAL called
+    # routine whose own full content gets embedded below (see the render
+    # site further down) -- a worklist, not a single pass, since a
+    # not-yet-real routine can itself call ANOTHER not-yet-real routine. A
+    # not-yet-real routine's own lines are folded into `routine_lines`
+    # itself so every dependency scan below (tags, modules, UDTs/AOIs) sees
+    # them too, the same way export_program() already unions every
+    # routine's own dependencies across a whole Program.
+    called_routines: List[Routine] = []
+    _seen_routine_names = {routine.name}
+    _scan_queue = [routine_lines]
+    while _scan_queue:
+        lines = _scan_queue.pop()
+        for r in _referenced_called_routines(lines, program):
+            if r.name in _seen_routine_names:
+                continue
+            _seen_routine_names.add(r.name)
+            called_routines.append(r)
+            if r._source_object_id is None:
+                r_lines = _routine_lines(r)
+                routine_lines = routine_lines + r_lines
+                _scan_queue.append(r_lines)
+
     referenced_names = set(_referenced_tag_names(routine_lines))
 
     # An Alias tag's target must also be included -- Studio 5000's own
@@ -1566,12 +1592,26 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     )
 
     # Routines called via JSR within the same program: empty Use="Reference"
-    # stubs alongside the real Use="Target" routine -- verified against that
-    # same real export (the target routine calls JSR(CalledRoutine,0)).
-    referenced_routines = _referenced_called_routines(routine_lines, program)
+    # stubs alongside the real Use="Target" routine -- verified against a
+    # real export (the target routine calls JSR(CalledRoutine,0)). This is
+    # only correct for a REAL, already-imported sibling routine -- a bare
+    # Reference stub tells Studio "this already exists, don't worry about
+    # its content." A JSR target created fresh via new_routine()/
+    # db_new_routine() and never actually imported anywhere (no real
+    # Comps.Dat object_id, see Routine._source_object_id) must be rendered
+    # with its REAL content instead (no individual Use= at all, same
+    # convention export_program() already uses for every routine inside its
+    # own target Program) -- found via a real, severe report: a lying
+    # Reference stub for a not-yet-real routine crashed Logix Designer
+    # outright (a fatal 0x80042001 RxE_NOT_FOUND error, not a normal,
+    # graceful "Import failed" rejection) rather than merely failing
+    # validation. `called_routines` (computed transitively above, alongside
+    # the dependency-scan expansion) already covers both the directly-called
+    # and any further routine called from a not-yet-real routine's own text.
     called_routines_xml = "".join(
-        f'<Routine Use="Reference" Name="{_escape_xml_attr(r.name)}">\n</Routine>\n'
-        for r in referenced_routines
+        r.to_xml() if r._source_object_id is None
+        else f'<Routine Use="Reference" Name="{_escape_xml_attr(r.name)}">\n</Routine>\n'
+        for r in called_routines
     )
 
     controller_tags_xml = "".join(t.to_xml() for t in controller_tags)

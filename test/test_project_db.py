@@ -2414,6 +2414,41 @@ def test_export_program_instance_method(acd_copy, tmp_path):
         db.close()
 
 
+def test_db_export_routine_embeds_full_content_for_not_yet_real_jsr_target(acd_copy, tmp_path):
+    # Regression test for a real, severe report through the actual db_*
+    # surface the bug was found on: db_insert_rung()/db_new_routine() let a
+    # caller freely create a new routine and reference it via JSR from
+    # another routine in the same program -- read-back via db_get_routine()
+    # looked completely correct -- but db_export_routine() used to render
+    # the not-yet-real routine as a bare <Routine Use="Reference"> stub,
+    # identical to a REAL, already-imported JSR target (here, the fixture's
+    # own real "B002_Timers", already called by "B001_Main" via JSR). A
+    # Reference stub for something Studio has no record of at all crashed
+    # real Logix Designer outright (fatal 0x80042001 RxE_NOT_FOUND, not a
+    # graceful import rejection). source_object_id (new column on
+    # proj_routines, mirroring proj_tags'/proj_rungs' own column of the same
+    # name) is what now lets export_routine() tell real apart from new.
+    db_new_routine(str(acd_copy), "DBNewNotYetReal", "ST", program_name="Branching")
+    db_insert_st_line(str(acd_copy), "DBNewNotYetReal", 0, "SomeNewTag := 1;",
+                       program_name="Branching")
+
+    db_new_routine(str(acd_copy), "DBNewTarget", "RLL", program_name="Branching")
+    db_insert_rung(str(acd_copy), "DBNewTarget", 0, "JSR(DBNewNotYetReal,0);",
+                    program_name="Branching")
+    db_insert_rung(str(acd_copy), "DBNewTarget", 1, "JSR(B002_Timers,0);",
+                    program_name="Branching")
+
+    out_path = tmp_path / "db_jsr_mixed_real_and_new.L5X"
+    db_export_routine(str(acd_copy), "DBNewTarget", str(out_path),
+                       program_name="Branching", validate=True)
+    content = out_path.read_text(encoding="utf-8")
+
+    assert '<Routine Use="Reference" Name="B002_Timers">' in content
+    assert 'Use="Reference" Name="DBNewNotYetReal"' not in content
+    assert '<Routine Name="DBNewNotYetReal" Type="ST">' in content
+    assert "SomeNewTag := 1;" in content
+
+
 def test_db_export_program_validate_rejects_out_of_bounds_array_index(acd_copy, tmp_path):
     db_new_tag(str(acd_copy), "PDB_ARR_TAG", "DINT", dimensions="3", program_name="Branching")
     db_insert_rung(str(acd_copy), "B001_Main", 0, "MOV(PDB_ARR_TAG[3],1);",

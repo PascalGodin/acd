@@ -146,6 +146,79 @@ def test_export_routine_st_routine_pulls_in_referenced_tags(tmp_path):
     assert {"DINT", "UDINT", "ULINT"} <= tag_names
 
 
+def test_export_routine_embeds_full_content_for_not_yet_real_jsr_target(tmp_path):
+    # Regression test for a real, severe report: a JSR-called sibling
+    # routine that was created fresh via new_routine()/db_new_routine() (and
+    # never actually imported into any real Studio 5000 project) used to be
+    # exported as a bare <Routine Use="Reference" Name="..."> stub, exactly
+    # like a REAL, already-imported called routine -- but a Reference stub
+    # tells Studio "this already exists, don't worry about its content,"
+    # which is a lie for a not-yet-real routine. Real Studio 5000 crashed
+    # OUTRIGHT (a fatal 0x80042001 RxE_NOT_FOUND error, Logix Designer itself
+    # closing -- not a normal, graceful "Import failed" validation message)
+    # when asked to resolve this. Root-caused and verified against the real
+    # reporting project (VAB_SQL.ACD) directly: a JSR target with no real
+    # Comps.Dat object_id (Routine._source_object_id is None) must be
+    # rendered with its REAL content instead, the same "no individual Use="
+    # convention export_program() already uses for every routine inside its
+    # own target Program.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"))
+    program = project.controller.programs[0]
+
+    real_called = new_routine("RealCalledRoutine", "RLL")
+    real_called.insert_rung(0, "NOP();")
+    real_called._source_object_id = 123456789  # simulates a real, already-imported routine
+
+    not_yet_real_called = new_routine("NotYetRealRoutine", "ST")
+    not_yet_real_called.insert_st_line(0, "SomeTag := 1;")
+    # _source_object_id left at its default (None) -- never imported for real.
+
+    target = new_routine("TargetRoutine", "RLL")
+    target.insert_rung(0, "JSR(RealCalledRoutine,0)JSR(NotYetRealRoutine,0);")
+
+    program.routines = program.routines + [real_called, not_yet_real_called, target]
+
+    out_path = tmp_path / "jsr_mixed_real_and_new.L5X"
+    export_routine(project, target, str(out_path))
+
+    xml_text = out_path.read_text(encoding="utf-8")
+    minidom.parseString(xml_text)  # raises on malformed XML
+
+    assert '<Routine Use="Reference" Name="RealCalledRoutine">' in xml_text
+    # The not-yet-real routine must NOT appear as a Reference stub...
+    assert 'Use="Reference" Name="NotYetRealRoutine"' not in xml_text
+    # ...it must carry its own real content instead, with no individual Use=.
+    assert '<Routine Name="NotYetRealRoutine" Type="ST">' in xml_text
+    assert "SomeTag := 1;" in xml_text
+
+
+def test_export_routine_not_yet_real_jsr_targets_own_dependencies_are_included(tmp_path):
+    # Companion test: a not-yet-real called routine's OWN tag references
+    # must be pulled into this export's dependency scan too (the same way
+    # export_program() unions dependencies across every routine) -- since
+    # its full content is now embedded, Studio needs its own referenced
+    # tags present as context, or the import would fail a (survivable, but
+    # still real) validation check instead of crashing outright.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"))
+    program = project.controller.programs[0]
+    real_tag_name = "AdvancedMath"  # a real, plain DINT controller-scope tag in this fixture
+
+    not_yet_real_called = new_routine("RoutineWithOwnTagRef", "RLL")
+    not_yet_real_called.insert_rung(0, f"OTE({real_tag_name});")
+
+    target = new_routine("TargetRoutine2", "RLL")
+    target.insert_rung(0, "JSR(RoutineWithOwnTagRef,0);")
+
+    program.routines = program.routines + [not_yet_real_called, target]
+
+    out_path = tmp_path / "jsr_new_routine_own_deps.L5X"
+    export_routine(project, target, str(out_path))
+
+    xml_text = out_path.read_text(encoding="utf-8")
+    minidom.parseString(xml_text)
+    assert f'Name="{real_tag_name}"' in xml_text
+
+
 def test_find_io_addresses():
     """A real I/O address always contains ':' (Rockwell reserves it for
     module addressing) so this must never match a plain UDT member path."""

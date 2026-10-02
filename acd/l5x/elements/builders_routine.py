@@ -478,7 +478,8 @@ class RoutineBuilder(L5xElementBuilder):
             st_lines = _st_routine_lines(self._cur, self._object_id)
 
         return Routine(
-            name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines
+            name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines,
+            self._object_id,
         )
 
 def _parse_fffeff(data: bytes, offset: int):

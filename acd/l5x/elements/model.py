@@ -1216,6 +1216,18 @@ class Routine(L5xElement):
     _rung_comments: Dict[int, str] = field(default_factory=dict)
     _description: Union[str, None] = field(default=None)
     _st_lines: List[str] = field(default_factory=list)
+    # The routine's own real Comps.Dat object_id if this Routine was decoded
+    # from a real ACD (ProgramBuilder/AoiBuilder set this), or None if it was
+    # created fresh via new_routine()/db_new_routine() and has never actually
+    # been imported into any real Studio 5000 project. See
+    # _referenced_called_routines()'s own usage (acd/api.py) for why this
+    # distinction is load-bearing, not just informational: a JSR-called
+    # sibling routine that ISN'T real yet must never be exported as a bare
+    # Use="Reference" stub (which tells Studio "this already exists, don't
+    # worry about it") -- real Studio 5000 crashed outright (a fatal
+    # RxE_NOT_FOUND error, not a normal import rejection) when asked to
+    # resolve a Reference stub naming a routine it has no record of at all.
+    _source_object_id: Union[int, None] = field(default=None)
 
     def to_xml(self) -> str:
         desc_xml = ""

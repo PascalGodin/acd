@@ -5701,7 +5701,32 @@ literal reported shape: a hand-built `MESSAGE` value including a string-family-s
 and `test_tag_to_xml_omits_data_for_skip_decorated_type_with_no_decoded_value` (non-regression for
 the already-correct no-value fallback case) — `test/test_api.py`.
 
-## PARKED, NOT IMPLEMENTED: a real, genuine duplicate live rung in Region Map/RegnLink.Dat that Studio's own UI doesn't show — no distinguishing raw-data signal found despite checking every mechanism this codebase currently understands
+## RETRACTED (was "PARKED, NOT IMPLEMENTED" below) — the "duplicate rung" was real user data, not a bug; the investigation itself stands and the SbRegion.Idx decode is kept for later use
+
+**Update, after the original report was fully retracted by the user**: the 3rd rung (duplicate text)
+was genuinely created by the user's own messy manual-edit sequence — hand-copying a rung into Studio
+produced some garbage rungs along the way (deleted afterward), and a SEPARATE prior `db_export_routine()`-
+generated-L5X import attempt (originally assumed to have failed as a clean no-op, per Studio's own
+"Import failed ... No changes were made to the project" message) apparently did land a real copy of
+the same rung text at position 3 anyway, at least partially. So the `.ACD` file genuinely, correctly
+contains 3 real rungs including a true duplicate — there was never a decode bug to find. **No fix was
+needed or attempted; none should be — do not revisit the "collapse duplicate rungs" idea.**
+
+The investigation below is kept, unedited, because it was methodologically sound and reached the
+right conclusion for the wrong assumed reason (a "the file disagrees with Studio" bug) — the file
+and Studio were never actually in disagreement once the full edit history was known; every mechanism
+checked (Region Map, RegnLink.Dat, SbRegion.Idx) correctly reported the real, true state of a project
+with a genuine user-created duplicate. The "leading hypothesis" paragraph below (a compile-"dirty"-
+flag explanation for stale pre-compile debris) is now known to be unnecessary for this specific case
+-- not re-verified as generally false, just moot here -- and should not be chased further on the
+strength of this one, now-explained report. **The one genuinely reusable result from this
+investigation is the `SbRegion.Idx` decode itself** (never reverse-engineered by this codebase
+before) — kept below for whenever a REAL `SbRegion.Idx`-relevant question comes up.
+
+---
+
+*(Original write-up, kept for the decode detail and as a record of the investigation — the
+"bug"/"PARKED" framing throughout is superseded by the retraction above.)*
 
 A real report: `db_get_routine()` on a real routine (`VAB_SQL.ACD`, `MainRoutine`/`MainProgram`)
 returned 3 rungs, with rungs 1 and 2 byte-for-byte identical RLL text — but the SAME, confirmed-

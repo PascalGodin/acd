@@ -1242,6 +1242,45 @@ def test_tag_to_xml_renders_data_normally_for_a_real_udt_type():
     assert '<Data' in xml
 
 
+def test_tag_to_xml_omits_data_for_skip_decorated_type_even_with_a_decoded_value():
+    # Regression test for a real, well-diagnosed report: a MESSAGE-typed tag
+    # almost always resolves as a real DataType (ControllerBuilder inserts
+    # every RxDataTypeCollection entry, not just user ones), so its
+    # _initial_value decodes to a real dict just like an ordinary UDT --
+    # which previously fell straight into the generic UDT-scalar <Data>
+    # rendering branch instead of being treated as the special, non-
+    # generically-serializable built-in type _SKIP_DECORATED already says it
+    # is ("these use other formats"). MESSAGE's own Path/RemoteElement
+    # members are raw SINT-array CIP path bytes that happen to decode via
+    # the same {"LEN":...,"DATA":...} shape this codebase uses for a real
+    # string-family member -- producing an L5K/Decorated shape that doesn't
+    # match Studio's real MESSAGE serialization, which a real Studio 5000
+    # import rejected outright ("Failed to set the 'Data' property
+    # (Requested item could not be found.)"). Confirmed against a real
+    # project's own MESSAGE tag (VAB_SQL.ACD, SKT_MSG_Client_Connect) --
+    # this test locks in the fix with a hand-built value reproducing the
+    # same shape, independent of that real fixture.
+    tag = new_tag("MyMsg", "MESSAGE", value={"Flags": 51, "Path": {"LEN": 64, "DATA": ""}})
+    tag._data_types_map = {}
+
+    xml = tag.to_xml()
+    assert '<Data' not in xml
+    assert 'MyMsg' in xml
+
+
+def test_tag_to_xml_omits_data_for_skip_decorated_type_with_no_decoded_value():
+    # Non-regression: the "no initial value at all" fallback path already
+    # correctly omitted <Data> for a _SKIP_DECORATED type before this fix
+    # (it's a built-in, not a primitive, so _PRIMITIVE_L5K_ZERO has no entry
+    # for it) -- confirm that's still true now that the check is explicit
+    # rather than incidental.
+    tag = new_tag("MyMsg2", "MESSAGE")
+    tag._data_types_map = {}
+
+    xml = tag.to_xml()
+    assert '<Data' not in xml
+
+
 def test_sync_data_types_map_does_not_overwrite_real_aoi_synthetic_type():
     # A real, already-imported AOI already has a real synthetic DataType
     # (built by ControllerBuilder at load time from the AOI's own Comps.Dat

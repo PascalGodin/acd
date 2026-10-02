@@ -5644,6 +5644,63 @@ Covered by `test_edit_aoi_local_tag_updates_only_passed_fields`,
 `test_db_edit_aoi_local_tag_and_delete_aoi_local_tag_stateless_wrappers`
 (`test/test_project_db.py`).
 
+## Twenty-fourth round: `_SKIP_DECORATED` types (MESSAGE and friends) still got the generic UDT `<Data>` treatment whenever a value happened to decode successfully
+
+A real, well-diagnosed downstream-of-downstream report (relayed via a peer session, from a user of
+the `PascalGodin/acd` fork): `db_export_routine()`/`export_routine()` on a routine referencing a
+controller-scope `MESSAGE`-typed tag (e.g. `SKT_MSG_Client_Connect`, part of a standard Rockwell
+socket-AOI pattern) produced an L5X whose `<Data Format="L5K">` block for that tag real Studio 5000
+rejected outright: `"Failed to set the 'Data' property (Requested item could not be found.)"`.
+
+**Root cause, confirmed directly against the real project** (`VAB_SQL.ACD`, same project this
+session's history already has read access to): `MESSAGE` is not a primitive and not a project UDT,
+but it IS almost always resolvable as a real `DataType` anyway — `ControllerBuilder` inserts every
+`RxDataTypeCollection` entry into `all_data_types_map` regardless of `cls` (already documented
+elsewhere in this file, originally found via the AOI-instance-value investigation), and a real
+project's own `Comps.Dat` genuinely has a `MESSAGE` entry there with its own real member layout
+(`Flags`, `ERR`, `EXERR`, `Class`, `Attribute`, `Instance`, `LocalIndex`, `Channel`, `Rack`, `Group`,
+`Slot`, `Path`, `RemoteElement`, ...). So a `MESSAGE` tag's `_initial_value` almost always decodes to
+a real dict via the exact same generic `_decode_udt_initial_value()` path as any ordinary UDT — and
+`Tag.to_xml()`'s UDT-scalar branch (`isinstance(iv, dict)`) rendered it exactly like one: a generic
+`_l5k_udt_literal()` L5K array and a generic `<Structure DataType="MESSAGE">` Decorated block.
+
+This is wrong for `MESSAGE` specifically (and the rest of `_SKIP_DECORATED` — `ALARM_DIGITAL`,
+`AXIS_SERVO`, `PID_ENHANCED`, `AXIS_CIP_DRIVE`, `MOTION_GROUP`) — a comment already sitting right
+above `_SKIP_DECORATED` said so ("these use other formats"), but that exclusion was only ever
+actually *checked* in the zero-value FALLBACK path (reached only when `_initial_value is None`),
+never in the generic UDT-scalar/UDT-array branches that fire when a value DID decode. Concretely:
+`MESSAGE.Path`/`.RemoteElement` are raw `SINT`-array CIP path bytes, but happen to decode via the
+exact same `{"LEN": int, "DATA": str}` shape this codebase uses for a genuine string-family member
+(`_decode_string_family_value()`'s own shape, reused generically wherever a member's declared type
+resolves as string-family) — producing an L5K/Decorated shape that doesn't match Studio's own real,
+special-cased `MESSAGE` serialization at all. These fields are also runtime-populated (e.g. via
+`COP(Create_MSG.Path, Connect_MSG.Path, 1)` in the reporting project's own AOI rung 0), never
+statically configured by a user, so the "value" being serialized was uninitialized garbage to begin
+with (`Instance=3145779`, `LocalIndex=3276854`, etc. — not sane CIP values) — not something worth
+preserving even if the serialization format were otherwise correct.
+
+**Fix**: `Tag.to_xml()` now computes `is_skip_decorated_type` (whether the tag's own base data type
+is in `_SKIP_DECORATED`) once, up front, alongside the existing `is_alias`/`is_synthetic_aoi_instance`
+checks, and gates BOTH the known-value rendering block and the zero-value fallback block on it —
+matching the exact same "omit `<Data>` entirely rather than assert a shape we can't verify, let Studio
+keep/self-initialize the tag's own existing value" precedent already established for a not-yet-real
+AOI instance tag (see "A not-yet-real AOI's instance tag renders NO `<Data>` at all" above). A
+`MESSAGE`-typed tag (or any other `_SKIP_DECORATED` type) now renders with no `<Data>` element at
+all, regardless of whether a value happened to decode successfully.
+
+**Verified end-to-end against the real, reported repro**: `db_export_routine(acd_path, 'MainRoutine',
+out_path, program_name='MainProgram')` (the literal reported call, run against a scratch copy of the
+real project, never the user's own working directory/`acd.db`) now produces well-formed XML with
+every one of the six real `SKT_MSG_*` `MESSAGE`-typed context tags rendering with zero `<Data>`
+elements, instead of the previously-malformed L5K block. The sibling UDT-typed context tag
+(`SKT_DATA_Client`) the report noted exported fine both before and after, confirming the fix is
+correctly scoped to `_SKIP_DECORATED` types only.
+
+Covered by `test_tag_to_xml_omits_data_for_skip_decorated_type_even_with_a_decoded_value` (the
+literal reported shape: a hand-built `MESSAGE` value including a string-family-shaped `Path` member)
+and `test_tag_to_xml_omits_data_for_skip_decorated_type_with_no_decoded_value` (non-regression for
+the already-correct no-value fallback case) — `test/test_api.py`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

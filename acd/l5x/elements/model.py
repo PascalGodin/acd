@@ -499,7 +499,42 @@ class Tag(L5xElement):
             and getattr(_resolved_dt_check, "_is_synthetic_aoi_instance", False)
         )
 
-        if not is_alias and not is_synthetic_aoi_instance and self._initial_value is not None:
+        # A type in _SKIP_DECORATED (MESSAGE, ALARM_DIGITAL, AXIS_SERVO, ...)
+        # gets NO <Data> element at all, regardless of whether an initial
+        # value was successfully decoded -- these are Rockwell built-in
+        # types with their own special, non-generic L5X serialization that
+        # this library doesn't implement (the comment above _SKIP_DECORATED
+        # already says "they use other formats"), but that was previously
+        # only honored by the zero-value FALLBACK path (reached only when
+        # self._initial_value is None). A type like MESSAGE is itself
+        # usually resolvable as a real DataType (ControllerBuilder inserts
+        # every RxDataTypeCollection entry, not just user ones -- see
+        # "ALL_data_types_map" in builders_controller.py), so a MESSAGE tag
+        # almost always HAS a decoded dict value and fell straight into the
+        # generic UDT-scalar branch below instead, rendering it with the
+        # same generic L5K-array-literal / <Structure> machinery used for an
+        # ordinary UDT. Found via a real, well-diagnosed report: a MESSAGE
+        # tag's own `Path`/`RemoteElement` members are raw SINT-array CIP
+        # path bytes, not genuine string-family fields, but happened to
+        # decode via the same {"LEN":...,"DATA":...} shape this generic
+        # machinery uses for a real STRING-family member -- producing an L5K
+        # literal (and Decorated <StructureMember DataType="STRING">
+        # elements) that doesn't match Studio's own real, special-cased
+        # MESSAGE serialization at all, which a real Studio 5000 import then
+        # rejected outright ("Failed to set the 'Data' property (Requested
+        # item could not be found.)"). These fields are also runtime-
+        # populated (e.g. via COP(...) in ladder logic), never statically
+        # configured, so the decoded "value" is frequently uninitialized
+        # garbage anyway -- omitting <Data> entirely lets Studio keep
+        # whatever the target project's own existing tag value already is,
+        # the same precedent already established for a not-yet-real AOI
+        # instance tag just above.
+        is_skip_decorated_type = dt_key_check in _SKIP_DECORATED
+
+        if (
+            not is_alias and not is_synthetic_aoi_instance
+            and not is_skip_decorated_type and self._initial_value is not None
+        ):
             dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
             iv = self._initial_value
 
@@ -649,7 +684,7 @@ class Tag(L5xElement):
                         f'</Data>'
                     )
 
-        if not data_xml and not is_alias and not is_synthetic_aoi_instance:
+        if not data_xml and not is_alias and not is_synthetic_aoi_instance and not is_skip_decorated_type:
             # Scalar primitives with no successfully-decoded initial value
             # (rare -- normally the branch above handles scalar primitives)
             # still get BOTH Format="L5K" and Format="Decorated" blocks at

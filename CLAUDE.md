@@ -5976,6 +5976,86 @@ same long-running session. If revisiting this area later without access to that 
 real sample (any AOI instance tag with a non-finite REAL member, ideally also exercising BIT-overlay
 system params and at least one LocalTag) would be needed to re-confirm or extend this.
 
+## `XRefs.Dat` — substantially reverse-engineered for the first time; a real cross-reference index, NOT where the AOI DefaultData link lives
+
+Picked up as a deliberate research task (the user asked "what's still unresolved," this was chosen
+as the most promising/hardest remaining item) — `XRefs.Dat` had never been reverse-engineered at all
+before this (`record_format 132`; `DbExtract`'s own generic `.Dat` header parser explicitly refuses
+it: `"Cross Reference Databases Not Supported"`, a harder block than the "doesn't recognize this
+record type" gap this codebase has for a couple of `Comps.Dat` record markers).
+
+**Method, same as every other format this codebase has cracked**: used the exact real, isolated
+single-edit triad already on disk from the earlier "ACD write-back" investigation
+(`..._OLD\BPM_TrimmerSorter_20260707.ACD`/`..._STUDIO_NOOP.ACD`/`..._STUDIO_EDITED.ACD` — one known
+rung added, one new tag created, nothing else touched) — no new data needed. `ExportL5x` never reads
+`XRefs.Dat` at all (nothing in `export_l5x.py` references it), so extracting it via
+`ExportL5x(..., _temp_dir=...)` and reading the raw bytes directly works fine without touching the
+generic `.Dat` reader that refuses it.
+
+**Solved**:
+- **Record shape**: a dense array of fixed **46-byte records** (97%+ of the file; found by searching
+  for a constant 8-byte sentinel `fe ff ff ff ff ff ff ff` that reliably ends every one — 37,817
+  records in this real project, spaced exactly 46 bytes apart in the overwhelming majority of cases).
+- **The core payload — two 4-byte object_id fields at FIXED relative offsets 14 and 18** — a
+  `(referencing_object → referenced_object)` pair. Verified two independent ways: (1) diffing
+  `noop` against `edit` directly (not `orig` against either — both later saves touch nearly identical
+  regions relative to `orig` regardless of the real edit, consistent with this codebase's own
+  established "every `.Dat`/`.Idx` header has a save-generation counter that bumps on every save"
+  finding; `noop` vs `edit` cancels that noise and isolates just the real content change) found the
+  record whose offset-14/18 fields changed from a stale pair to EXACTLY `(0x17c4b9bd, 0x114ef0d5)` —
+  the real rung object_id and the real `BitFlags` tag object_id from that exact known edit
+  (`OTE(BitFlags[21])` appended to that rung), confirmed against `Comps.Dat` directly; (2) broadly,
+  across all 37,817 records project-wide, the second field (offset 18) resolves to a real `comps`
+  object 97.9% of the time, with consistently sensible pairs (`tag → its own DataType`,
+  `AOI → a DataType/module it depends on` — including `AOI_SNTP_QUERY → DateTime`, the exact GSV/SSV
+  system-object dependency flagged as an unresolved gap much earlier in this file's own AOI/Module/JSR
+  dependency-closure work).
+- **A `type` field** (4-byte u32 at relative offset 8): 16+ distinct values observed, but overwhelmingly
+  dominated by `type=1` (90% of all records) — every value, not just `1`, resolves to the same basic
+  `object → its own type` relationship; `type` appears to encode the CIP/Rockwell category of the
+  REFERENCING object (plain tag vs. I/O module/connection vs. AOI vs. ...) rather than a different
+  kind of relationship altogether — not fully mapped value-by-value, but the dominant case alone
+  already accounts for the large majority of the file.
+- **Ruled out, definitively, with a completely assumption-free check**: this is NOT where the AOI
+  Parameter/LocalTag `DefaultData` blob link lives (see the separate "PARKED" section on that above).
+  A raw byte search for all 3,223 known `$hex$`-named `DefaultData` blob object_ids anywhere in this
+  project's `XRefs.Dat` — not relying on the record-shape hypothesis at all, a pure substring search
+  — found **zero** matches. `XRefs.Dat` is a logic/type cross-reference index (what references what),
+  not an AOI-own-default-value index; that investigation's own next lead (`XRefs.Dat`) is now closed
+  out as a dead end specifically, not just still-open.
+
+**NOT solved — an 8-byte "key" field** (relative offset 0, before the `type`/object-id fields):
+tried the two cheapest hypotheses, both cleanly disproven with real data rather than left as guesses:
+- **Not a per-routine/per-owner grouping key**: only 181 distinct key values across all 37,817
+  records (suspiciously close to this project's own real routine count, 177 — tempting, but false:
+  picked one real key value and found its own 439-record group spans object names from completely
+  unrelated parts of the project — `Skid`, `FenceGate`, `MMI_BITS`, `Tray8_Timers`, `DINTS_MISC`,
+  etc. — with no common routine/program ancestor at all).
+- **Not a simple modulo-hash bucket of either object-id field**: checked `f2 % N`/`f3 % N` for
+  N ∈ {32, 64, 128, 181, 256} within one key's own group — none collapse to a single value (a true
+  modulo-bucket scheme would), ruling out the simplest hash-table theories.
+- Leading, unconfirmed guess: likely a B-tree/hash-index internal navigation key (bucket chain
+  pointer or similar), possibly tied to `XRefs.Idx` (786KB in this same project, never even glanced
+  at this round) rather than carrying any semantic meaning of its own — but this is genuinely a guess,
+  not verified, and stated as such.
+
+**Practical takeaway, independent of the unsolved key field**: the two object-id fields alone are
+already enough to answer "what does X reference" / "what references X" reliably via a linear scan —
+no feature currently in this library needs the key field's own semantics to use this data. This could
+plausibly replace or strengthen `_resolve_type_closure()`'s/`_referenced_tag_names()`'s current
+approach (walking the in-memory object graph / regex-scanning rung text) with a real, authoritative,
+Rockwell-maintained index instead — not implemented as an actual library feature this round, this was
+purely the reverse-engineering investigation itself; revisit if/when there's a concrete reason to
+expose it.
+
+**If picking this back up**: the real triad used here
+(`BPM_TrimmerSorter_20260707(.ACD/_STUDIO_NOOP.ACD/_STUDIO_EDITED.ACD)`, same machine, same
+`..._OLD\` directory already referenced elsewhere in this file) has plenty more real, resolvable
+object-id pairs to mine for the `type` field's own fine-grained meaning, and the project's own
+`XRefs.Idx` is sitting right next to `XRefs.Dat`, completely unexamined — the most promising next
+step for the `key` field specifically, by direct analogy with how `RegnLink.Idx` turned out to hold
+the answer `RegnLink.Dat` alone couldn't give for rung-comment attribution.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

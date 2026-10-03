@@ -31,6 +31,8 @@ NONE = 0xFFFFFFFF
 _REGION_MARKER = b"\xfe\xfe"
 _LIVE = struct.Struct("<2xIIHHIII8xIII")
 
+PROGRAM_MAIN_ROUTINE = 15
+
 # Relationship kinds confirmed against real projects. Unlisted values exist
 # (compiler-internal links between Nameless code objects, trends, motion).
 KINDS = {
@@ -44,7 +46,7 @@ KINDS = {
     10: "code_routine",
     13: "code_object",
     14: "code_label",
-    15: "program_main_routine",
+    PROGRAM_MAIN_ROUTINE: "program_main_routine",
     32: "task_program",
     115: "aoi_data_type",
     137: "st_code_tag",

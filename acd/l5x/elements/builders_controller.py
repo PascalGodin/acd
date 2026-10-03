@@ -2,6 +2,7 @@
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from typing import Dict, List, Union
 from loguru import logger as log
 
 from acd.generated.comps.rx_generic import RxGeneric
+from acd.record.xrefs import PROGRAM_MAIN_ROUTINE as XREF_PROGRAM_MAIN_ROUTINE
 
 from .base import L5xElementBuilder
 from .builders_common import _build_hex_oid_map
@@ -277,6 +279,27 @@ class ProgramBuilder(L5xElementBuilder):
                     ):
                         main_routine_name = child[0]
                         break
+
+        # The footer above finds nothing on older files (every program in
+        # CuteLogix.ACD and a real V32 project); XRefs.Dat's own
+        # program -> main routine record (kind 15) has it on every file
+        # checked, and agrees with the footer wherever both exist. Matched
+        # only against this program's own routines. A project DB built
+        # before the xrefs table existed has no such table -- treat that as
+        # "no record" rather than failing the whole load.
+        if main_routine_name is None and routine_child_rows:
+            try:
+                self._cur.execute(
+                    "SELECT to_id FROM xrefs WHERE from_id=? AND kind=?",
+                    (self._object_id, XREF_PROGRAM_MAIN_ROUTINE),
+                )
+                main_ids = {row[0] for row in self._cur.fetchall()}
+            except sqlite3.OperationalError:
+                main_ids = set()
+            for child in routine_child_rows:
+                if child[1] in main_ids:
+                    main_routine_name = child[0]
+                    break
 
         # --- FaultRoutineName ---
         # NOT independently re-verified this session -- this still uses the

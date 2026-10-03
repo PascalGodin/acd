@@ -412,6 +412,61 @@ def test_program_builder_resolves_main_routine_name_via_local_ref():
     assert program.main_routine_name == "RoutineB"
 
 
+def _program_without_footer_main_ref(cur, prog_id, coll_id):
+    ext01 = bytearray(40)  # footer local ref (offset 32) left 0 -- the older-file case
+    ext01_attr = struct.pack("<II", 0x01, len(ext01)) + bytes(ext01)
+    dummy_last_attr = struct.pack("<II", 0x02, 4) + b"\x00" * 4
+    prog_record = _rx_generic_header() + struct.pack("<II", 0, 2) + ext01_attr + dummy_last_attr
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (prog_id, 0, "TestProgram", 0, 256, prog_record))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (coll_id, prog_id, "RxRoutineCollection", 0, 256, b""))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (902, coll_id, "RoutineA", 0, 256, bytes(20)))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (903, coll_id, "RoutineB", 0, 256, bytes(20)))
+
+
+def _comps_db():
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE comments(parent int, tag_reference text, record_string text)")
+    return db
+
+
+def test_program_builder_main_routine_falls_back_to_xrefs():
+    # The footer local ref finds nothing on older files (every program in
+    # CuteLogix.ACD and a real V32 project); XRefs.Dat's program -> main
+    # routine record (kind 15) has the answer.
+    db = _comps_db()
+    db.execute(
+        "CREATE TABLE xrefs(from_id int, to_id int, access int, kind int, instruction int, "
+        "bit_offset int, bit_width int, scope_id int, routine_id int, count int)"
+    )
+    cur = db.cursor()
+    _program_without_footer_main_ref(cur, 900, 901)
+    cur.execute("INSERT INTO xrefs VALUES (900, 903, 3, 15, 0, 0, -1, -1, -1, 1)")
+    # Same kind, but pointing at a routine outside this program -- must be ignored.
+    cur.execute("INSERT INTO xrefs VALUES (900, 5555, 3, 15, 0, 0, -1, -1, -1, 1)")
+
+    assert ProgramBuilder(cur, 900).build().main_routine_name == "RoutineB"
+
+
+def test_program_builder_main_routine_tolerates_db_without_xrefs_table():
+    # A project DB built before the xrefs table existed is reused as-is by
+    # open_project_db() when the .ACD hasn't changed -- must not crash.
+    db = _comps_db()
+    cur = db.cursor()
+    _program_without_footer_main_ref(cur, 900, 901)
+
+    assert ProgramBuilder(cur, 900).build().main_routine_name is None
+
+
+def test_cutelogix_programs_resolve_main_routine():
+    controller = ExportL5x("../resources/CuteLogix.ACD", "build").controller
+    main = {p.name: p.main_routine_name for p in controller.programs}
+    assert main == {"Instructions": "MainRoutine", "Duh": "Stupid", "Branching": "B001_Main"}
+
+
 def test_routine_builder_disambiguates_colliding_object_id_by_parent():
     # Regression test for a real, downstream-reported bug: object_id is not
     # always unique in Comps.Dat (see CLAUDE.md's "object_id is not always

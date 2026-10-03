@@ -6048,11 +6048,19 @@ buckets instead of the (program, routine) pair it is. Starting from the header's
 **Not where the AOI `DefaultData` link lives** — still true after the full decode: none of 3,223 known
 `DefaultData` blob object ids appear in any field of any record (a raw byte search too).
 
-**Found along the way, not acted on**: `ProgramBuilder`'s footer-based `MainRoutineName` decode returns
-`None` for every program in `CuteLogix.ACD` (this repo's main fixture) and in the older real
-`BPM_TrimmerSorter_20260707.ACD`, while kind-15 records give the right answer (`Branching → B001_Main`,
-`Duh → Stupid`; and the same main routines this file already documents for the BPM project). On the newer
-`VAB_SQL.ACD` both agree. Kind 15 would make a reliable source or fallback — not wired in.
+**Now used for `MainRoutineName`**: `ProgramBuilder`'s footer-based decode (see "`Program.main_routine_name`
+was always `None`" above) returned `None` for every program in `CuteLogix.ACD` (this repo's main fixture)
+and in the older real `BPM_TrimmerSorter_20260707.ACD` — so `db_export_program()` on those projects still
+dropped the Main Routine designation, the exact symptom that original fix was for. Kind-15 records give the
+right answer there (`Branching → B001_Main`, `Duh → Stupid`, and all 12 BPM programs match the main routines
+this file already documents as real ground truth for that project); on the newer `VAB_SQL.ACD` the footer
+and kind 15 agree. `ProgramBuilder` now keeps the footer as primary and falls back to the kind-15 record
+when it finds nothing, matched only against the program's own routines. A project DB built before the
+`xrefs` table existed (reused by `open_project_db()` without a rebuild while the `.ACD` is unchanged) has
+no such table — the fallback treats that as "no record", so such a sidecar keeps its old `None` until its
+next rebuild rather than failing to load. Covered by `test_program_builder_main_routine_falls_back_to_xrefs`,
+`test_program_builder_main_routine_tolerates_db_without_xrefs_table`, and
+`test_cutelogix_programs_resolve_main_routine` (`test/test_database.py`).
 
 Covered by `test/test_xrefs.py`: synthetic records (live + free slot), header rejection, missing/bad file
 degradation, and against `CuteLogix.ACD` — row count vs the header's own count, every `to_id` resolving,

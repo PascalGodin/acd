@@ -192,6 +192,31 @@ def test_decorated_real_literal_array_infinity_matches_real_quirk():
     assert _decorated_real_literal(float("inf"), in_array=True) == "1.$"
 
 
+def test_udt_scalar_to_xml_scalar_member_infinity_uses_truncated_form():
+    # Regression test: _udt_scalar_to_xml()'s own scalar-member branch used
+    # to call _decorated_real_literal(val, in_array=False) for a REAL/LREAL
+    # member -- reasoning (at the time, unverified) that a scalar UDT member
+    # should follow the same "bare 1.#INF label" convention as a top-level
+    # scalar TAG's own Decorated value. Real ground truth disproves this: a
+    # real Studio 5000 "Export Tag" of AOI instance tag TestFPM
+    # (AOI_RPMtoFPM) shows its scalar REAL member SurfaceFPM (+Infinity,
+    # never statically configured -- a runtime-computed value) rendering as
+    # Value="1.$", the SAME truncated form already established for a
+    # literal array Element, not "1.#INF". The quirk is apparently about
+    # going through Studio's shared member-traversal exporter at all (array
+    # element OR struct member), not specifically about being inside an
+    # array -- fixed by passing in_array=True at this call site too.
+    outer_dt = DataType(
+        "Outer", "Outer", "NoFamily", "User", [_member("SurfaceFPM", "REAL")],
+    )
+    data_types_map = {"OUTER": outer_dt}
+
+    xml = _udt_scalar_to_xml("OUTER", {"SurfaceFPM": float("inf")}, data_types_map)
+
+    assert 'Value="1.$"' in xml
+    assert "1.#INF" not in xml
+
+
 def test_resolve_bit_target_prefers_declaration_order_fallback():
     # Regression test for a real, previously-unresolved bug (a downstream
     # agent hit it live): a real UDT ("LugWrk") had 4 BIT members whose own

@@ -780,7 +780,23 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
                 elem_size = _PRIM.get(mdt_upper, (None, 4))[1]
                 member_val = _decorated_binary_literal(val, elem_size * 8)
             elif isinstance(val, float):
-                member_val = _decorated_real_literal(val, in_array=False)
+                # A scalar UDT/AOI member's own non-finite (NaN/Infinity)
+                # value uses the SAME truncated "1.$" form as a literal array
+                # Element's Decorated value, NOT the bare "1.#QNAN"/"1.#INF"
+                # label a top-level scalar TAG uses (see Tag.to_xml()'s own
+                # call, model.py) -- confirmed via real ground truth (a real
+                # Studio 5000 "Export Tag" for AOI instance tag TestFPM,
+                # AOI_RPMtoFPM): its scalar REAL member SurfaceFPM (+Infinity,
+                # never statically configured) renders as
+                # <DataValueMember ... Value="1.$"/>, not "1.#INF". The
+                # quirk is apparently about going through Studio's shared
+                # member-traversal exporter at all (array element OR struct
+                # member), not specifically about being inside an array --
+                # `in_array=True` here reuses that same code path rather than
+                # the top-level-scalar-tag one. This REVERSES an earlier,
+                # unverified "inferred by direct symmetry" guess (in_array=
+                # False) that a real scalar member case now disproves.
+                member_val = _decorated_real_literal(val, in_array=True)
             else:
                 member_val = val
             parts.append(

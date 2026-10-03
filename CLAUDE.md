@@ -1249,45 +1249,41 @@ exercised through `export_routine()` specifically yet (though the underlying `_l
       Decorated-format REAL/LREAL rendering project-wide (plain tags, UDT members, AOI members),
       not just AOI structures.
 
-    **Separate, deeper, NOT-yet-solved gap found via the same real `TestFPM` comparison — AOI
-    *instance value* decoding is measurably wrong, independent of the dependency-declaration fixes
-    above**: comparing our rendered `TestFPM` tag (`DataType="AOI_RPMtoFPM"`) against the real
-    export's byte-for-byte:
-    - Two members are silently missing from both our `<Data Format="L5K">` and `<Structure>`
-      output: `EnableIn`/`EnableOut` (both real BOOL members present in Studio's own output, not
-      BIT-overlay pseudo-members). The underlying synthetic "DataType" that backs an AOI instance's
-      value decode (found via `all_data_types_map[dt.name.upper()] = dt` in `ControllerBuilder`,
-      which inserts *every* `RxDataTypeCollection` entry regardless of `cls`, not just `cls ==
-      "User"` — meaning an AOI's own instance-data-shape record lives there under the AOI's name,
-      separately from the AOI's own `AddOnInstructionDefinition`/Parameters) appears to mark these
-      two members `hidden`, and `_udt_scalar_to_xml`/`_decode_single_udt_element`'s generic
-      "skip if hidden" rule (correct for real UDT BIT-overlay members) incorrectly drops them here
-      too. Whether that's a raw-byte misread of the hidden flag for this specific case, or a
-      genuine semantic difference (AOI system-defined params need to never be skipped regardless
-      of a hidden flag) is not yet determined.
-    - The real `<Data Format="L5K">` literal has **17 comma-separated values**; ours has only 8
-      (matching the 8 members we do emit). Real Decorated `<Structure>` only shows 10 named
-      members (`EnableIn`/`EnableOut` + our 8) — still short of 17, meaning L5K encodes something
-      beyond even the full named-Parameter list, quite possibly the AOI's own `LocalTags` (private
-      storage) packed into the same flat blob, plus the leading value `3` in the real L5K array
-      that doesn't map to any named Parameter or LocalTag at all (possibly an internal AOI
-      execution-state field Studio never exposes as a named member).
-    - `<Structure DataType="AOI_RPMtoFPM">` in real output preserves the AOI's own mixed-case name;
-      ours renders `AOI_RPMTOFPM` (all-caps) — traceable to `display_name` falling back to the
-      already-uppercased lookup key when the synthetic backing DataType's own stored `.name` isn't
-      the properly-cased one.
-    - `<DefaultData Format="L5K">`/`<DefaultData Format="Decorated">` (an AOI's own default value
-      for a `Parameter`/`LocalTag`, e.g. `MotorRPM`'s default `0.0`) is never emitted at all —
-      `Parameter`/`LocalTag` dataclasses don't even have an `_initial_value`-equivalent field yet,
-      so this needs new binary reverse-engineering (where an AOI *definition's* own default values
-      live in Comps.Dat, analogous to but distinct from `_read_tag_initial_value`/
-      `_decode_udt_initial_value` for a tag *instance's* current value) before it can be
-      implemented at all — not attempted this session.
-    None of this blocks the dependency-declaration fixes above (which only need the AOI/Module/
-    UDT/routine *names* to be correctly identified and included, not their values decoded
-    correctly) — but any future work rendering an AOI-typed tag's own current value, or an AOI's
-    own parameter/local-tag default values, should start here rather than assume the existing UDT
-    value-decode pipeline already handles AOIs correctly.
+    **RESOLVED — see "AOI instance value decoding (`TestFPM`/`AOI_RPMtoFPM`) — fully resolved" much
+    further below in this file.** The gap documented in this paragraph (originally written as
+    "deeper, NOT-yet-solved") turned out to be entirely explained by bugs fixed much later in this
+    same session (the `BIT`-overlay `Target` resolution work, `_tag_value_blob_offset()`, the
+    `USINT`/`UINT`/`UDINT`/`ULINT` `_PRIM` gap, and finally a one-line scalar-vs-member Decorated
+    NaN/Infinity fix) — re-verified against this EXACT same real `TestFPM` tag and found to now be a
+    complete, exact match (both `<Data Format="L5K">` and `<Data Format="Decorated">`) against the
+    real Studio 5000 export. The specific sub-points below are kept, struck through in spirit but not
+    in text (per this file's own "retract in place, don't delete" convention), each annotated with
+    what actually explains it:
+    - "Two members silently missing... `EnableIn`/`EnableOut`" — explained by the `BIT`-overlay
+      `Target`-resolution work (a separate round, well before this retraction): these ARE correctly
+      decoded as `BIT`-overlay pseudo-members today (`hidden=False`, `bit_number=0`/`1`,
+      `target="__BitHost00"`), not independent hidden `BOOL`s — whatever this paragraph originally
+      saw was already fixed by the time of the re-verification, this note just hadn't been updated.
+    - "17 comma-separated values; ours has only 8... L5K encodes something beyond even the full
+      named-Parameter list, quite possibly LocalTags... plus the leading value 3" — this was simply
+      CORRECT, and remains correct: the leading `3` is `EnableIn`/`EnableOut` BIT-packed into their
+      shared hidden backing DINT (`1<<0 | 1<<1 = 3`) — not a mystery execution-state field — and the
+      trailing values beyond the 8 named parameters really are the AOI's own 8 hidden `LocalTags`
+      (`CalculatedCurrentMotorRPM`, `GearBoxOutputShaftRPM`, `CalculatedHzReal`, `GearboxInputRatio`,
+      `GearBoxInputShaftRPM`, `GearboxOutputRatio`, `DrivenShaftRPM`, `DrivenRimRPM`), confirmed by
+      direct count (`1 + 8 + 8 = 17`). The GENERIC member-list-walk this codebase already uses for
+      every UDT (not a special AOI-specific mechanism) was already producing this correctly by the
+      time of re-verification; nothing additional was needed once the BIT-overlay and `_PRIM` fixes
+      landed.
+    - "`<Structure DataType=...>` casing" — already correct at re-verification time (renders
+      `AOI_RPMtoFPM`, matching real output exactly); whatever produced the all-caps case originally
+      must have been fixed by an unrelated `display_name`-lookup fix elsewhere in this session.
+    - `<DefaultData Format="L5K">`/`<DefaultData Format="Decorated">` — genuinely NOT part of this
+      resolution, still out of scope: that's an AOI Parameter/LocalTag's own DEFAULT value (defined
+      on the AOI itself), a completely different concept from an INSTANCE TAG's current value (what
+      this whole section is about) — see the separate "PARKED, NOT IMPLEMENTED: AOI Parameter/
+      LocalTag `DefaultData`" section elsewhere in this file for that investigation's own, still-open
+      status (encoding fully solved, AOI→blob link not found).
 
 ## `export_routine()` for ST routines — dependency scan was RLL-only
 
@@ -5930,6 +5926,55 @@ Covered by `test_decode_single_udt_element_unsigned_integer_members_not_empty_di
 large enough to be unambiguous — e.g. `200` for `USINT`, which would read as negative if the bytes were
 ever misinterpreted as signed `SINT`), `test_get_type_size_unsigned_integer_types`, and
 `test_udt_scalar_to_xml_renders_unsigned_integer_member` — `test/test_elements_helpers.py`.
+
+## AOI instance value decoding (`TestFPM`/`AOI_RPMtoFPM`) — fully resolved
+
+Follow-up-of-our-own-accord (the user asked "is there a known bug worth fixing," this was the
+recommended candidate given the recent `_PRIM` fix might have closed it): re-ran the long-parked
+`TestFPM`/`AOI_RPMtoFPM` real-ground-truth comparison from the "Lookup/editing convenience API"
+investigation (see the "RESOLVED" note just above this section) against the exact same real project
+(`BPM_TrimmerSorter_20260707.ACD`, found on disk at `..._OLD\BPM_TrimmerSorter_20260707.ACD`,
+alongside its own real Studio 5000 whole-project export `..._OLD\BPM_TrimmerSorter_20260707.L5X`).
+
+**Result: the L5K side was ALREADY a complete, exact match** (confirmed via direct Python string
+comparison of the full 17-value literal, `ours == real` → `True`) — every fix landed between the
+original investigation and now (BIT-overlay `Target` resolution, `_tag_value_blob_offset()`, dead-
+member-byte corrections, and especially the `USINT`/`UINT`/`UDINT`/`ULINT` `_PRIM` fix from earlier
+today) collectively closed the whole gap for L5K with no further work needed.
+
+**One remaining, genuine discrepancy found and fixed**: the Decorated block's `SurfaceFPM` member
+(a scalar `REAL`, real value `+Infinity` — never statically configured, a runtime-computed quantity)
+rendered as `Value="1.#INF"`; real Studio shows `Value="1.$"` — the exact same truncated form already
+established (and tested) for a literal array Element's own NaN/Infinity Decorated value, which this
+codebase's own earlier documentation had explicitly flagged as "inferred by direct symmetry... not
+independently observed" for the SCALAR case. That inference was wrong: the truncation quirk is
+apparently triggered by going through Studio's shared member-traversal exporter at all (whether a
+literal array Element or an ordinary struct/AOI member), not specifically by being inside an array.
+Root cause: `_udt_scalar_to_xml()`'s own scalar-member branch (`rendering.py`) called
+`_decorated_real_literal(val, in_array=False)` — the same call used for a top-level scalar TAG's own
+Decorated value (independently confirmed elsewhere to correctly use the bare `"1.#QNAN"` label, no
+truncation) — when it should have used `in_array=True` (the array-Element code path) instead, despite
+`SurfaceFPM` not literally being inside an array.
+
+Fixed by changing that one call site to `in_array=True`, with a comment explaining why a non-array
+member uses the "array" formatting path. **Re-verified end-to-end**: with this fix, the ENTIRE
+Decorated block for the real `TestFPM` tag matches the real Studio export element-for-element,
+attribute-for-attribute, value-for-value (whitespace/newline formatting aside, which this codebase
+has never targeted byte-for-byte — every other verification in this file treats that as cosmetic).
+
+Covered by `test_udt_scalar_to_xml_scalar_member_infinity_uses_truncated_form`
+(`test/test_elements_helpers.py`) — the existing `test_decorated_real_literal_scalar_nan`/
+`test_decorated_real_literal_array_infinity_matches_real_quirk` tests (which exercise the OTHER,
+unchanged call site — a top-level scalar tag's own value) continue to pass unchanged, confirming this
+fix is correctly scoped to the UDT/AOI-member rendering path only.
+
+**Practical note for anyone re-opening this investigation further**: the real ground-truth files used
+here (`BPM_TrimmerSorter_20260707.ACD`/`.L5X`, under this machine's
+`Documents\PLC_Claude_Code\Bethel_Planer\_OLD\` directory) are NOT part of this repo and won't be
+available in a fresh clone or on a different machine — they're kept on disk from earlier work in this
+same long-running session. If revisiting this area later without access to that directory, a fresh
+real sample (any AOI instance tag with a non-finite REAL member, ideally also exercising BIT-overlay
+system params and at least one LocalTag) would be needed to re-confirm or extend this.
 
 ## Testing gotchas
 

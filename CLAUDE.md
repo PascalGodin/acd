@@ -5343,6 +5343,11 @@ projects:
   a real, working cross-reference database for things like instance-tag call sites), but the
   blob's own `object_id` appears **zero** times anywhere in the same file.
 
+**UPDATE — `XRefs.Dat` has since been fully decoded and ruled out as this link's home** (every
+record's two object-id fields are now understood and resolve 100%; none of the `DefaultData` blobs
+appear in any record — see "`XRefs.Dat` — decoded" below). The paragraph that follows is kept as
+written at the time.
+
 **Most promising un-attempted next step**: `XRefs.Dat` is the one file in the whole container this
 codebase has genuinely never reverse-engineered at all (`record_format 132; DbExtract refuses it`,
 per the "ACD write-back" section above) — its own object_id NOT appearing as a raw little-endian
@@ -5976,85 +5981,82 @@ same long-running session. If revisiting this area later without access to that 
 real sample (any AOI instance tag with a non-finite REAL member, ideally also exercising BIT-overlay
 system params and at least one LocalTag) would be needed to re-confirm or extend this.
 
-## `XRefs.Dat` — substantially reverse-engineered for the first time; a real cross-reference index, NOT where the AOI DefaultData link lives
+## `XRefs.Dat` — decoded; loaded into an `xrefs` table on every load
 
-Picked up as a deliberate research task (the user asked "what's still unresolved," this was chosen
-as the most promising/hardest remaining item) — `XRefs.Dat` had never been reverse-engineered at all
-before this (`record_format 132`; `DbExtract`'s own generic `.Dat` header parser explicitly refuses
-it: `"Cross Reference Databases Not Supported"`, a harder block than the "doesn't recognize this
-record type" gap this codebase has for a couple of `Comps.Dat` record markers).
+`XRefs.Dat` is Studio 5000's own cross-reference index: one record per "X references Y" relationship
+(rung → tag operand, tag → its DataType, alias → target, program → main routine, task → scheduled
+program, UDT → member type, AOI → DataType it depends on, MSG ↔ config ↔ source tag, ...). It can't go
+through the generic `DbExtract`/Kaitai `Dat` reader — records have no `FAFA`/`FDFD` framing at all —
+so `acd/record/xrefs.py` (`parse_xrefs()`) reads it directly, and `ExportL5x` loads every live record
+into an `xrefs` table (`from_id, to_id, access, kind, instruction, bit_offset, bit_width, scope_id,
+routine_id, count`, indexed on `from_id`/`to_id`). A missing/unrecognized file degrades to an empty
+table with a warning (`_read_xrefs()`), same policy as `_parse_records()`. Nothing consumes the table
+yet — it's there for future features.
 
-**Method, same as every other format this codebase has cracked**: used the exact real, isolated
-single-edit triad already on disk from the earlier "ACD write-back" investigation
-(`..._OLD\BPM_TrimmerSorter_20260707.ACD`/`..._STUDIO_NOOP.ACD`/`..._STUDIO_EDITED.ACD` — one known
-rung added, one new tag created, nothing else touched) — no new data needed. `ExportL5x` never reads
-`XRefs.Dat` at all (nothing in `export_l5x.py` references it), so extracting it via
-`ExportL5x(..., _temp_dir=...)` and reading the raw bytes directly works fine without touching the
-generic `.Dat` reader that refuses it.
+**Layout** (little-endian; full field docs in `acd/record/xrefs.py`'s module docstring): the generic
+`.Dat` header is the same as every other file (u32@0 = file length − 1, u32@4 = head of the free-slot
+chain, u32@8 = end of records, u32@12 = region-pointer offset, u32@0x18 = live-record count **+ 1**,
+held exactly on every file checked); records start at the records-region offset (u32 at region
+pointer + 18) plus that region's header length (u32 at records region + 2) — 2346 in most files, but
+11316 in one real project, so it must come from the header. Each record is a fixed **46 bytes**:
+`[0:2]` status (`0x0000` live; first byte `0xFF` = free slot whose `[1:5]` is the next free slot's
+offset, a clean chain ending at 0), `[2:6]` from_id, `[6:10]` to_id, `[10:12]` access (1 read, 2 write,
+3 read+write; 5 seen inside FBD), `[12:14]` kind, `[14:18]` instruction code, `[18:22]` bit offset into
+the referenced tag, `[22:26]` bit width (`0xFFFFFFFF` = not a data reference), `[26:34]` sub-location
+(not decoded — `fe ff ff ff ff ff ff ff` for rung refs; a small int + a Nameless object id for ST),
+`[34:38]` scope_id (program or AOI id of the referencing code), `[38:42]` routine_id, `[42:46]` count.
+The region-header length field next to the region marker reads 46 for this file but 44 for
+`RegnLink.Dat` (22-byte records) and 31 for variable-length files, so it is NOT treated as the record
+size — 46 is a verified constant for this format.
 
-**Solved**:
-- **Record shape**: a dense array of fixed **46-byte records** (97%+ of the file; found by searching
-  for a constant 8-byte sentinel `fe ff ff ff ff ff ff ff` that reliably ends every one — 37,817
-  records in this real project, spaced exactly 46 bytes apart in the overwhelming majority of cases).
-- **The core payload — two 4-byte object_id fields at FIXED relative offsets 14 and 18** — a
-  `(referencing_object → referenced_object)` pair. Verified two independent ways: (1) diffing
-  `noop` against `edit` directly (not `orig` against either — both later saves touch nearly identical
-  regions relative to `orig` regardless of the real edit, consistent with this codebase's own
-  established "every `.Dat`/`.Idx` header has a save-generation counter that bumps on every save"
-  finding; `noop` vs `edit` cancels that noise and isolates just the real content change) found the
-  record whose offset-14/18 fields changed from a stale pair to EXACTLY `(0x17c4b9bd, 0x114ef0d5)` —
-  the real rung object_id and the real `BitFlags` tag object_id from that exact known edit
-  (`OTE(BitFlags[21])` appended to that rung), confirmed against `Comps.Dat` directly; (2) broadly,
-  across all 37,817 records project-wide, the second field (offset 18) resolves to a real `comps`
-  object 97.9% of the time, with consistently sensible pairs (`tag → its own DataType`,
-  `AOI → a DataType/module it depends on` — including `AOI_SNTP_QUERY → DateTime`, the exact GSV/SSV
-  system-object dependency flagged as an unresolved gap much earlier in this file's own AOI/Module/JSR
-  dependency-closure work).
-- **A `type` field** (4-byte u32 at relative offset 8): 16+ distinct values observed, but overwhelmingly
-  dominated by `type=1` (90% of all records) — every value, not just `1`, resolves to the same basic
-  `object → its own type` relationship; `type` appears to encode the CIP/Rockwell category of the
-  REFERENCING object (plain tag vs. I/O module/connection vs. AOI vs. ...) rather than a different
-  kind of relationship altogether — not fully mapped value-by-value, but the dominant case alone
-  already accounts for the large majority of the file.
-- **Ruled out, definitively, with a completely assumption-free check**: this is NOT where the AOI
-  Parameter/LocalTag `DefaultData` blob link lives (see the separate "PARKED" section on that above).
-  A raw byte search for all 3,223 known `$hex$`-named `DefaultData` blob object_ids anywhere in this
-  project's `XRefs.Dat` — not relying on the record-shape hypothesis at all, a pure substring search
-  — found **zero** matches. `XRefs.Dat` is a logic/type cross-reference index (what references what),
-  not an AOI-own-default-value index; that investigation's own next lead (`XRefs.Dat`) is now closed
-  out as a dead end specifically, not just still-open.
+**What each field means, verified on real data**:
+- `from_id`/`to_id` resolve **100%** in every file checked — to a Comps object, a rung (SbRegion), or a
+  Nameless object (ST/FBD/SFC compiled code lines) — 40,255 + 4,608 + 849 + 853 + 847 live records.
+- `scope_id`/`routine_id` are the program (or AOI) and routine the referencing code lives in,
+  `0xFFFFFFFF` when the relationship isn't code (e.g. tag → DataType).
+- `bit_offset`/`bit_width` locate the referenced bits: `TL_T4[10]` (TIMER) → 960 / 96; `TRAY_BITS[6].4`
+  → 6×32+4 / 1; `HTV_Set_Accum[5]` (DINT) → 160 / 32; a STRING → width 704 (88 bytes).
+- `instruction` is a small alphabetical enumeration for built-ins, confirmed ≥95% from single-occurrence
+  references: ADD 8, BSL 25, BTD 28, CLR 31, COP 33, CPT 35, CTD 36, CTU 37, DIV 40, EQU 42, FFL 47,
+  FFU 48, FLL 49, GEQ 53, GRT 55, GSV 56, JMP 60, JSR 61, LBL 62, LEQ 63, LES 64, LIM 67, MEQ 88, MOD 94,
+  MOV 95, MSG 100, MUL 102, NEQ 105, ONS 111, OTE 115, OTL 116, OTU 117, RES 121, RET 122, RTO 123,
+  SSV 132, SUB 134, TOF 138, TON 139, XIC 143, XIO 144, CONCAT 158, SIZE 161, CPS 162. An AOI call gets a
+  large per-AOI code (derivation not decoded).
+- `kind` — the named values in `KINDS` (`xrefs.py`) are verified; e.g. 2 tag → DataType, 1 alias →
+  target, 3 I/O tag → module, 8 UDT → member type, 9 rung → tag, 10 rung → JSR routine, 13 code → GSV/SSV
+  object, 14 code → label, 15 program → main routine, 32 task → program, 115 AOI → DataType, 137 ST →
+  tag, 157 code → UDT member. 135/136/97 are compiler-internal links between Nameless code objects of
+  ST/SFC/FBD routines (both ends Nameless); trends, motion groups, axes and MSG configs have their own.
+- `count` is a multiplicity — for kind 8 it's how many members of the UDT have that type, counting a
+  BIT-overlay member as BOOL (1,343 / 1,343 matched).
 
-**NOT solved — an 8-byte "key" field** (relative offset 0, before the `type`/object-id fields):
-tried the two cheapest hypotheses, both cleanly disproven with real data rather than left as guesses:
-- **Not a per-routine/per-owner grouping key**: only 181 distinct key values across all 37,817
-  records (suspiciously close to this project's own real routine count, 177 — tempting, but false:
-  picked one real key value and found its own 439-record group spans object names from completely
-  unrelated parts of the project — `Skid`, `FenceGate`, `MMI_BITS`, `Tray8_Timers`, `DINTS_MISC`,
-  etc. — with no common routine/program ancestor at all).
-- **Not a simple modulo-hash bucket of either object-id field**: checked `f2 % N`/`f3 % N` for
-  N ∈ {32, 64, 128, 181, 256} within one key's own group — none collapse to a single value (a true
-  modulo-bucket scheme would), ruling out the simplest hash-table theories.
-- Leading, unconfirmed guess: likely a B-tree/hash-index internal navigation key (bucket chain
-  pointer or similar), possibly tied to `XRefs.Idx` (786KB in this same project, never even glanced
-  at this round) rather than carrying any semantic meaning of its own — but this is genuinely a guess,
-  not verified, and stated as such.
+**Cross-checked against data this library already decodes independently** (real 18,967-object
+project): tag → DataType 3,051 / 3,051; alias → target 154 / 154 (14 aliases have no alias record) once
+the target's internal comp_name `&0d2a0e85:0:I` has its `&hexid` module prefix resolved — the same
+convention rung text uses; task → scheduled programs 3 / 3; rung references whose tag name literally
+appears in the rung text 314 / 315 in `CuteLogix.ACD` — the one exception is real behavior, not a decode
+error: a tag configured *inside* a message (`XIC(Toggle)MSG(WebPage);` → `DisableWeb`) is attributed to
+the rung holding the `MSG`. In the isolated noop → edit pair, adding `OTE(BitFlags[21])` to one rung added
+exactly one live record: `(rung, BitFlags, access 2, kind 9, OTE, bit 21, width 1, Continuous/Flasher)`.
 
-**Practical takeaway, independent of the unsolved key field**: the two object-id fields alone are
-already enough to answer "what does X reference" / "what references X" reliably via a linear scan —
-no feature currently in this library needs the key field's own semantics to use this data. This could
-plausibly replace or strengthen `_resolve_type_closure()`'s/`_referenced_tag_names()`'s current
-approach (walking the in-memory object graph / regex-scanning rung text) with a real, authoritative,
-Rockwell-maintained index instead — not implemented as an actual library feature this round, this was
-purely the reverse-engineering investigation itself; revisit if/when there's a concrete reason to
-expose it.
+**Correction of the first pass at this (kept so nobody re-treads it)**: an earlier session framed records
+by searching for the `fe ff ff ff ff ff ff ff` bytes and assumed they *ended* each record — they're in the
+middle (`[26:34]`). That shifted every record by 12 bytes, so its "8-byte key" and "type" were actually the
+*previous* record's `scope_id`/`routine_id`/`count`, which is why the "key" looked like 181 unrelated hash
+buckets instead of the (program, routine) pair it is. Starting from the header's own records offset fixed it.
 
-**If picking this back up**: the real triad used here
-(`BPM_TrimmerSorter_20260707(.ACD/_STUDIO_NOOP.ACD/_STUDIO_EDITED.ACD)`, same machine, same
-`..._OLD\` directory already referenced elsewhere in this file) has plenty more real, resolvable
-object-id pairs to mine for the `type` field's own fine-grained meaning, and the project's own
-`XRefs.Idx` is sitting right next to `XRefs.Dat`, completely unexamined — the most promising next
-step for the `key` field specifically, by direct analogy with how `RegnLink.Idx` turned out to hold
-the answer `RegnLink.Dat` alone couldn't give for rung-comment attribution.
+**Not where the AOI `DefaultData` link lives** — still true after the full decode: none of 3,223 known
+`DefaultData` blob object ids appear in any field of any record (a raw byte search too).
+
+**Found along the way, not acted on**: `ProgramBuilder`'s footer-based `MainRoutineName` decode returns
+`None` for every program in `CuteLogix.ACD` (this repo's main fixture) and in the older real
+`BPM_TrimmerSorter_20260707.ACD`, while kind-15 records give the right answer (`Branching → B001_Main`,
+`Duh → Stupid`; and the same main routines this file already documents for the BPM project). On the newer
+`VAB_SQL.ACD` both agree. Kind 15 would make a reliable source or fallback — not wired in.
+
+Covered by `test/test_xrefs.py`: synthetic records (live + free slot), header rejection, missing/bad file
+degradation, and against `CuteLogix.ACD` — row count vs the header's own count, every `to_id` resolving,
+program main routines, tag DataTypes, UDT member-type counts, and rung references appearing in rung text.
 
 ## Testing gotchas
 

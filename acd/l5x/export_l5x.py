@@ -23,6 +23,23 @@ from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
 from acd.record.nameless import NamelessRecord
 from acd.record.sbregion import SbRegionRecord
+from acd.record.xrefs import parse_xrefs
+
+
+def _read_xrefs(dat_path: str) -> list:
+    """XRefs.Dat rows for the `xrefs` table, or [] (with a warning) if the
+    file is missing or its header isn't the layout parse_xrefs() expects --
+    same degrade-don't-abort policy as _parse_records() for the other .Dat
+    files, since nothing else in a load depends on this table."""
+    if not os.path.exists(dat_path):
+        log.warning(f"XRefs: file not found at {dat_path} - skipping")
+        return []
+    try:
+        with open(dat_path, "rb") as f:
+            return parse_xrefs(f.read())
+    except (ValueError, struct.error) as e:
+        log.warning(f"XRefs: unreadable database file ({e!r}) - skipping")
+        return []
 
 
 def _dedupe_comps_records(tuples: List[tuple]) -> Dict[tuple, tuple]:
@@ -319,6 +336,11 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE regnlink_chain(routine_id int, own_rung int, next_rung int)"
         )
+        log.debug("Create Xrefs table in sqllite db")
+        self._cur.execute(
+            "CREATE TABLE xrefs(from_id int, to_id int, access int, kind int, instruction int, "
+            "bit_offset int, bit_width int, scope_id int, routine_id int, count int)"
+        )
 
         log.info("Extracting ACD database file")
         unzip = Unzip(self.input_filename)
@@ -432,6 +454,13 @@ class ExportL5x:
         self._cur.executemany("INSERT INTO nameless VALUES (?,?,?)", nameless_tuples)
         self._db.commit()
 
+        log.info("Getting records from ACD XRefs file and storing in sqllite database")
+        self._cur.executemany(
+            "INSERT INTO xrefs VALUES (?,?,?,?,?,?,?,?,?,?)",
+            _read_xrefs(os.path.join(self._temp_dir, "XRefs.Dat")),
+        )
+        self._db.commit()
+
         log.info("Creating indexes for fast object graph queries")
         self._cur.execute("CREATE INDEX idx_comps_object_id ON comps(object_id)")
         self._cur.execute("CREATE INDEX idx_comps_parent_id ON comps(parent_id)")
@@ -440,6 +469,8 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent, scope_id)")
         self._cur.execute("CREATE INDEX idx_nameless_parent_id ON nameless(parent_id)")
+        self._cur.execute("CREATE INDEX idx_xrefs_to_id ON xrefs(to_id)")
+        self._cur.execute("CREATE INDEX idx_xrefs_from_id ON xrefs(from_id)")
         self._db.commit()
 
     @staticmethod

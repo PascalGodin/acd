@@ -23,7 +23,7 @@ Professional license, and Python 3.12/3.13 with both acd-tools and the SDK's
 
 Usage:
     python scripts/sdk_compare.py PROJECT.ACD OUTDIR [--program NAME]
-        [--kinds routine,program,aoi] [--limit N] [--no-import]
+        [--kinds routine,program,aoi] [--limit N] [--no-import] [--diff-only]
 
 Writes OUTDIR/report.md (summary by difference category) and
 OUTDIR/report.json (every difference and import message per object).
@@ -53,13 +53,18 @@ from acd.api import export_aoi, export_program, export_routine, load_acd
 # Attributes that legitimately differ per export run, or are known,
 # accepted differences (see CLAUDE.md "GSV/SSV objects and
 # MESSAGE-configured tags as export context").
-IGNORED_ATTRS = {"ExportDate", "Owner", "ExportOptions", "OpcUaAccess"}
+# SoftwareRevision: the SDK opens a project in the installed Studio version
+# and stamps that on its exports. DataExchangeId: a per-tag GUID Studio adds
+# in its own export, like OpcUaAccess.
+IGNORED_ATTRS = {
+    "ExportDate", "Owner", "ExportOptions", "OpcUaAccess", "SoftwareRevision", "DataExchangeId",
+}
 
 # Containers whose children are an unordered set of named objects (Studio
 # sorts some alphabetically, acd-tools uses project order -- not meaningful).
 UNORDERED_CONTAINERS = {
     "DataTypes", "Modules", "AddOnInstructionDefinitions", "Tags", "Tasks",
-    "Dependencies", "Programs", "LocalTags",
+    "Dependencies", "Programs", "LocalTags", "Comments",
 }
 
 
@@ -82,8 +87,10 @@ class _Collector(OperationEvent):
 def _normalize(elem):
     """Drop what is known and accepted to differ, in place."""
     for child in list(elem):
-        if child.tag == "DataType" and child.get("Class") == "ProductDefined":
-            elem.remove(child)  # the SDK export adds these; the GUI export doesn't
+        if child.tag == "DataType" and child.get("Class") in ("ProductDefined", "IO"):
+            elem.remove(child)  # the SDK export adds these (ProductDefinedTypes); the GUI export doesn't
+        elif child.tag == "Tag" and ":" in (child.get("Name") or ""):
+            elem.remove(child)  # I/O tags: the SDK export adds them (IOTags); the GUI export doesn't
         elif child.tag == "DefaultData":
             elem.remove(child)  # AOI DefaultData: parked, see CLAUDE.md
         elif elem.tag == "Tag" and elem.get("DataType") == "MESSAGE" and child.tag == "Data":
@@ -104,6 +111,10 @@ def _label(elem):
         name = elem.get("Number")
     if name is None and elem.tag in ("Data", "DefaultData"):
         name = elem.get("Format")
+    if name is None and elem.tag == "Comment":
+        name = elem.get("Operand")
+    if name is None and elem.tag == "Element":
+        name = elem.get("Index")
     return f"{elem.tag}[{name}]" if name is not None else elem.tag
 
 
@@ -113,7 +124,9 @@ def _text(elem):
 
 def _diff(a, b, path, out):
     """Studio (a) vs acd-tools (b). Appends (category, detail) tuples."""
-    gpath = re.sub(r"\[[^\]]*\]", "", path)  # path with names stripped, for grouping
+    # path with names stripped, for grouping (a name can itself contain
+    # brackets, e.g. Element[[0,1]] or Comment[[3].5])
+    gpath = re.sub(r"\[(?:[^\[\]]|\[[^\]]*\])*\]", "", path)
     for k in sorted(set(a.attrib) | set(b.attrib)):
         va, vb = a.get(k), b.get(k)
         if va != vb:
@@ -205,8 +218,26 @@ def collect_objects(project, kinds, program_filter, limit):
     return objs[:limit] if limit else objs
 
 
+def rediff(out):
+    """Re-run only the diff over a previous run's files (after changing the
+    comparer's normalization), keeping its import results."""
+    results = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    for res in results.values():
+        res.pop("diffs", None)
+        res.pop("diff_error", None)
+        if "ours" in res and "studio" in res:
+            try:
+                res["diffs"] = compare_files(res["studio"], res["ours"])
+            except Exception:  # noqa: BLE001
+                res["diff_error"] = traceback.format_exc(limit=2)
+    write_reports(out, results)
+
+
 async def run(args):
     out = Path(args.outdir).resolve()
+    if args.diff_only:
+        rediff(out)
+        return
     (out / "ours").mkdir(parents=True, exist_ok=True)
     (out / "studio").mkdir(parents=True, exist_ok=True)
     work = out / "work_export.ACD"
@@ -330,6 +361,8 @@ def main():
     ap.add_argument("--kinds", default="routine,program,aoi")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-import", action="store_true")
+    ap.add_argument("--diff-only", action="store_true",
+                    help="re-diff OUTDIR's existing files (no export/import); ACD is ignored")
     args = ap.parse_args()
     asyncio.run(run(args))
 

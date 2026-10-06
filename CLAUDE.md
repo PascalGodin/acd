@@ -6235,6 +6235,53 @@ Still differing, each with no import message:
   large UDT and for `HTV_Packs[50,50,30]`, while smaller multi-dimensional arrays get both, so it looks
   like a size cutoff, not yet pinned down.
 
+**Second run, `BPM_TrimmerSorter_20260827_Before.ACD`** (V38.02, 158 objects, about 21 min with
+imports): every import was clean, 0 warnings or errors. But the diff found three real bugs Studio
+accepts silently:
+
+1. **Tag descriptions replaced by GUIDs.** V38 stores each tag's `DataExchangeId` GUID as a
+   Comments.Dat ASCII record (`object_id` 45) under the same key as the tag's description
+   (`object_id` 1). In this project all 345 kind-45 records were GUIDs, and every GUID record was
+   kind 45. The comment dedup keeps the longest text, so the 38-character GUID won over 88 real
+   descriptions (e.g. alias `GetDiverterShifts`, "Get / Diverter / Shifts"), and tags with no
+   description got the GUID as one. An import would overwrite real descriptions with GUIDs, with no
+   warning. Fixed: `_is_data_exchange_id()` drops them in `_dedupe_comments()` (`export_l5x.py`, the
+   dedup moved out of `__post_init__` for testing). Earlier description verification was on a V32
+   save, which has no such records. Covered by `test_dedupe_comments_*` and
+   `test_is_data_exchange_id_*` (`test/test_database.py`).
+2. **Primitive tags ignored their own radix.** `Tag.to_xml()` always used the type default
+   (`_PRIMITIVE_RADIX`), so a `Binary` or `ASCII` tag rendered `Radix="Decimal"` with plain numbers.
+   Studio's formats, from its own exports:
+   - Binary: `2#0000_..._0100_0011`, the existing `_decorated_binary_literal()`; a Binary BOOL stays
+     plain `0`/`1`.
+   - ASCII: the value's bytes most significant first, quoted, unprintables as `$XX`
+     (`INT 16717 -> 'AM'`, `0 -> '$00$00'`).
+
+   Now `_tag_decorated_radix()` uses the tag's radix for Decimal, Float, Binary and ASCII. Hex and
+   Octal value formats never appeared in a real export, so those tags keep the type default.
+3. **Multi-dimensional array element indexes were flattened.** Element 1 of a `[90,245]` array was
+   `Index="[1]"`; Studio writes `[0,1]`, last dimension fastest (`_array_index()`).
+
+After 2 and 3, seven sample tags matched Studio's Decorated output exactly, including a 22,051-element
+2-D array. Covered by `test_decorated_ascii_literal_*`, `test_array_index_*` and `test_tag_to_xml_*_radix*`
+(`test/test_elements_helpers.py`).
+
+The comparer was also fixed for SDK-specific output it had treated as differences:
+- The SDK export carries `ProductDefinedTypes IOTags`, so it adds `Class="IO"` DataTypes and I/O tags.
+- It stamps the installed Studio version as `SoftwareRevision`.
+- It adds `DataExchangeId` attributes.
+- `<Comment>` elements are matched by `Operand`, array `<Element>`s by `Index`.
+
+It also gained `--diff-only`, which re-diffs an existing run without exporting or importing again.
+
+Still open after this run, beyond the VAB_SQL list above:
+- L5K value differences on 38 objects (e.g. a string member `port=1233` vs ours `port=123`; LINT
+  values).
+- Structure member values differing on 9 objects.
+- Context sets differing slightly: 8 extra and 5 missing tags, 12 extra modules.
+- `Constant="false"` on InOut AOI parameters where Studio has none.
+- 8 tag comments with different text.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

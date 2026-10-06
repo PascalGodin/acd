@@ -552,7 +552,7 @@ class Tag(L5xElement):
                 data_xml = (
                     f'<Data Format="L5K">\n<![CDATA[{l5k_body}]]>\n</Data>'
                     f'<Data Format="String" Length="{length}">\n'
-                    f'{_string_literal_cdata(text)}\n</Data>'
+                    f'{_string_literal_cdata(text, empty_quoted=True)}\n</Data>'
                 )
 
             elif isinstance(iv, dict):

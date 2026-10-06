@@ -731,6 +731,45 @@ def test_l5k_string_padded_still_escapes_control_chars():
     assert result == "'$00$1B'"
 
 
+def test_string_literal_cdata_escapes_control_and_non_ascii_as_dollar_hex():
+    # Real Studio export of a binary STRING_480 tag's <Data Format="String">
+    # and of a Decorated DATA member: '$10$01$00$D6...p$00...'. We used to
+    # write XML character references (&#x0010;), which Studio reads as a
+    # different string and rejected on import ("Invalid size.").
+    from acd.l5x.elements.rendering import _string_literal_cdata
+    assert _string_literal_cdata("\x10\x01\x00\xd6p") == "<![CDATA['$10$01$00$D6p']]>"
+    assert _string_literal_cdata("192.168.5.100?port=1433") == "<![CDATA['192.168.5.100?port=1433']]>"
+    assert _string_literal_cdata("a$b") == "<![CDATA['a$$b']]>"
+
+
+def test_string_literal_cdata_empty_forms():
+    # 1,444 real empty Decorated DATA members are bare; 10 real empty
+    # <Data Format="String"> blocks are ''.
+    from acd.l5x.elements.rendering import _string_literal_cdata
+    assert _string_literal_cdata("") == "<![CDATA[]]>"
+    assert _string_literal_cdata("", empty_quoted=True) == "<![CDATA['']]>"
+
+
+def test_string_tag_string_format_block_uses_dollar_escapes_and_quoted_empty():
+    from acd.l5x.elements import DataType, new_member, new_tag
+    string_dt = DataType("STRING_8", "STRING_8", "StringFamily", "User", [
+        new_member("LEN", "DINT"),
+        new_member("DATA", "SINT", dimension=8, radix="ASCII"),
+    ])
+    types = {"STRING_8": string_dt}
+
+    def render(value):
+        tag = new_tag("T", "STRING_8")
+        tag._initial_value = value
+        tag._data_types_map = types
+        return tag.to_xml()
+
+    binary = render({"LEN": 3, "DATA": "\x10\x00\xd6"})
+    assert "<![CDATA['$10$00$D6']]>" in binary
+    assert "&#x" not in binary
+    assert "<![CDATA['']]>" in render({"LEN": 0, "DATA": ""})
+
+
 def _rx_generic_header(cip_type=999):
     # 14-byte fixed header + 60-byte opaque main_record, enough for
     # RxGeneric.from_bytes() to parse regardless of cip_type (main_record
@@ -1032,6 +1071,55 @@ def test_aoi_builder_orders_parameters_by_member_ref_not_seq_number():
         "Parameters must be ordered by member_ref (the real Rockwell order key), "
         "not by seq_number/insertion order"
     )
+
+
+def _order_list_record(oids) -> bytes:
+    """A Nameless ordered-id-list record: u16 count at 24, then u32 ids."""
+    return b"\x00" * 24 + struct.pack("<H", len(oids)) + b"".join(struct.pack("<I", o) for o in oids)
+
+
+def test_aoi_builder_orders_by_nameless_display_list_over_member_ref():
+    # A real AOI whose parameters were reordered in Studio after creation
+    # (VAB_Unicode_To_ASCII_STRING: EN/DN/ER moved above Source/Dest) kept
+    # creation-order member_refs, so ordering by member_ref exported the
+    # wrong order -- which silently rebinds call-site arguments, since AOI
+    # calls are positional. Studio's real display order is an ordered id
+    # list in Nameless.Dat (AOI -> Nameless child -> one list for the
+    # parameters, one for the local tags); verified 40/40 against Studio's
+    # own export of a real project's 20 AOIs.
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE nameless(object_id int, parent_id int, record BLOB NOT NULL)")
+    db.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    cur = db.cursor()
+
+    AOI_ID, TAG_COLL_ID = 500, 501
+    rows = [
+        (AOI_ID, 0, "TestAOI", 0, 256, b"\x00" * 20),
+        (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""),
+        (_AOI_TAG_RECORD_DEFAULT_DT_OID, 0, "DINT", 0, 256, b""),
+        # member_ref (creation) order: Source, Dest, EN; then locals A, B.
+        (600, TAG_COLL_ID, "Source", 0, 256, _aoi_tag_record(10, is_param=True)),
+        (601, TAG_COLL_ID, "Dest", 0, 256, _aoi_tag_record(20, is_param=True)),
+        (602, TAG_COLL_ID, "EN", 0, 256, _aoi_tag_record(30, is_param=True)),
+        (610, TAG_COLL_ID, "A", 0, 256, _aoi_tag_record(40, is_param=False)),
+        (611, TAG_COLL_ID, "B", 0, 256, _aoi_tag_record(50, is_param=False)),
+    ]
+    cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", rows)
+    cur.executemany("INSERT INTO nameless VALUES (?,?,?)", [
+        (700, AOI_ID, b"\x00" * 32),                     # the AOI's Nameless child
+        (701, 700, _order_list_record([602, 600, 601])),  # display order: EN, Source, Dest
+        (702, 700, _order_list_record([611, 610])),       # local tags: B, A
+    ])
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+
+    assert [p.name for p in aoi.parameters] == ["EN", "Source", "Dest"]
+    assert [t.name for t in aoi.local_tags] == ["B", "A"]
 
 
 def test_aoi_builder_orders_local_tags_by_member_ref_too():

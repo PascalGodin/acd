@@ -3,6 +3,7 @@ import re
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import sqlite3
 from sqlite3 import Cursor
 from typing import Dict, List, Tuple, Union
 
@@ -528,6 +529,36 @@ def _st_line_order_index(rec: bytes) -> Union[List[int], None]:
     return [struct.unpack_from("<I", rec, 26 + i * 4)[0] for i in range(count)]
 
 
+def _aoi_member_display_order(cur: Cursor, aoi_object_id: int) -> Dict[int, int]:
+    """AOI parameter/local-tag object id -> position in Studio's own display
+    order (the Parameters / Local Tags tab order, which is also the order
+    an AOI call binds its arguments in).
+
+    Nameless.Dat holds it: the AOI's comps object has a Nameless child whose
+    own two children are ordered object-id lists in the same shape as an ST
+    region stub (see _st_line_order_index()) -- one for the parameters, one
+    for the local tags. Verified against Studio's own export of all 20 AOIs
+    in a real project (40/40 lists exact), including one whose parameters
+    had been reordered after creation, where member_ref order was wrong.
+    Returns {} when no list is found (callers fall back to member_ref).
+    """
+    try:
+        cur.execute(
+            "SELECT g.record FROM nameless c JOIN nameless g ON g.parent_id = c.object_id "
+            "WHERE c.parent_id = ?",
+            (aoi_object_id,),
+        )
+        rows = cur.fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    positions: Dict[int, int] = {}
+    for (rec,) in rows:
+        ids = _st_line_order_index(bytes(rec))
+        for i, oid in enumerate(ids or []):
+            positions.setdefault(oid, i)
+    return positions
+
+
 def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
     """Extract a Structured Text routine's source lines.
 
@@ -819,6 +850,7 @@ class AoiBuilder(L5xElementBuilder):
                 + " AND record_type != 512"
                 + " ORDER BY seq_number"
             )
+            child_rows = self._cur.fetchall()
             # NOTE: `seq_number` (used above only as a stable tiebreaker for the
             # rare case two children share the same real order key below) is NOT
             # a reliable Parameter/LocalTag declaration order on its own -- a
@@ -850,8 +882,16 @@ class AoiBuilder(L5xElementBuilder):
             # AOI could theoretically still export in creation order instead of
             # display order) -- revisit if a future real AOI with a known,
             # confirmed manual reorder disagrees with this.
+            # UPDATE: it did. A real AOI whose parameters had been reordered in
+            # Studio (VAB_Unicode_To_ASCII_STRING: EN/DN/ER moved above
+            # Source/Dest) still had creation-order member_refs. The real
+            # display order is an explicit list in Nameless.Dat -- see
+            # _aoi_member_display_order() -- which is now the primary key;
+            # member_ref remains the fallback for a child no list covers.
+            # (after the fetch above: this queries the same cursor)
+            display_pos = _aoi_member_display_order(self._cur, self._object_id)
             children_with_order: List[Tuple[int, int, bool, int]] = []
-            for child_oid, child_rec in self._cur.fetchall():
+            for child_oid, child_rec in child_rows:
                 child_rec = bytes(child_rec)
                 # Determine whether this is a parameter or a local tag by inspecting
                 # ext01[0x20E]: bits 0x04 (Input) or 0x08 (Output) indicate a parameter.
@@ -873,12 +913,15 @@ class AoiBuilder(L5xElementBuilder):
                 )
                 children_with_order.append((member_ref, child_oid, is_param, len(children_with_order)))
 
-            # Stable sort by the real order key (member_ref), falling back to
-            # the original seq_number-ordered position (the 4th tuple element)
-            # for the rare tie -- never observed in the one real AOI checked,
-            # but a safe, deterministic fallback rather than relying on
-            # whatever arbitrary order a tie happens to come back in.
-            children_with_order.sort(key=lambda t: (t[0], t[3]))
+            # Stable sort by the display-order list position, then member_ref,
+            # then the original seq_number-ordered position (the 4th tuple
+            # element) for the rare tie. Parameters and local tags have
+            # separate lists whose positions both start at 0; they're split
+            # into .parameters/.local_tags below, so that overlap is harmless.
+            children_with_order.sort(
+                key=lambda t: (0, display_pos[t[1]], 0, 0) if t[1] in display_pos
+                else (1, 0, t[0], t[3])
+            )
 
             for _, child_oid, is_param, _ in children_with_order:
                 if is_param:

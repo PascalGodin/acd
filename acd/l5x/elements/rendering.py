@@ -879,21 +879,36 @@ def _udt_array_to_xml(dt_base: str, values: List[dict],
         f'{"".join(elems)}</Array>'
     )
 # Logix STRING struct: DINT LEN (4 bytes) + SINT[82] DATA (82 bytes) + 2 bytes padding.
-def _string_literal_cdata(text: str) -> str:
+def _string_literal_cdata(text: str, empty_quoted: bool = False) -> str:
     """Format a decoded string value as Rockwell's quoted-literal CDATA content.
 
     Studio 5000 renders a non-empty STRING/string-family DATA member's text
     as ``<![CDATA['the text']]>`` -- wrapped in a CDATA section AND in
     literal single quotes (matching its L5K string-literal convention), with
-    any embedded single quote doubled (Pascal/Ada-style escaping). An empty
-    string renders as bare ``<![CDATA[]]>`` with no quotes at all. Both
-    verified against a real Studio 5000 L5X export.
+    any embedded single quote doubled (Pascal/Ada-style escaping).
+
+    Empty: a Decorated ``DATA`` member renders as bare ``<![CDATA[]]>``, but
+    a tag's ``<Data Format="String">`` block renders ``<![CDATA['']]>``
+    (pass ``empty_quoted=True``) -- 1,444 vs 10 real samples, no exception
+    either way.
+
+    Every control byte (0x00-0x1F, 0x7F) and non-ASCII byte (>0x7E) is a
+    ``$XX`` (uppercase hex) escape, the same as the L5K literal
+    (``_l5k_string_padded()``) -- e.g. ``'$10$01$00$D6...p$00...'``,
+    verified on 59 real values. These were previously XML character
+    references (``&#x0010;``), which Studio reads as different text: a real
+    import rejected a binary STRING_480 tag's data with "Invalid size."
+    A literal ``$`` becomes ``$$`` so it can't be read as an escape -- the
+    L5K convention, not independently observed in this format.
     """
     if not text:
-        return "<![CDATA[]]>"
-    escaped = text.replace("'", "''")
-    safe = _sanitize_xml_text(escaped)
-    return f"<![CDATA['{safe}']]>"
+        return "<![CDATA['']]>" if empty_quoted else "<![CDATA[]]>"
+    escaped = text.replace("$", "$$").replace("'", "''")
+    escaped = "".join(
+        f"${ord(ch):02X}" if ord(ch) < 0x20 or ord(ch) == 0x7F or ord(ch) > 0x7E else ch
+        for ch in escaped
+    )
+    return f"<![CDATA['{escaped}']]>"
 
 def _l5k_string_padded(text: str, capacity: int) -> str:
     """Format a string value as Rockwell's L5K array-literal string content.

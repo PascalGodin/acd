@@ -175,6 +175,14 @@ L5X, or the tag's `<Description>`). Getting the full address (`Tag[3].Flags.2`, 
      against a real non-blank custom string-family array tag. The `DATA` member's own text
      content is further wrapped as `<![CDATA['text']]>` (quoted L5K-style literal) when
      non-empty, or bare `<![CDATA[]]>` (no quotes) when empty — see `_string_literal_cdata()`.
+     **UPDATE:** two corrections, both from a real Studio export compared with the SDK (see
+     "Logix Designer SDK as a verification tool"):
+     - Control and non-ASCII bytes are `$XX` escapes (`'$10$01$00$D6...'`), as in L5K. They used to
+       be XML character references (`&#x0010;`), which made Studio reject a binary `STRING_480`
+       tag's import with "Invalid size.".
+     - The empty form depends on where it appears. A Decorated `DATA` member is bare
+       `<![CDATA[]]>` (1,444 real samples), but a tag's `<Data Format="String">` block is
+       `<![CDATA['']]>` (10 real samples).
 
 6. **L5X `<Comments>` emission** (`_build_comments_xml()` in `elements.py`, called from
    `Tag.to_xml()`): renders every non-empty-path entry in `tag._comments` as a standalone
@@ -4173,6 +4181,22 @@ AFTER initial authoring could theoretically still export in its original creatio
 current display order. No evidence either way has been found yet; revisit if a future real AOI with a
 KNOWN, confirmed manual reorder disagrees with this fix's output.
 
+**UPDATE — the caveat came true, and the real order source is now decoded.** The SDK comparison of
+`VAB_SQL.ACD` found `VAB_Unicode_To_ASCII_STRING`, whose parameters had been reordered after creation:
+- Studio: `EnableIn, EnableOut, EN, DN, ER, Source, Dest`.
+- Our member_ref order: `EnableIn, EnableOut, Source, Dest, ER, EN, DN`.
+
+Rockwell does not renumber `member_ref` on a reorder. The display order lives in Nameless.Dat:
+- The AOI's comps object has a Nameless child (32 bytes).
+- That child's own two children are ordered object-id lists in the ST region-stub shape
+  (`_st_line_order_index()`: u16 count at 24, then that many u32 ids, `26 + 4n == len`).
+- One list is the parameters, the other the local tags.
+
+Checked against Studio's own export of all 20 AOIs in that project: 40/40 lists exact.
+`_aoi_member_display_order()` reads them, and `AoiBuilder` sorts by list position first, then
+`member_ref` for any child no list covers. After the fix the whole project re-exported with no AOI
+order difference. Covered by `test_aoi_builder_orders_by_nameless_display_list_over_member_ref`.
+
 Covered by `test_aoi_builder_orders_parameters_by_member_ref_not_seq_number` and
 `test_aoi_builder_orders_local_tags_by_member_ref_too` (`test/test_elements_helpers.py`) -- a synthetic
 comps DB reproducing the exact real shape (three RxTagCollection children, all sharing one `seq_number`,
@@ -6157,6 +6181,59 @@ The import log (an `ImportLog` XML stream via `StdOutEventLogger`) reports per-o
 warnings and errors with the XPath and line of the offending element. That is the same diagnostic a
 manual import gives, but scriptable. Always import into a copy and `save_as` to a new file; never point
 the SDK at a working project.
+
+### `scripts/sdk_compare.py` — whole-project export comparison
+
+Run it with the SDK venv's Python:
+
+```
+python scripts/sdk_compare.py PROJECT.ACD OUTDIR [--program P] [--kinds routine,program,aoi] [--limit N] [--no-import]
+```
+
+For every routine, program and AOI it does the following, all on copies inside OUTDIR:
+1. Exports the object with acd-tools.
+2. Has Studio export the same object (`partial_export_to_xml_file`).
+3. Diffs the two as XML trees.
+4. Imports our file into a scratch copy that is never saved, and records Studio's warnings and errors.
+
+It writes `report.md`, with differences grouped into categories by how many objects they affect, and
+`report.json`, with everything per object.
+
+The diff ignores differences already known and accepted:
+- per-run attributes;
+- `OpcUaAccess`;
+- the ProductDefined DataTypes the SDK export adds (otherwise the SDK export is identical to the GUI
+  export);
+- `DefaultData`;
+- MESSAGE `<Data>`;
+- L5K line-wrapping;
+- child order inside unordered named containers.
+
+Gotchas found building it:
+- A Python logger subclass must not set its own `__namespace__`; opening a project then fails inside the
+  SDK.
+- The import log arrives asynchronously, after the `await` returns, so the script waits for the closing
+  `</ImportLog>` line.
+- `partial_export_to_xml_file` won't overwrite an existing file.
+
+**First run, `VAB_SQL.ACD`** (24 objects, about 80 s):
+- 2 imports aborted on `VAB_SQL_LoginPacket` "Invalid size.", and `SKT_DATA_Client`'s data was skipped.
+  Cause: the string `$XX` bug above.
+- 1 AOI parameter order was wrong: the Nameless list fix above.
+
+After both fixes: 0 failures, 0 import warnings or errors.
+
+Still differing, each with no import message:
+- `TargetRevision="1.0 "` (trailing space) on AOI exports.
+- Missing `<Dependencies>` on context DataTypes and context AOIs, and our target AOI lists its whole
+  closure instead of only its direct dependencies.
+- Missing `<AdditionalHelpText>` on AOIs.
+- AOI `Logic`/`Prescan` routine order.
+- Program routine order.
+- An empty program `<Tags Use="Context">` in routine exports.
+- A Decorated block on very large array tags. Studio emits only L5K for `VAB_SQL_OutputRows[25,25]` of a
+  large UDT and for `HTV_Packs[50,50,30]`, while smaller multi-dimensional arrays get both, so it looks
+  like a size cutoff, not yet pinned down.
 
 ## Testing gotchas
 

@@ -26,6 +26,43 @@ from acd.record.sbregion import SbRegionRecord
 from acd.record.xrefs import parse_xrefs
 
 
+_DATA_EXCHANGE_ID_RE = re.compile(r"^'?\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}'?$")
+_DATA_EXCHANGE_ID_KIND = 45
+
+
+def _is_data_exchange_id(comment: tuple) -> bool:
+    """True for a Comments.Dat record holding a tag's DataExchangeId GUID.
+
+    Studio V38 stores each tag's DataExchangeId (the `DataExchangeId="{...}"`
+    tag attribute in its own exports) as an ASCII comment record (record_type
+    1) with object_id 45, under the same (parent, scope_id) key as the tag's
+    real description (object_id 1). In a real V38 project all 345 object_id-45
+    records were GUIDs and every GUID record had object_id 45. Left in, the
+    comment dedup kept the GUID (the longer text) over 88 real descriptions,
+    and tags with no description exported the GUID as one.
+    """
+    return (
+        comment[2] == _DATA_EXCHANGE_ID_KIND
+        and comment[4] == 1
+        and isinstance(comment[3], str)
+        and bool(_DATA_EXCHANGE_ID_RE.match(comment[3]))
+    )
+
+
+def _dedupe_comments(comment_tuples: list) -> list:
+    """Drop DataExchangeId records, then keep one comment per
+    (parent, tag_reference, scope_id, rung_content) -- the longest text.
+    See the comment at the call site for why each key part is needed."""
+    seen: Dict[tuple, tuple] = {}
+    for t in comment_tuples:
+        if _is_data_exchange_id(t):
+            continue
+        key = (t[5], t[6], t[9], t[7])
+        if key not in seen or len(t[3]) > len(seen[key][3]):
+            seen[key] = t
+    return list(seen.values())
+
+
 def _read_xrefs(dat_path: str) -> list:
     """XRefs.Dat rows for the `xrefs` table, or [] (with a warning) if the
     file is missing or its header isn't the layout parse_xrefs() expects --
@@ -437,12 +474,9 @@ class ExportL5x:
         # silently discarded whichever of the two had the shorter text -- not just a
         # missing Description, but a risk of *also* dropping a real rung comment in the
         # reverse case.
-        seen: Dict[tuple, tuple] = {}
-        for t in comment_tuples:
-            key = (t[5], t[6], t[9], t[7])
-            if key not in seen or len(t[3]) > len(seen[key][3]):
-                seen[key] = t
-        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?)", seen.values())
+        self._cur.executemany(
+            "INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?)", _dedupe_comments(comment_tuples)
+        )
         self._db.commit()
 
         log.info(

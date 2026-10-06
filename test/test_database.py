@@ -965,3 +965,42 @@ def test_resolve_io_tag_comments_skips_non_io_tags():
     _resolve_io_tag_comments([tag], {}, {})
 
     assert tag._comments == [(".!02CA91B5.!0794E8EC", "should be left alone")]
+
+
+def _comment(object_id, text, parent=4226613352, scope_id=174, record_type=1, tag_reference=""):
+    # (seq_number, sub_record_length, object_id, record_string, record_type,
+    #  parent, tag_reference, rung_content, member_ref, scope_id)
+    return (0, len(text), object_id, text, record_type, parent, tag_reference, 0, 0, scope_id)
+
+
+def test_is_data_exchange_id_matches_only_guid_records_of_kind_45():
+    from acd.l5x.export_l5x import _is_data_exchange_id
+    assert _is_data_exchange_id(_comment(45, "{E54CB399-6DE3-4560-8D52-A04DB5360D1D}"))
+    assert _is_data_exchange_id(_comment(45, "'{e54cb399-6de3-4560-8d52-a04db5360d1d}'"))
+    assert not _is_data_exchange_id(_comment(1, "{E54CB399-6DE3-4560-8D52-A04DB5360D1D}"))
+    assert not _is_data_exchange_id(_comment(45, "Get\r\nDiverter\r\nShifts"))
+    assert not _is_data_exchange_id(
+        _comment(45, "{E54CB399-6DE3-4560-8D52-A04DB5360D1D}", record_type=6)
+    )
+
+
+def test_dedupe_comments_keeps_real_description_over_data_exchange_id():
+    # A real V38 project stored each tag's DataExchangeId GUID as a comment
+    # record (object_id 45) under the tag's own description key. The dedup
+    # keeps the longest text, so the 38-char GUID replaced 88 real, shorter
+    # descriptions (e.g. alias "GetDiverterShifts" -> "Get\r\nDiverter\r\nShifts").
+    from acd.l5x.export_l5x import _dedupe_comments
+    description = _comment(1, "Get\r\nDiverter\r\nShifts")
+    guid = _comment(45, "{E54CB399-6DE3-4560-8D52-A04DB5360D1D}")
+    assert _dedupe_comments([description, guid]) == [description]
+    assert _dedupe_comments([guid, description]) == [description]
+    # A tag with no description must not get the GUID as one.
+    assert _dedupe_comments([guid]) == []
+
+
+def test_dedupe_comments_still_keeps_longest_of_real_duplicates():
+    from acd.l5x.export_l5x import _dedupe_comments
+    short, longer = _comment(1, "Short"), _comment(1, "Longer text")
+    assert _dedupe_comments([short, longer]) == [longer]
+    other_scope = _comment(1, "Other", scope_id=999)
+    assert sorted(_dedupe_comments([short, other_scope]), key=lambda t: t[9]) == [short, other_scope]

@@ -110,7 +110,15 @@ class CommentsRecord:
                     while desc_start < len(rest) and rest[desc_start] == 0:
                         desc_start += 1
                     desc_end = rest.find(b"\x00", desc_start)
-                    record_string = rest[desc_start:desc_end].decode("ascii", errors="replace") if desc_end > desc_start else ""
+                    # UTF-8, not ASCII: a real project's own comment text
+                    # (French "présence", bytes C3 A9) decoded as "ascii"
+                    # replaced every accented character with U+FFFD -- the
+                    # same real text/raw-data-table distinction already
+                    # established for _decode_string_family_value() (that
+                    # one IS raw latin-1 PLC data, not text -- this is
+                    # genuine UTF-8 comment text, confirmed against the raw
+                    # bytes of the failing case).
+                    record_string = rest[desc_start:desc_end].decode("utf-8", errors="replace") if desc_end > desc_start else ""
                 else:
                     tag_ref = ""
                     record_string = ""
@@ -147,10 +155,12 @@ class CommentsRecord:
                     pos += 2
                     while pos < len(body) and body[pos] == 0:
                         pos += 1
-                    # Read null-terminated ASCII text.
+                    # Read null-terminated text -- UTF-8, not ASCII (see the
+                    # identical fix a few lines up, record_type 16/17, for
+                    # the real example this was found from).
                     text_end = body.find(b"\x00", pos)
                     if text_end > pos:
-                        record_string = body[pos:text_end].decode("ascii", errors="replace")
+                        record_string = body[pos:text_end].decode("utf-8", errors="replace")
                 return (
                     r.header.seq_number,
                     r.header.sub_record_length,

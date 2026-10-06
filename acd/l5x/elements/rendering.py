@@ -661,6 +661,68 @@ def _decorated_binary_literal(value: int, bit_width: int) -> str:
     groups = [bits[i:i + 4] for i in range(0, len(bits), 4)]
     return "2#" + "_".join(groups)
 
+def _decorated_ascii_literal(value: int, byte_width: int) -> str:
+    """Format an integer as Rockwell's Radix="ASCII" literal: its bytes,
+    most significant first, as a quoted string with unprintable bytes as
+    $XX -- e.g. INT 16717 -> "'AM'", 8240 -> "' 0'", 0 -> "'$00$00'"
+    (verified on real INT tags/array elements in a Studio export)."""
+    raw = (value & ((1 << (byte_width * 8)) - 1)).to_bytes(byte_width, "big")
+    out = []
+    for b in raw:
+        ch = chr(b)
+        if ch == "$":
+            out.append("$$")
+        elif ch == "'":
+            out.append("$'")
+        elif 0x20 <= b <= 0x7E:
+            out.append(ch)
+        else:
+            out.append(f"${b:02X}")
+    return "'" + "".join(out) + "'"
+
+
+# Tag-level radixes whose Decorated value format is verified against real
+# Studio output (see _decorated_primitive_value()); any other tag radix
+# (Hex, Octal, ...) keeps the type's default radix and a decimal value.
+_VERIFIED_TAG_RADIXES = {"Decimal", "Float", "Binary", "ASCII"}
+
+
+def _tag_decorated_radix(tag_radix, dt_base: str) -> str:
+    """The Radix= a primitive tag's Decorated value is written with: the
+    tag's own radix when its value format is verified, else the type
+    default. A tag's own radix was previously ignored entirely, so a
+    Binary/ASCII tag rendered as Decimal (found comparing a real project's
+    exports with Studio's via the SDK)."""
+    if tag_radix in _VERIFIED_TAG_RADIXES:
+        return tag_radix
+    return _PRIMITIVE_RADIX.get(dt_base, "Decimal")
+
+
+def _decorated_primitive_value(val, dt_base: str, radix: str, in_array: bool) -> str:
+    """A primitive tag's (or array element's) Decorated Value= string."""
+    if dt_base in ("BOOL", "BIT"):
+        return "1" if val else "0"  # a Binary-radix BOOL is still plain 0/1
+    if isinstance(val, float):
+        return _decorated_real_literal(val, in_array=in_array)
+    width = _PRIM.get(dt_base, (None, 4))[1]
+    if radix == "Binary":
+        return _decorated_binary_literal(int(val), width * 8)
+    if radix == "ASCII":
+        return _decorated_ascii_literal(int(val), width)
+    return str(int(val))
+
+
+def _array_index(flat: int, dims: List[int]) -> str:
+    """Element index for position `flat` of an array with `dims`, last
+    dimension varying fastest -- "[0,1]" for flat 1 of a [90,245] array.
+    Studio writes every dimension; we used to write the flat "[1]"."""
+    parts = []
+    for size in reversed(dims):
+        parts.append(flat % size)
+        flat //= size
+    return "[" + ",".join(str(p) for p in reversed(parts)) + "]"
+
+
 def _udt_scalar_to_xml(dt_name: str, values: dict,
                         data_types_map: Dict[str, 'DataType']) -> str:
     """Generate inner member XML for a decoded UDT scalar.

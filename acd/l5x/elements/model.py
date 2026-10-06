@@ -16,7 +16,9 @@ from .base import (
 from .rendering import (
     _PRIMITIVE_RADIX,
     _SKIP_DECORATED,
+    _array_index,
     _build_comments_xml,
+    _decorated_primitive_value,
     _decorated_real_literal,
     _generate_decorated,
     _l5k_array_literal,
@@ -24,6 +26,7 @@ from .rendering import (
     _l5k_string_padded,
     _l5k_udt_literal,
     _string_literal_cdata,
+    _tag_decorated_radix,
     _udt_array_to_xml,
     _udt_scalar_to_xml,
 )
@@ -600,7 +603,7 @@ class Tag(L5xElement):
                     )
 
             elif dt_base in _PRIM:
-                radix_attr = _PRIMITIVE_RADIX.get(dt_base, "Decimal")
+                radix_attr = _tag_decorated_radix(self.radix, dt_base)
 
                 if isinstance(iv, list):
                     # Array: emit every element at the tag's full declared
@@ -616,21 +619,25 @@ class Tag(L5xElement):
                     # just a cosmetic fidelity gap, do not reintroduce
                     # truncation here without solid verification first.
                     def _fmt_elem_val(val):
-                        if dt_base in ("BOOL", "BIT"):
-                            return "1" if val else "0"
-                        if isinstance(val, float):
-                            return _decorated_real_literal(val, in_array=True)
-                        return str(int(val))
+                        return _decorated_primitive_value(val, dt_base, radix_attr, in_array=True)
 
                     # NOTE: array-element comments go in the tag's standalone
                     # <Comments><Comment Operand="..."> block (see
                     # _build_comments_xml), never embedded inline here
                     # (verified: zero such occurrences in a real project).
+                    # A multi-dimensional array's Index lists every
+                    # dimension ("[0,1]"), as in Studio's own export.
+                    try:
+                        dims = [int(d) for d in (self.dimensions or "").split(",")]
+                    except ValueError:
+                        dims = []
+                    if len(dims) < 2:
+                        dims = [len(iv)]
                     elems_parts = []
                     for i in range(len(iv)):
                         val_attr = f'Value="{_fmt_elem_val(iv[i])}"'
                         elems_parts.append(
-                            f'<Element Index="[{i}]" {val_attr}/>'
+                            f'<Element Index="{_array_index(i, dims)}" {val_attr}/>'
                         )
                     elems = "".join(elems_parts)
                     dim_str = self.dimensions or "1"
@@ -666,15 +673,13 @@ class Tag(L5xElement):
                     # this used the DataType name as the element name
                     # itself (e.g. <BOOL Name="Tag" .../>), which doesn't
                     # match Studio 5000's actual output at all.
+                    val_str = _decorated_primitive_value(iv, dt_base, radix_attr, in_array=False)
                     if dt_base in ("BOOL", "BIT"):
-                        val_str = "1" if iv else "0"
                         l5k_val = val_str
                     elif isinstance(iv, float):
-                        val_str = _decorated_real_literal(iv, in_array=False)
                         l5k_val = _l5k_real_literal(iv)
                     else:
-                        val_str = str(int(iv))
-                        l5k_val = val_str
+                        l5k_val = str(int(iv))
 
                     data_xml = (
                         f'<Data Format="L5K">\n<![CDATA[{l5k_val}]]>\n</Data>'
@@ -697,12 +702,16 @@ class Tag(L5xElement):
             dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
             l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
             if l5k_zero is not None:
-                zero_radix = _PRIMITIVE_RADIX.get(dt_base, "Decimal")
+                zero_radix = _tag_decorated_radix(self.radix, dt_base)
+                zero_value = (
+                    _decorated_primitive_value(0, dt_base, zero_radix, in_array=False)
+                    if dt_base in _PRIM and zero_radix in ("Binary", "ASCII") else l5k_zero
+                )
                 data_xml = (
                     f'<Data Format="L5K">\n<![CDATA[{l5k_zero}]]>\n</Data>'
                     f'<Data Format="Decorated">\n'
                     f'<DataValue DataType="{dt_base}" Radix="{zero_radix}" '
-                    f'Value="{l5k_zero}"/>\n'
+                    f'Value="{zero_value}"/>\n'
                     f'</Data>'
                 )
             else:

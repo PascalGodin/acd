@@ -1535,3 +1535,45 @@ def test_st_routine_lines_falls_back_to_seq_when_no_order_list_present():
     from acd.l5x.elements.builders_routine import _st_routine_lines
 
     assert _st_routine_lines(cur, ROUTINE_ID) == ["first;", "second;"]
+
+
+def test_decorated_ascii_literal_is_big_endian_with_dollar_escapes():
+    # Real Studio export of INT tags with Radix="ASCII".
+    from acd.l5x.elements.rendering import _decorated_ascii_literal
+    assert _decorated_ascii_literal(16717, 2) == "'AM'"
+    assert _decorated_ascii_literal(8240, 2) == "' 0'"
+    assert _decorated_ascii_literal(0, 2) == "'$00$00'"
+
+
+def test_array_index_lists_every_dimension():
+    # Studio writes [0,1] for element 1 of a [90,245] array; we wrote [1].
+    from acd.l5x.elements.rendering import _array_index
+    assert _array_index(1, [90, 245]) == "[0,1]"
+    assert _array_index(245, [90, 245]) == "[1,0]"
+    assert _array_index(7, [2, 2, 2]) == "[1,1,1]"
+    assert _array_index(5, [10]) == "[5]"
+
+
+def test_tag_to_xml_uses_tag_radix_and_full_array_index():
+    from acd.l5x.elements import new_tag
+    tag = new_tag("Flags", "DINT", dimensions="2,2")
+    tag.radix = "Binary"
+    tag._initial_value = [67, 514, 0, 1]
+    xml = tag.to_xml()
+    assert 'Radix="Binary"' in xml
+    assert '<Element Index="[0,0]" Value="2#0000_0000_0000_0000_0000_0000_0100_0011"/>' in xml
+    assert '<Element Index="[1,1]" Value="2#0000_0000_0000_0000_0000_0000_0000_0001"/>' in xml
+
+    scalar = new_tag("Txt", "INT")
+    scalar.radix = "ASCII"
+    scalar._initial_value = 16717
+    assert '<DataValue DataType="INT" Radix="ASCII" Value="\'AM\'"/>' in scalar.to_xml()
+
+
+def test_tag_to_xml_unverified_tag_radix_keeps_type_default():
+    # Hex/Octal value formats haven't been seen in a real export yet.
+    from acd.l5x.elements import new_tag
+    tag = new_tag("H", "DINT")
+    tag.radix = "Hex"
+    tag._initial_value = 255
+    assert '<DataValue DataType="DINT" Radix="Decimal" Value="255"/>' in tag.to_xml()

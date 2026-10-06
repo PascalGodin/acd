@@ -6114,11 +6114,49 @@ The same comparison showed differences left as-is:
 - `TargetRevision` on an AOI export has a trailing space (`"1.0 "`).
 - AOI parameter `DefaultData` is still parked.
 
+**Imported through the Logix Designer SDK** (see "Logix Designer SDK as a verification tool" below):
+our export of the routine, with one extra rung and comment, imported into a copy of the test project with
+0 errors and 1 warning, `Unexpected element 'ControllerDevice' will be ignored`. Studio's *own* export of
+the same routine gets that exact warning, so it is Studio's own quirk, not ours to fix.
+
 Covered by `test/test_export_references.py`:
 - Against `CuteLogix.ACD`: `MSG(WebPage)` pulls in `DisableWeb`, `SSV(Task,MainTask,...)` adds the Task
   reference, and the AOI export gets `WallClockTime`.
 - Unit tests of the classifier and of the scope keying.
 - The four export tests fail without the fix.
+
+## Logix Designer SDK as a verification tool (never a dependency)
+
+Rockwell's Logix Designer SDK drives Studio 5000 itself: open a project, partial import or export an
+L5X, save or save as, read or set offline tag values. With it, Studio performs the binary write and the
+`FileInfo.Dat` signing, which is the write path this library can't do itself (see "ACD write-back").
+
+**Ground rule, from the user: acd-tools must never require the SDK.** Nothing under `acd/` may import it.
+It's a dev-side tool for closing gaps:
+- Pushing an `export_*()` file into a copy of a project, to prove it imports.
+- Getting Studio's own export of any routine, program or AOI as ground truth, instead of asking the user
+  to export by hand.
+
+Requirements:
+- The SDK installed (examples and wheels under `C:\Users\Public\Documents\Studio 5000\Logix Designer SDK\`;
+  the server lives under `Program Files (x86)\Rockwell Software\Studio 5000\Logix Designer SDK`).
+- A Studio 5000 Professional license.
+- Projects created for Logix Designer v31 or later.
+- The Python client (`logix_designer_sdk` wheel) needs **Python 3.12 or 3.13**. Give it its own venv
+  (`py -3.13 -m venv`, then pip install the wheel), separate from the interpreter running acd-tools.
+
+Verified loop, on 2026-10-06 against a copy of the `Xref_test` project:
+1. `export_routine()` of an edited routine.
+2. `LogixProject.open_logix_project(copy)`.
+3. `partial_import_from_xml_file("Controller/Programs/Program[@Name='P']/Routines/Routine[@Name='R']",
+   l5x, ImportCollisionOptions.OVERWRITE_ON_COLL)`.
+4. `save_as(new_path, True)`.
+5. `load_acd(new_path)` shows the added rung and its comment exactly.
+
+The import log (an `ImportLog` XML stream via `StdOutEventLogger`) reports per-object collisions,
+warnings and errors with the XPath and line of the offending element. That is the same diagnostic a
+manual import gives, but scriptable. Always import into a copy and `save_as` to a new file; never point
+the SDK at a working project.
 
 ## Testing gotchas
 

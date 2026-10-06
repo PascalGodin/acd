@@ -15,6 +15,7 @@ from .base import L5xElementBuilder
 from .builders_common import external_access_enum, radix_enum
 from .builders_tag import _aoi_tag_data_type, _aoi_tag_usage_flags
 from .model import AOI, LocalTag, Parameter, Routine
+from .rendering import _PARAMETER_NO_CONSTANT_TYPES
 
 
 @dataclass
@@ -83,10 +84,14 @@ class ParameterBuilder(L5xElementBuilder):
         visible = "true" if (flags & 0x40) else "false"
 
         # ExternalAccess (u16 at ext01[0x21E])
-        # MESSAGE-type InOut parameters don't carry Constant in L5X; all others do.
+        # A live-CIP-object-reference InOut parameter (MESSAGE, MODULE,
+        # AXIS_CIP_DRIVE, ...) carries no Constant= at all in L5X; every
+        # other InOut parameter does (see _PARAMETER_NO_CONSTANT_TYPES).
         if usage == "InOut":
             external_access = None
-            constant: Union[str, None] = None if data_type == "MESSAGE" else "false"
+            constant: Union[str, None] = (
+                None if (data_type or "").upper() in _PARAMETER_NO_CONSTANT_TYPES else "false"
+            )
         elif len(ext01) > 0x21F:
             ea_val = struct.unpack_from("<H", ext01, 0x21E)[0]
             external_access = external_access_enum(ea_val)

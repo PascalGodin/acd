@@ -960,7 +960,8 @@ _AOI_TAG_RECORD_DEFAULT_DT_OID = 999900  # arbitrary, must match a comps row cal
 
 def _aoi_tag_record(member_ref: int, is_param: bool,
                      data_type_oid: int = _AOI_TAG_RECORD_DEFAULT_DT_OID,
-                     dim1: int = 0, dim2: int = 0, dim3: int = 0) -> bytes:
+                     dim1: int = 0, dim2: int = 0, dim3: int = 0,
+                     usage: str = None) -> bytes:
     """Build a synthetic AOI RxTagCollection child (Parameter or LocalTag)
     comps record. `member_ref` (raw offset [14:18]) is the real Rockwell
     order key AoiBuilder now sorts by -- see its own docstring for how this
@@ -970,6 +971,13 @@ def _aoi_tag_record(member_ref: int, is_param: bool,
     arbitrary order. `is_param` sets ext01[0x20E] bit 0x04 (Input) so
     AoiBuilder classifies this child as a Parameter, or leaves it 0 so it's
     classified as a LocalTag (see `_aoi_tag_usage_flags`).
+
+    `usage` overrides the plain `is_param` bool with an explicit
+    "Input"/"Output"/"InOut" encoding (0x04/0x08/0x0C -- InOut is BOTH bits
+    set, per `_aoi_tag_usage_flags`'s own docstring) -- needed for anything
+    beyond the Input-vs-LocalTag distinction `is_param` alone can express,
+    e.g. a real InOut Parameter (`is_param=True` alone only ever produces
+    Input).
 
     `data_type_oid` (raw offset 0x2A, `_aoi_tag_data_type()`'s own DataType
     object_id pointer) defaults to `_AOI_TAG_RECORD_DEFAULT_DT_OID` --
@@ -991,7 +999,10 @@ def _aoi_tag_record(member_ref: int, is_param: bool,
     struct.pack_into("<I", main_record, 20, dim3)  # this record's bytes [34:38] (0x22)
     struct.pack_into("<I", main_record, 28, data_type_oid)  # this record's bytes [42:46] (0x2A)
     ext01 = bytearray(0x210)
-    if is_param:
+    usage_bits = {"Input": 0x04, "Output": 0x08, "InOut": 0x0C}
+    if usage is not None:
+        ext01[0x20E] = usage_bits[usage]
+    elif is_param:
         ext01[0x20E] = 0x04  # Input usage bit
     ext01_attr = struct.pack("<II", 0x01, len(ext01)) + bytes(ext01)
     dummy_last_attr = struct.pack("<II", 0x02, 4) + b"\x00" * 4  # left unparsed by RxGeneric
@@ -1250,6 +1261,43 @@ def test_aoi_builder_scalar_parameter_still_decodes_no_dimensions():
     aoi = AoiBuilder(cur, AOI_ID).build()
 
     assert aoi.parameters[0].dimensions is None
+
+
+def test_aoi_builder_inout_parameter_of_system_reference_type_omits_constant():
+    # Real bug: a real project's own AOI exports show InOut parameters typed
+    # MODULE ("Ethernet_Module") and AXIS_CIP_DRIVE ("Inp_Axis") with NO
+    # Constant= attribute at all -- the old rule only omitted it for
+    # data_type=="MESSAGE", so these two came out Constant="false", a real
+    # difference from Studio's own export.
+    db = _make_aoi_db()
+    cur = db.cursor()
+
+    AOI_ID, TAG_COLL_ID = 930, 931
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (AOI_ID, 0, "TestAOI6", 0, 256, b"\x00" * 20))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TAG_COLL_ID, AOI_ID, "RxTagCollection", 0, 256, b""))
+    rows = [
+        (940, 0, "MODULE", 0, 256, b""),
+        (941, 0, "AXIS_CIP_DRIVE", 0, 256, b""),
+        (942, 0, "DINT", 0, 256, b""),
+        (950, TAG_COLL_ID, "Ethernet_Module", 0, 256,
+         _aoi_tag_record(10, is_param=True, data_type_oid=940, usage="InOut")),
+        (951, TAG_COLL_ID, "Inp_Axis", 0, 256,
+         _aoi_tag_record(20, is_param=True, data_type_oid=941, usage="InOut")),
+        (952, TAG_COLL_ID, "PlainInOut", 0, 256,
+         _aoi_tag_record(30, is_param=True, data_type_oid=942, usage="InOut")),
+    ]
+    cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", rows)
+    db.commit()
+
+    aoi = AoiBuilder(cur, AOI_ID).build()
+    by_name = {p.name: p for p in aoi.parameters}
+
+    assert by_name["Ethernet_Module"].usage == "InOut"
+    assert by_name["Ethernet_Module"].constant is None
+    assert by_name["Inp_Axis"].constant is None
+    # Non-regression: an ordinary InOut parameter (a plain DINT, not a
+    # system-reference type) still gets Constant="false".
+    assert by_name["PlainInOut"].constant == "false"
 
 
 def _make_aoi_db():
@@ -1545,6 +1593,24 @@ def test_decorated_ascii_literal_is_big_endian_with_dollar_escapes():
     assert _decorated_ascii_literal(0, 2) == "'$00$00'"
 
 
+def test_decorated_ascii_literal_escapes_xml_special_chars():
+    # Real bug: this string is embedded directly into Value="..." -- an
+    # unescaped "&" produced not-well-formed XML (an import would fail
+    # outright). Studio's own export of the same value keeps the single
+    # quotes literal and only XML-escapes "&" -> Value="'&amp; '".
+    from acd.l5x.elements.rendering import _decorated_ascii_literal
+    import xml.etree.ElementTree as ET
+
+    value = (ord("&") << 8) | ord(" ")
+    literal = _decorated_ascii_literal(value, 2)
+    assert literal == "'&amp; '"
+    ET.fromstring(f'<E Value="{literal}"/>')  # raises if not well-formed
+
+    assert _decorated_ascii_literal((ord("<") << 8) | ord(">"), 2) == "'&lt;&gt;'"
+    assert _decorated_ascii_literal((ord('"') << 8) | ord("'"), 2) == "'&quot;$''"
+    ET.fromstring(f'<E Value="{_decorated_ascii_literal((ord(chr(60)) << 8) | ord(chr(62)), 2)}"/>')
+
+
 def test_array_index_lists_every_dimension():
     # Studio writes [0,1] for element 1 of a [90,245] array; we wrote [1].
     from acd.l5x.elements.rendering import _array_index
@@ -1570,6 +1636,21 @@ def test_tag_to_xml_uses_tag_radix_and_full_array_index():
     assert '<DataValue DataType="INT" Radix="ASCII" Value="\'AM\'"/>' in scalar.to_xml()
 
 
+def test_tag_to_xml_ascii_array_element_with_ampersand_is_well_formed():
+    # Real bug: an ASCII-radix array element whose value contained "&"
+    # produced non-well-formed XML (ElementTree.ParseError on a real
+    # project's own export -- an import would have failed outright).
+    import xml.etree.ElementTree as ET
+    from acd.l5x.elements import new_tag
+
+    tag = new_tag("Txt", "INT", dimensions="1")
+    tag.radix = "ASCII"
+    tag._initial_value = [(ord("&") << 8) | ord(" ")]
+    xml = tag.to_xml()
+    assert "Value=\"'&amp; '\"" in xml
+    ET.fromstring(xml)  # raises if not well-formed
+
+
 def test_tag_to_xml_unverified_tag_radix_keeps_type_default():
     # Hex/Octal value formats haven't been seen in a real export yet.
     from acd.l5x.elements import new_tag
@@ -1577,3 +1658,11 @@ def test_tag_to_xml_unverified_tag_radix_keeps_type_default():
     tag.radix = "Hex"
     tag._initial_value = 255
     assert '<DataValue DataType="DINT" Radix="Decimal" Value="255"/>' in tag.to_xml()
+
+
+def test_string_escapes_use_r_and_l_for_cr_lf():
+    # Real Studio exports write CR as $r (619 samples) and LF as $l, never
+    # $0D/$0A, in L5K, <Data Format="String"> and Decorated values alike.
+    from acd.l5x.elements.rendering import _l5k_string_padded, _string_literal_cdata
+    assert _l5k_string_padded("\r\n\x1bS", capacity=5) == "'$r$l$1BS$00'"
+    assert _string_literal_cdata("^01060000000004\r") == "<![CDATA['^01060000000004$r']]>"

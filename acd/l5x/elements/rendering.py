@@ -236,6 +236,19 @@ _SKIP_DECORATED: set = {
     "AXIS_CIP_DRIVE", "MOTION_GROUP",
 }
 
+# AOI InOut Parameter DataTypes whose <Parameter> carries no Constant=
+# attribute at all (same reasoning as _SKIP_DECORATED: these are live CIP
+# object references -- a motion axis, a message config, a hardware module --
+# not data a "constant" flag applies to). MESSAGE was already handled;
+# MODULE and AXIS_CIP_DRIVE confirmed via a real project's own AOI exports
+# (VAB_PowerFlex_525/700's "Ethernet_Module" parameter, AOI_CIP_Home_Torque's
+# "Inp_Axis" parameter -- both Usage="InOut" with no Constant= in Studio's
+# own export, where our old MESSAGE-only rule still emitted Constant="false").
+# The rest of _SKIP_DECORATED (ALARM_DIGITAL, AXIS_SERVO, PID_ENHANCED,
+# MOTION_GROUP) is included by symmetry, not independently observed as an
+# InOut parameter type in any real project checked so far.
+_PARAMETER_NO_CONSTANT_TYPES: set = _SKIP_DECORATED | {"MODULE"}
+
 def _zero_value_for_member(member: "Member", data_types_map: Dict[str, "DataType"]):
     """Synthesize a Studio-consistent zero/default value for a UDT member
     that has no decoded value at all in a tag's already-decoded
@@ -661,11 +674,31 @@ def _decorated_binary_literal(value: int, bit_width: int) -> str:
     groups = [bits[i:i + 4] for i in range(0, len(bits), 4)]
     return "2#" + "_".join(groups)
 
+def _xml_attr_special_escape(ch: str) -> Union[str, None]:
+    """Standard XML entity escape for a character that would otherwise break
+    a double-quoted attribute value (& < > "), or None if `ch` needs none.
+    A literal `'` is deliberately left alone -- real Studio ASCII-radix
+    output keeps it unescaped inside a double-quoted Value="..." attribute
+    (verified: a real array element's Value="'& '" came back as
+    Value="'&amp; '", single quotes untouched, only the ampersand escaped)."""
+    return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}.get(ch)
+
+
 def _decorated_ascii_literal(value: int, byte_width: int) -> str:
     """Format an integer as Rockwell's Radix="ASCII" literal: its bytes,
     most significant first, as a quoted string with unprintable bytes as
     $XX -- e.g. INT 16717 -> "'AM'", 8240 -> "' 0'", 0 -> "'$00$00'"
-    (verified on real INT tags/array elements in a Studio export)."""
+    (verified on real INT tags/array elements in a Studio export).
+
+    This string is always embedded directly into an XML attribute
+    (Value="..."), never CDATA -- a printable byte can be &, <, >, or " (a
+    control byte is already a safe $XX escape via _escape_string_char, and '
+    is already escaped to $' above), each of which must be a standard XML
+    entity reference or the attribute itself breaks. Found via a real
+    project: an array element's Radix="ASCII" value containing "&" produced
+    not-well-formed XML (confirmed: Studio's own export of the same element
+    is Value="'&amp; '").
+    """
     raw = (value & ((1 << (byte_width * 8)) - 1)).to_bytes(byte_width, "big")
     out = []
     for b in raw:
@@ -674,10 +707,9 @@ def _decorated_ascii_literal(value: int, byte_width: int) -> str:
             out.append("$$")
         elif ch == "'":
             out.append("$'")
-        elif 0x20 <= b <= 0x7E:
-            out.append(ch)
         else:
-            out.append(f"${b:02X}")
+            escaped = _xml_attr_special_escape(ch)
+            out.append(escaped if escaped is not None else _escape_string_char(ch))
     return "'" + "".join(out) + "'"
 
 
@@ -940,6 +972,24 @@ def _udt_array_to_xml(dt_base: str, values: List[dict],
         f'<Array DataType="{display_name}" Dimensions="{dim_str}">'
         f'{"".join(elems)}</Array>'
     )
+def _escape_string_char(ch: str) -> str:
+    """Rockwell's escape for one character inside a quoted string literal
+    (L5K, <Data Format="String">, Decorated DATA, ASCII radix). Carriage
+    return and line feed are the named escapes $r and $l -- Studio never
+    writes $0D/$0A (619 vs 0 real samples for CR). Every other control or
+    non-ASCII byte is $XX, uppercase hex (tab has never been observed, so it
+    stays $09). $ and ' are left to the caller, whose quote escaping differs
+    by format."""
+    code = ord(ch)
+    if code == 0x0D:
+        return "$r"
+    if code == 0x0A:
+        return "$l"
+    if code < 0x20 or code == 0x7F or code > 0x7E:
+        return f"${code:02X}"
+    return ch
+
+
 # Logix STRING struct: DINT LEN (4 bytes) + SINT[82] DATA (82 bytes) + 2 bytes padding.
 def _string_literal_cdata(text: str, empty_quoted: bool = False) -> str:
     """Format a decoded string value as Rockwell's quoted-literal CDATA content.
@@ -965,11 +1015,7 @@ def _string_literal_cdata(text: str, empty_quoted: bool = False) -> str:
     """
     if not text:
         return "<![CDATA['']]>" if empty_quoted else "<![CDATA[]]>"
-    escaped = text.replace("$", "$$").replace("'", "''")
-    escaped = "".join(
-        f"${ord(ch):02X}" if ord(ch) < 0x20 or ord(ch) == 0x7F or ord(ch) > 0x7E else ch
-        for ch in escaped
-    )
+    escaped = "".join(_escape_string_char(ch) for ch in text.replace("$", "$$").replace("'", "''"))
     return f"<![CDATA['{escaped}']]>"
 
 def _l5k_string_padded(text: str, capacity: int) -> str:
@@ -1014,11 +1060,7 @@ def _l5k_string_padded(text: str, capacity: int) -> str:
     reaches here intact and gets escaped correctly, whether it's meaningful
     extended/accented text or garbage.
     """
-    escaped = text.replace("$", "$$").replace("'", "$'")
-    escaped = "".join(
-        f"${ord(ch):02X}" if ord(ch) < 0x20 or ord(ch) == 0x7F or ord(ch) > 0x7E else ch
-        for ch in escaped
-    )
+    escaped = "".join(_escape_string_char(ch) for ch in text.replace("$", "$$").replace("'", "$'"))
     pad = "$00" * max(capacity - len(text), 0)
     return f"'{escaped}{pad}'"
 

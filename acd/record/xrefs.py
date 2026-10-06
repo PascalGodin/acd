@@ -32,6 +32,10 @@ _REGION_MARKER = b"\xfe\xfe"
 _LIVE = struct.Struct("<2xIIHHIII8xIII")
 
 PROGRAM_MAIN_ROUTINE = 15
+IO_TAG_MODULE = 3  # I/O tag -> a module that owns it
+MOTION_GROUP_TAG = 4  # MOTION_GROUP tag -> its motion group object
+AXIS_TAG = 5  # AXIS_* tag -> its axis object
+MOTION_GROUP_AXIS = 80  # motion group object -> an axis object it contains
 MSG_TAG_CONFIG = 6  # MESSAGE tag -> its message configuration object
 MSG_CONFIG_TAG = 7  # message configuration -> a tag it reads/writes
 
@@ -40,7 +44,9 @@ MSG_CONFIG_TAG = 7  # message configuration -> a tag it reads/writes
 KINDS = {
     1: "alias_target",
     2: "tag_data_type",
-    3: "io_tag_module",
+    IO_TAG_MODULE: "io_tag_module",
+    MOTION_GROUP_TAG: "motion_group_tag",
+    AXIS_TAG: "axis_tag",
     MSG_TAG_CONFIG: "msg_tag_config",
     MSG_CONFIG_TAG: "msg_config_tag",
     8: "data_type_member_type",
@@ -50,6 +56,7 @@ KINDS = {
     14: "code_label",
     PROGRAM_MAIN_ROUTINE: "program_main_routine",
     32: "task_program",
+    MOTION_GROUP_AXIS: "motion_group_axis",
     115: "aoi_data_type",
     137: "st_code_tag",
     157: "code_member",

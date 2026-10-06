@@ -14,7 +14,9 @@ from typing import Dict, List, Tuple, Union
 from loguru import logger as log
 
 from acd.generated.comps.rx_generic import RxGeneric
-from acd.record.xrefs import MSG_CONFIG_TAG, MSG_TAG_CONFIG
+from acd.record.xrefs import (
+    AXIS_TAG, IO_TAG_MODULE, MOTION_GROUP_AXIS, MOTION_GROUP_TAG, MSG_CONFIG_TAG, MSG_TAG_CONFIG,
+)
 from acd.record.xrefs import PROGRAM_MAIN_ROUTINE as XREF_PROGRAM_MAIN_ROUTINE
 
 from .base import L5xElementBuilder
@@ -87,6 +89,80 @@ def _msg_config_tag_names(cur) -> Dict[Tuple[str, str], List[str]]:
         if target[1] not in names:
             names.append(target[1])
     return result
+
+
+def _axis_motion_group_tags(cur) -> Dict[str, List[str]]:
+    """Axis tag name -> the MOTION_GROUP tag(s) its axis belongs to, from
+    XRefs.Dat: axis tag -(kind 5)-> axis object <-(kind 80)- motion group
+    object <-(kind 4)- MOTION_GROUP tag. Studio's Export Routine includes an
+    axis's motion group tag as context (verified: routines doing MAM/MASR on
+    FenceAxis_1 export the MotionGroup tag, which their text never names).
+    Returns {} for a project DB built before the xrefs table existed."""
+    try:
+        cur.execute(
+            "SELECT a.from_id, g.from_id FROM xrefs a "
+            "JOIN xrefs m ON m.to_id = a.to_id AND m.kind = ? "
+            "JOIN xrefs g ON g.to_id = m.from_id AND g.kind = ? "
+            "WHERE a.kind = ?",
+            (MOTION_GROUP_AXIS, MOTION_GROUP_TAG, AXIS_TAG),
+        )
+        links = cur.fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    if not links:
+        return {}
+    cur.execute("SELECT object_id, comp_name FROM comps")
+    names = {}
+    for oid, name in cur.fetchall():
+        names.setdefault(oid, name)
+    result: Dict[str, List[str]] = {}
+    for axis_oid, group_oid in links:
+        axis, group = names.get(axis_oid), names.get(group_oid)
+        if axis and group and group not in result.setdefault(axis, []):
+            result[axis].append(group)
+    return result
+
+
+def _io_tag_owner_modules(cur) -> Dict[str, List[str]]:
+    """I/O tag name ("Rack:2:O", "VFD1:I") -> the modules XRefs.Dat says own
+    it (kind 3, io_tag_module).
+
+    Studio's Export Routine includes exactly the owners of each referenced
+    I/O tag as <Module Use="Reference"> context. For a rack-optimized rack
+    that is the rack adapter only -- the slot module owns just its :C config
+    tag, its :I/:O data belongs to the adapter -- so a slot module is NOT
+    included for a "Rack:2:O" reference. A direct-connection slot module
+    co-owns its data tag and is included. Verified on three real routines'
+    module lists. An I/O tag's comp_name carries its module as a hex object
+    id ("&0d2a0e85:2:O"), resolved here to the module's name. Returns {} for
+    a project DB built before the xrefs table existed.
+    """
+    try:
+        cur.execute("SELECT from_id, to_id FROM xrefs WHERE kind = ?", (IO_TAG_MODULE,))
+        links = cur.fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    if not links:
+        return {}
+    cur.execute("SELECT object_id, comp_name FROM comps")
+    names = {}
+    for oid, name in cur.fetchall():
+        names.setdefault(oid, name)
+    owners: Dict[str, List[str]] = {}
+    for tag_oid, module_oid in links:
+        tag_name, module_name = names.get(tag_oid), names.get(module_oid)
+        if not tag_name or not module_name:
+            continue
+        m = re.match(r"&([0-9a-fA-F]{8})(:.*)$", tag_name)
+        if m:
+            base = names.get(int(m.group(1), 16))
+            if not base:
+                continue
+            tag_name = base + m.group(2)
+        mods = owners.setdefault(tag_name, [])
+        if module_name not in mods:
+            mods.append(module_name)
+    return owners
 
 
 def _resolve_hex_oid_chain(path: str, hex_oid_map: Dict[int, str]) -> Union[str, None]:
@@ -988,6 +1064,8 @@ class ControllerBuilder(L5xElementBuilder):
             data_types_map,
         )
         controller._msg_config_tags = _msg_config_tag_names(self._cur)
+        controller._io_tag_modules = _io_tag_owner_modules(self._cur)
+        controller._axis_motion_groups = _axis_motion_group_tags(self._cur)
         return controller
 
 @dataclass

@@ -33,6 +33,7 @@ import asyncio
 import json
 import re
 import shutil
+import struct
 import sys
 import traceback
 import xml.etree.ElementTree as ET
@@ -84,6 +85,18 @@ class _Collector(OperationEvent):
 
 # --- XML normalization and diff -------------------------------------------
 
+_FLOAT_RE = re.compile(r"-?\d+\.\d+(?:e[+-]\d+)?")
+
+
+def _canonical_float(m):
+    """Compare REALs by the float32 they store, not their decimal text.
+    Studio sometimes prints a "clean" decimal (2.00000000e-001) where we
+    print the float's full precision (2.00000003e-001); on a real project
+    all 505 such pairs parsed to the identical float32. (An LREAL value is
+    rounded to float32 too here -- a known blind spot for LREAL.)"""
+    value = struct.unpack("<f", struct.pack("<f", float(m.group(0))))[0]
+    return repr(value)
+
 def _normalize(elem):
     """Drop what is known and accepted to differ, in place."""
     for child in list(elem):
@@ -100,7 +113,9 @@ def _normalize(elem):
     if elem.tag in ("Data", "DefaultData") and elem.get("Format") == "L5K" and elem.text:
         # Studio wraps long L5K values with "\n\t\t"; raw whitespace is never
         # part of the value (inside a string literal it would be $N/$T/$XX).
-        elem.text = re.sub(r"[\r\n\t]", "", elem.text)
+        elem.text = _FLOAT_RE.sub(_canonical_float, re.sub(r"[\r\n\t]", "", elem.text))
+    if elem.get("DataType") in ("REAL", "LREAL") and elem.get("Value"):
+        elem.set("Value", _FLOAT_RE.sub(_canonical_float, elem.get("Value")))
     for attr in IGNORED_ATTRS:
         elem.attrib.pop(attr, None)
 

@@ -1661,6 +1661,12 @@ class Controller(L5xElement):
     # those tags never appear in rung text -- Studio's own Export Routine still
     # includes them as context. Reflects the project as last saved in Studio.
     _msg_config_tags: Dict[Tuple[str, str], List[str]] = field(default_factory=dict)
+    # I/O tag name ("Rack:2:O") -> names of the modules that own it, from
+    # XRefs.Dat (see _io_tag_owner_modules()). Empty when unavailable.
+    _io_tag_modules: Dict[str, List[str]] = field(default_factory=dict)
+    # Axis tag name -> its MOTION_GROUP tag name(s), from XRefs.Dat (see
+    # _axis_motion_group_tags()). Studio exports the group with the axis.
+    _axis_motion_groups: Dict[str, List[str]] = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()

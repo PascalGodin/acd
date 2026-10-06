@@ -946,21 +946,71 @@ def _referenced_tag_names(rung_texts) -> set:
     to be named "InputLength" (renamed here), coincidentally matching a
     member-access suffix of the same name in several rungs and getting
     wrongly pulled in as context.
+
+    Three more exclusions, each found when a real project's export pulled in
+    an unrelated tag that happened to share a name (verified against Studio's
+    own export of the same routines):
+    - A token followed by ":" (but not ST's ":=") is the module part of an
+      I/O address ("TongLoader_XFR:I.DriveStatus"), never a tag; one
+      preceded by ":" is its I/O type ("I").
+    - A JSR's first operand is a routine name ("JSR(LS_Read,0)" next to a
+      controller tag also named LS_Read).
+    - ST comments and quoted string literals are not code -- "a" in
+      "//... on a change of state" matched a real tag named "a".
     """
     import re
     token_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
     paren_next_re = re.compile(r"\s*\(")
+    jsr_target_re = re.compile(r"\bJSR\s*\(\s*$", re.IGNORECASE)
     names = set()
     for text in rung_texts:
         if not text:
             continue
+        text = _strip_comments_and_strings(text)
         for m in token_re.finditer(text):
-            if paren_next_re.match(text, m.end()):
+            end = m.end()
+            if paren_next_re.match(text, end):
                 continue
             if m.start() > 0 and text[m.start() - 1] == ".":
                 continue
+            if text.startswith(":", end) and not text.startswith(":=", end):
+                continue
+            if m.start() > 0 and text[m.start() - 1] == ":":
+                continue  # the I/O type after "Module:" / "Rack:3:"
+            if jsr_target_re.search(text, 0, m.start()):
+                continue
             names.add(m.group())
     return names
+
+
+def _strip_comments_and_strings(text: str) -> str:
+    """Blank out ST comments (// to end of line, (* *), /* */) and the
+    contents of single-quoted string literals ($' is an escaped quote), so
+    an identifier scan only sees code. A comment left unterminated on this
+    line (a multi-line block comment) is blanked to the end of the line."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        two = text[i:i + 2]
+        if two == "//":
+            break
+        if two in ("(*", "/*"):
+            close = "*)" if two == "(*" else "*/"
+            j = text.find(close, i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+            continue
+        ch = text[i]
+        if ch == "'":
+            j = i + 1
+            while j < n and text[j] != "'":
+                j += 2 if text[j] == "$" else 1
+            out.append("''")
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _validate_array_bounds(lines, tags) -> None:
@@ -1068,6 +1118,7 @@ def _referenced_modules(rung_texts, project: RSLogix5000Content) -> list:
     import re
     io_ref_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*):(\d+:)?([A-Za-z]\w*)")
     modules_by_name = {m.name: m for m in project.controller.modules}
+    io_owners = project.controller._io_tag_modules
     found: Dict[str, object] = {}
     for text in rung_texts:
         if not text:
@@ -1076,6 +1127,20 @@ def _referenced_modules(rung_texts, project: RSLogix5000Content) -> list:
             base, slot_part, _typ = m.group(1), m.group(2), m.group(3)
             base_module = modules_by_name.get(base)
             if base_module is None:
+                continue
+            # Preferred: the modules XRefs says own this I/O tag -- for a
+            # rack-optimized rack that is the adapter alone, not the slot
+            # module (see _io_tag_owner_modules()). The slot rule below is
+            # the fallback both when no XRefs data exists for this
+            # reference at all, AND (defensively, not observed in any real
+            # project) when XRefs names an owner that no longer resolves to
+            # a currently-known module -- better to fall back to the old
+            # heuristic than silently include nothing for this reference.
+            owners = io_owners.get(m.group(0))
+            resolved_owners = [name for name in (owners or []) if name in modules_by_name]
+            if resolved_owners:
+                for name in resolved_owners:
+                    found[name] = modules_by_name[name]
                 continue
             found[base] = base_module
             if slot_part:
@@ -1170,6 +1235,7 @@ def _tag_context_dependencies(tag, scope: str, project: RSLogix5000Content) -> L
         deps.append(_tag_base_name(tag.target))
     if tag.data_type and tag.data_type.upper() == "MESSAGE":
         deps.extend(project.controller._msg_config_tags.get((scope, tag.name), []))
+    deps.extend(project.controller._axis_motion_groups.get(tag.name, []))
     return deps
 
 

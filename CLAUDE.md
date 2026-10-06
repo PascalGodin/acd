@@ -6278,9 +6278,106 @@ Still open after this run, beyond the VAB_SQL list above:
 - L5K value differences on 38 objects (e.g. a string member `port=1233` vs ours `port=123`; LINT
   values).
 - Structure member values differing on 9 objects.
-- Context sets differing slightly: 8 extra and 5 missing tags, 12 extra modules.
-- `Constant="false"` on InOut AOI parameters where Studio has none.
-- 8 tag comments with different text.
+- ~~Context sets differing slightly: 8 extra and 5 missing tags, 12 extra modules.~~ **FIXED, see
+  "Third round" below.**
+- ~~`Constant="false"` on InOut AOI parameters where Studio has none.~~ **FIXED, see "Third round"
+  below (extended beyond `MESSAGE` to `MODULE`/`AXIS_CIP_DRIVE`).**
+- ~~8 tag comments with different text.~~ **FIXED, see "Third round" below (a UTF-8/ASCII decode
+  bug, not a content bug).**
+
+**Third round**, same BPM project, fixing the "Context sets"/"Constant"/"8 tag comments" items above:
+
+1. **Context differences were four separate, real bugs in the rung-text scan, not noise.**
+   - **Extra modules** (`Input1`..`Input5`, `DC_14`, `DC_15`, `Trim_Saws`, `Smart_Gates`,
+     `Inkjet_I_O`, ...): `_referenced_modules()`'s own rack/slot rule ("the slot occupant is always a
+     dependency too") is wrong for a rack-optimized rack — the slot module there owns only its own
+     `:C` config tag; its `:I`/`:O` data belongs to the rack adapter alone. A direct-connection slot
+     module, by contrast, DOES co-own its `:I`/`:O` tag alongside the adapter. The real,
+     authoritative answer is in XRefs.Dat (kind 3, `io_tag_module`, already decoded — see "XRefs.Dat"
+     above): `_io_tag_owner_modules()` reads every I/O tag's real owner module(s) directly, and
+     `_referenced_modules()` now prefers that over the old heuristic (which stays as a fallback for a
+     project DB built before the `xrefs` table existed, or for the one owner name that doesn't
+     resolve to a currently-known module — not observed, just defensive).
+   - **Extra tags** (`a`, `LS_Read`, `TongLoader_XFR`, `Pack_Clear`): `_referenced_tag_names()`'s
+     identifier scan had no concept of ST comments/string literals, so a comment like `"...on a
+     change of state..."` matched a real tag literally named `a`; no concept of `:` addressing, so
+     `TongLoader_XFR` (the module) and the I/O type after the second `:` both matched as tag names;
+     and no concept of JSR's own first operand being a routine name, so `JSR(LS_Read,0)` matched the
+     unrelated controller tag also named `LS_Read`. Fixed with `_strip_comments_and_strings()` (blank
+     out `//`, `(* *)`, `/* */`, and single-quoted string contents before scanning) and two more
+     exclusions: a token followed or preceded by `:` (not ST's `:=`), and a token that's a `JSR`'s own
+     first operand.
+   - **Missing tag** (`MotionGroup`): an axis tag (`FenceAxis_1`, `DataType="AXIS_CIP_DRIVE"`) never
+     names its own motion group in rung text (`MAM`/`MASR`/... only name the axis), but Studio's
+     export includes it anyway. XRefs links it in three hops with no rung involved: axis tag
+     -(kind 5, `axis_tag`)-> axis object <-(kind 80, `motion_group_axis`)- motion group object
+     <-(kind 4, `motion_group_tag`)- the `MOTION_GROUP` tag. `_axis_motion_group_tags()` resolves
+     this, and `_tag_context_dependencies()` pulls it in alongside an Alias target/MESSAGE-configured
+     tag.
+   - Covered by `test/test_export_references.py` (synthetic comps/xrefs DBs for both new XRefs
+     readers, and `_referenced_modules()`/`_referenced_tag_names()`/`_tag_context_dependencies()`
+     unit tests for each of the four exclusions/inclusions) — every test confirmed to fail without
+     its fix.
+
+2. **A real, severe XML well-formedness bug in the new ASCII-radix rendering** (added in the second
+   round above): `_decorated_ascii_literal()`'s printable bytes were embedded raw into a
+   `Value="..."` attribute — a value containing `&`, `<`, `>`, or `"` produced not-well-formed XML
+   (confirmed: `ElementTree.ParseError` parsing our own export of `Continuous/INFOMASTER`, a real
+   `Value="'& '"` where Studio's own export is `Value="'&amp; '"`). An import of such a file would
+   fail outright. Fixed: `_xml_attr_special_escape()` escapes `&`/`<`/`>`/`"` the standard XML way
+   (confirmed against Studio's own output — it leaves a literal `'` unescaped inside the
+   double-quoted attribute, only `&` gets `&amp;`). Covered by
+   `test_decorated_ascii_literal_escapes_xml_special_chars` and
+   `test_tag_to_xml_ascii_array_element_with_ampersand_is_well_formed`
+   (`test/test_elements_helpers.py`) — both confirmed to reproduce the real parse error without the
+   fix.
+
+3. **`Constant=` omission was `MESSAGE`-only; real exports also omit it for `MODULE` and
+   `AXIS_CIP_DRIVE`.** A real AOI's own InOut parameters (`VAB_PowerFlex_525`/`700`'s
+   `Ethernet_Module`, `AOI_CIP_Home_Torque`'s `Inp_Axis`) have no `Constant=` attribute at all in
+   Studio's export; `ParameterBuilder.build()`'s old rule only omitted it for `data_type=="MESSAGE"`,
+   so these two came out `Constant="false"`. All three (plus, by symmetry with the already-existing
+   `_SKIP_DECORATED` rendering set, `ALARM_DIGITAL`/`AXIS_SERVO`/`PID_ENHANCED`/`MOTION_GROUP` — not
+   independently observed as parameter types) are "live CIP object reference" types, not real data a
+   `Constant` flag applies to — `_PARAMETER_NO_CONSTANT_TYPES` (`rendering.py`) is `_SKIP_DECORATED
+   | {"MODULE"}`. Covered by
+   `test_aoi_builder_inout_parameter_of_system_reference_type_omits_constant`
+   (`test/test_elements_helpers.py`).
+
+4. **"8 tag comments with different text" was a genuine UTF-8 decode bug, not noise.** A real French
+   comment ("LS pres ligne de bois présence AC") decoded with the accented `é` replaced by TWO
+   U+FFFD replacement characters. Root cause, confirmed against the raw bytes: `CommentsRecord.parse()`
+   (`acd/record/comments.py`) decoded the array/bit-operand description text (the `record_type in
+   (5,6,7,8,...)` shape, and the `16`/`17` shape) as `"ascii"` with `errors="replace"` — but the raw
+   bytes are genuine UTF-8 (`0xC3 0xA9`, confirmed directly against Comments.Dat). This is NOT the
+   same class of bug as `_decode_string_family_value()`'s own latin-1 fix elsewhere in this file —
+   that one is raw PLC data-table bytes (correctly latin-1, never text), this is genuine Rockwell
+   UTF-8 comment text (the same encoding the `record_type` 1/2/12 shapes already correctly used).
+   Fixed by decoding both sites as `"utf-8"` instead. Covered by `test/test_comments.py` (new file —
+   synthetic `FafaComents`-shaped records via a `SimpleNamespace` duck-typed `dat_record`, since
+   `CommentsRecord.parse()` only ever reads `.identifier`/`.record.record_buffer`) — confirmed to
+   fail (both produce `��` instead of `é`) without the fix.
+
+**Re-run against every fix in this round, including the import pass**: all 158 BPM objects import
+into a scratch copy with **0 errors and 0 warnings** (empty import-messages section), 60/158 now
+identical to Studio's own export after normalization (up from 30/158 before this round). Every
+category this round targeted (`Parameter@Constant`, extra `Modules/Module`, the extra/missing
+`Tags/Tag` false positives, the mojibake'd `Comments/Comment` text) is gone from the report
+entirely. Full acd-tools test suite: 605 passed, 2 skipped, 0 failed.
+
+**One more real, NOT-yet-fixed gap found in this same round, left open**: several real tags whose
+DataType has a nested `PID`/motion-instruction-shaped member show every BIT-status member (`EN`,
+`DN`, `IP`, and `LugSyncLL`'s own nested `PID` member's `INI`/`OLL`/`DVNA`/`PVHA`) decoding to `0`
+when Studio's own value is `1` — e.g. `Axis01_StartAxis`/`Axis02_AbsMov`
+(`DataType="MOTION_INSTRUCTION"`) and `LugSyncLL` (a project UDT, `LugSync`, with a member typed
+`PID` -- almost certainly the built-in `PID_ENHANCED`, already in `_SKIP_DECORATED` for the
+TOP-LEVEL-tag case, but that doesn't cover a NESTED member of that type inside a larger UDT, which
+still goes through the generic member-decode path). Not chased further this round — this needs the
+same kind of real, multi-sample BIT-overlay-target investigation `_resolve_bit_target()` itself
+needed (see "BIT-overlay member Target resolution" above), and `MOTION_INSTRUCTION` specifically has
+never been looked at in this codebase at all. If picking this up: `BPM_TrimmerSorter_20260827_Before.ACD`
+`Continuous` program, tags `Axis01_StartAxis`/`Axis02_AbsMov`/`LugSyncLL`, is the real, confirmed
+repro.
 
 ## Testing gotchas
 

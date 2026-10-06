@@ -1090,6 +1090,89 @@ def _referenced_modules(rung_texts, project: RSLogix5000Content) -> list:
     return list(found.values())
 
 
+_GSV_RE = re.compile(r"\b[GS]SV\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)?", re.IGNORECASE)
+
+# GSV/SSV classes Studio's own export references as a bare
+# <Name Use="Reference"> element after </Programs>, in this order. Verified
+# for exactly these two (a real Export Routine/Program/Add-On Instruction of a
+# test project doing GSV on each); other controller-level classes (CST,
+# TimeSynchronize, Redundancy, FaultLog, ...) are left out until a real export
+# shows how Studio writes them.
+_GSV_CONTROLLER_OBJECTS = ("ControllerDevice", "WallClockTime")
+
+
+def _referenced_gsv_objects(lines, project: RSLogix5000Content):
+    """The objects a routine's GSV/SSV instructions read or write, as
+    (modules, tasks, controller_objects) -- none of which the tag scan finds,
+    since the class/instance operands aren't tags.
+
+    Verified against real Studio exports of a routine doing one GSV per class:
+    GSV(Module,M,...) puts M in <Modules Use="Context"> like an I/O reference
+    does; GSV(Task,T,...) adds <Tasks Use="Context"><Task Use="Reference"
+    Name="T">; GSV(ControllerDevice,...)/GSV(WallClockTime,...) add bare
+    <ControllerDevice Use="Reference">/<WallClockTime Use="Reference">
+    elements. GSV(Program,P,...) on the routine's own program added nothing --
+    a different program isn't verified, so Program is not handled. Class and
+    instance names match case-insensitively, as Logix names do (real rung text
+    has both "WallClockTime" and "WALLCLOCKTIME").
+    """
+    modules_by_name = {m.name.upper(): m for m in project.controller.modules}
+    tasks_by_name = {t.name.upper(): t for t in (project.controller.tasks or [])}
+    objects_by_name = {o.upper(): o for o in _GSV_CONTROLLER_OBJECTS}
+    modules: Dict[str, object] = {}
+    tasks: Dict[str, object] = {}
+    objects = set()
+    for text in lines:
+        if not text:
+            continue
+        for m in _GSV_RE.finditer(text):
+            cls, instance = m.group(1).upper(), (m.group(2) or "").upper()
+            if cls == "MODULE" and instance in modules_by_name:
+                module = modules_by_name[instance]
+                modules[module.name] = module
+            elif cls == "TASK" and instance in tasks_by_name:
+                task = tasks_by_name[instance]
+                tasks[task.name] = task
+            elif cls in objects_by_name:
+                objects.add(objects_by_name[cls])
+    ordered_objects = [o for o in _GSV_CONTROLLER_OBJECTS if o in objects]
+    return list(modules.values()), list(tasks.values()), ordered_objects
+
+
+def _controller_references_xml(tasks, controller_objects) -> str:
+    """The <Tasks Use="Context"> section and bare controller-object Reference
+    elements Studio writes after </Programs> (or after
+    </AddOnInstructionDefinitions> in an AOI export) -- see
+    _referenced_gsv_objects()."""
+    xml = ""
+    if tasks:
+        tasks_xml = "".join(
+            f'<Task Use="Reference" Name="{_escape_xml_attr(t.name)}">\n</Task>\n' for t in tasks
+        )
+        xml += f'<Tasks Use="Context">\n{tasks_xml}</Tasks>\n'
+    for name in controller_objects:
+        xml += f'<{name} Use="Reference">\n</{name}>\n'
+    return xml
+
+
+def _tag_base_name(ref: str) -> str:
+    return re.split(r"[.\[]", ref, 1)[0]
+
+
+def _tag_context_dependencies(tag, scope: str, project: RSLogix5000Content) -> List[str]:
+    """Other tags that must be exported as context alongside `tag`, though
+    their names never appear in the routine text: an Alias tag's target, and
+    the Source/Destination tags a MESSAGE tag's configuration uses (from
+    Controller._msg_config_tags, keyed by `scope` -- the program name, or ""
+    for a controller tag)."""
+    deps = []
+    if tag.tag_type == "Alias" and tag.target:
+        deps.append(_tag_base_name(tag.target))
+    if tag.data_type and tag.data_type.upper() == "MESSAGE":
+        deps.extend(project.controller._msg_config_tags.get((scope, tag.name), []))
+    return deps
+
+
 def _referenced_called_routines(rung_texts, program) -> list:
     """Resolve which OTHER routines in the same program a routine's rung
     text calls via JSR (subroutine calls can't cross program boundaries in
@@ -1357,7 +1440,12 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     JSR) are resolved via _referenced_called_routines() and emitted as an
     empty <Routine Use="Reference" Name="..."> stub alongside the real
     <Routine Use="Target"> -- also verified against that same export (the
-    target routine calls JSR(CalledRoutine,0)).
+    target routine calls JSR(CalledRoutine,0)). GSV/SSV operands add a
+    Module, a <Tasks Use="Context"> Task reference, or a bare
+    <ControllerDevice/WallClockTime Use="Reference"> element (see
+    _referenced_gsv_objects()), and a referenced MESSAGE tag pulls in the
+    tags its configuration uses (from XRefs.Dat, see
+    _tag_context_dependencies()) -- both verified against a real export.
 
     ST routines are supported the same way: `Routine.to_xml()` already
     renders an ST routine's own content as <STContent><Line .../></STContent>
@@ -1496,19 +1584,18 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # text). Resolved iteratively since a target could itself be an alias
     # (rare, but handled for robustness); target names are stripped of any
     # trailing member/bit-index suffix (e.g. "Tag.Member" -> "Tag") to get
-    # the base tag name.
-    def _base_name(ref: str) -> str:
-        return re.split(r"[.\[]", ref, 1)[0]
-
+    # the base tag name. A referenced MESSAGE tag's configured Source/
+    # Destination tags are pulled in the same way (see
+    # _tag_context_dependencies()).
     while True:
         program_tags = [t for t in program.tags if t.name in referenced_names]
         controller_tags_all = [t for t in project.controller.tags if t.name in referenced_names]
         new_names = set()
-        for t in program_tags + controller_tags_all:
-            if t.tag_type == "Alias" and t.target:
-                base = _base_name(t.target)
-                if base not in referenced_names:
-                    new_names.add(base)
+        scoped = [(program.name, t) for t in program_tags] + [("", t) for t in controller_tags_all]
+        for scope, t in scoped:
+            for dep in _tag_context_dependencies(t, scope, project):
+                if dep not in referenced_names:
+                    new_names.add(dep)
         if not new_names:
             break
         referenced_names |= new_names
@@ -1575,6 +1662,10 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
     # alias_io_targets (see above) so an alias's I/O target pulls in its
     # owning Module(s) too.
     referenced_modules = _referenced_modules(list(routine_lines) + alias_io_targets, project)
+    # GSV/SSV objects -- see _referenced_gsv_objects().
+    gsv_modules, gsv_tasks, gsv_objects = _referenced_gsv_objects(routine_lines, project)
+    _module_names = {m.name for m in referenced_modules}
+    referenced_modules += [m for m in gsv_modules if m.name not in _module_names]
     modules_xml = "".join(
         f'<Module Use="Reference" Name="{_escape_xml_attr(m.name)}">\n</Module>\n'
         for m in referenced_modules
@@ -1659,6 +1750,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
         f'</Routines>\n'
         f'</Program>\n'
         f'</Programs>\n'
+        f'{_controller_references_xml(gsv_tasks, gsv_objects)}'
         f'</Controller>\n'
         f'</RSLogix5000Content>\n'
     )
@@ -1784,9 +1876,6 @@ def export_program(project: RSLogix5000Content, program: Program, output_path,
 
     _sync_data_types_map(project)
 
-    def _base_name(ref: str) -> str:
-        return re.split(r"[.\[]", ref, 1)[0]
-
     all_lines: List[str] = []
     for routine in program.routines:
         all_lines.extend(_routine_lines(routine))
@@ -1794,20 +1883,17 @@ def export_program(project: RSLogix5000Content, program: Program, output_path,
     referenced_names = set(_referenced_tag_names(all_lines))
     # Every program tag is rendered regardless of whether it's directly
     # referenced (the whole program's own tag list is part of the Target),
-    # but an Alias program tag's own target still needs pulling in as its
-    # own context, same rule as export_routine().
-    for t in program.tags:
-        if t.tag_type == "Alias" and t.target:
-            referenced_names.add(_base_name(t.target))
-
+    # but an Alias program tag's own target (or a MESSAGE program tag's
+    # configured tags) still needs pulling in as its own context, same rule
+    # as export_routine().
     while True:
         controller_tags_all = [t for t in project.controller.tags if t.name in referenced_names]
         new_names = set()
-        for t in controller_tags_all + list(program.tags):
-            if t.tag_type == "Alias" and t.target:
-                base = _base_name(t.target)
-                if base not in referenced_names:
-                    new_names.add(base)
+        scoped = [("", t) for t in controller_tags_all] + [(program.name, t) for t in program.tags]
+        for scope, t in scoped:
+            for dep in _tag_context_dependencies(t, scope, project):
+                if dep not in referenced_names:
+                    new_names.add(dep)
         if not new_names:
             break
         referenced_names |= new_names
@@ -1836,6 +1922,9 @@ def export_program(project: RSLogix5000Content, program: Program, output_path,
     data_types_xml = "".join(dt.to_xml() for dt in referenced_data_types)
 
     referenced_modules = _referenced_modules(all_lines + alias_io_targets, project)
+    gsv_modules, gsv_tasks, gsv_objects = _referenced_gsv_objects(all_lines, project)
+    _module_names = {m.name for m in referenced_modules}
+    referenced_modules += [m for m in gsv_modules if m.name not in _module_names]
     modules_xml = "".join(
         f'<Module Use="Reference" Name="{_escape_xml_attr(m.name)}">\n</Module>\n'
         for m in referenced_modules
@@ -1882,6 +1971,7 @@ def export_program(project: RSLogix5000Content, program: Program, output_path,
         f'<Programs Use="Context">\n'
         f'{program_xml}\n'
         f'</Programs>\n'
+        f'{_controller_references_xml(gsv_tasks, gsv_objects)}'
         f'</Controller>\n'
         f'</RSLogix5000Content>\n'
     )
@@ -2093,13 +2183,10 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
     `EnableIn`/`EnableOut` (via
     `new_aoi_enable_parameters()`) and AOI `LocalTags` (via
     `new_aoi_local_tag()`) HAVE been confirmed working end-to-end in a real
-    import. Known, NOT-yet-addressed gap (see CLAUDE.md's AOI support
-    section for the full detail): an AOI's own logic can reference a
-    GSV/SSV system object (e.g. `WallClockTime`) as a bare `<WallClockTime
-    Use="Reference">` sibling of `<AddOnInstructionDefinitions>`, a
-    dependency class this wrapper's own resolution has no concept of at all
-    (only `.parameters`/`.local_tags` data types are resolved, not
-    system-object references inside routine logic). Test on a COPY of your
+    import. A GSV/SSV on `WallClockTime`/`ControllerDevice` in the AOI's own
+    logic adds a bare `<WallClockTime Use="Reference">`-style element after
+    `</AddOnInstructionDefinitions>`, matching a real Studio export (see
+    `_referenced_gsv_objects()`). Test on a COPY of your
     project first, and expect this may still need further real-import-driven
     adjustment the same way `export_routine()` did (see CLAUDE.md's
     "Partial/context L5X exports" section for how many rounds that took).
@@ -2204,6 +2291,16 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
     # _inject_aoi_dependencies_xml()'s own docstring.
     aoi_xml = _inject_aoi_dependencies_xml(aoi_xml, referenced_data_types, referenced_aois)
 
+    # A GSV/SSV on a controller object in the AOI's own logic -- verified
+    # against a real Export Add-On Instruction (GSV(WallClockTime,...) ->
+    # <WallClockTime Use="Reference"> right after </AddOnInstructionDefinitions>).
+    # Module/Task references from an AOI's logic aren't verified, so only the
+    # controller objects are emitted here.
+    aoi_lines: List[str] = []
+    for routine in aoi.routines:
+        aoi_lines.extend(_routine_lines(routine) or [])
+    _, _, gsv_objects = _referenced_gsv_objects(aoi_lines, project)
+
     owner_attr = f' Owner="{_escape_xml_attr(owner)}"' if owner else ""
 
     xml = (
@@ -2220,6 +2317,7 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
         f'<DataTypes Use="Context">\n{data_types_xml}\n</DataTypes>\n'
         f'<AddOnInstructionDefinitions Use="Context">\n{context_aois_xml}{aoi_xml}\n'
         f'</AddOnInstructionDefinitions>\n'
+        f'{_controller_references_xml([], gsv_objects)}'
         f'</Controller>\n'
         f'</RSLogix5000Content>\n'
     )

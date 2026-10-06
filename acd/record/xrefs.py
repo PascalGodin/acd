@@ -32,6 +32,8 @@ _REGION_MARKER = b"\xfe\xfe"
 _LIVE = struct.Struct("<2xIIHHIII8xIII")
 
 PROGRAM_MAIN_ROUTINE = 15
+MSG_TAG_CONFIG = 6  # MESSAGE tag -> its message configuration object
+MSG_CONFIG_TAG = 7  # message configuration -> a tag it reads/writes
 
 # Relationship kinds confirmed against real projects. Unlisted values exist
 # (compiler-internal links between Nameless code objects, trends, motion).
@@ -39,8 +41,8 @@ KINDS = {
     1: "alias_target",
     2: "tag_data_type",
     3: "io_tag_module",
-    6: "msg_tag_config",
-    7: "msg_config_tag",
+    MSG_TAG_CONFIG: "msg_tag_config",
+    MSG_CONFIG_TAG: "msg_config_tag",
     8: "data_type_member_type",
     9: "code_tag",
     10: "code_routine",

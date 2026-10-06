@@ -9,11 +9,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 
 from loguru import logger as log
 
 from acd.generated.comps.rx_generic import RxGeneric
+from acd.record.xrefs import MSG_CONFIG_TAG, MSG_TAG_CONFIG
 from acd.record.xrefs import PROGRAM_MAIN_ROUTINE as XREF_PROGRAM_MAIN_ROUTINE
 
 from .base import L5xElementBuilder
@@ -35,6 +36,57 @@ from .model import (
     Tag,
     Task,
 )
+
+
+def _msg_config_tag_names(cur) -> Dict[Tuple[str, str], List[str]]:
+    """MESSAGE tag -> names of the tags its message configuration uses, keyed
+    by (program name, or "" for controller scope; MESSAGE tag name).
+
+    The configured Source/Destination tags never appear in rung text, but
+    Studio's own Export Routine includes them as context (verified: a routine
+    whose only reference is "MSG(TestMsg);" exports TestMsgData, the
+    message's DestinationTag, as a context tag). XRefs.Dat links them in two
+    hops that don't involve any rung: MESSAGE tag -(kind 6)-> configuration
+    object -(kind 7)-> configured tag. Returns {} for a project DB built
+    before the xrefs table existed.
+    """
+    try:
+        cur.execute(
+            "SELECT m.from_id, c.to_id FROM xrefs m JOIN xrefs c ON c.from_id = m.to_id "
+            "WHERE m.kind = ? AND c.kind = ?",
+            (MSG_TAG_CONFIG, MSG_CONFIG_TAG),
+        )
+        links = cur.fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    if not links:
+        return {}
+
+    # A tag is a child of an RxTagCollection, whose parent is either the
+    # controller (controller scope) or a program.
+    cur.execute("SELECT object_id FROM comps WHERE comp_name = 'RxProgramCollection'")
+    program_collections = {row[0] for row in cur.fetchall()}
+    cur.execute(
+        "SELECT t.object_id, t.comp_name, g.comp_name, g.parent_id "
+        "FROM comps t JOIN comps p ON p.object_id = t.parent_id "
+        "JOIN comps g ON g.object_id = p.parent_id "
+        "WHERE p.comp_name = 'RxTagCollection'"
+    )
+    tags: Dict[int, Tuple[str, str]] = {}
+    for oid, name, owner_name, owner_parent in cur.fetchall():
+        scope = owner_name if owner_parent in program_collections else ""
+        tags.setdefault(oid, (scope, name))
+
+    result: Dict[Tuple[str, str], List[str]] = {}
+    for msg_oid, target_oid in links:
+        msg = tags.get(msg_oid)
+        target = tags.get(target_oid)
+        if msg is None or target is None:
+            continue
+        names = result.setdefault(msg, [])
+        if target[1] not in names:
+            names.append(target[1])
+    return result
 
 
 def _resolve_hex_oid_chain(path: str, hex_oid_map: Dict[int, str]) -> Union[str, None]:
@@ -901,7 +953,7 @@ class ControllerBuilder(L5xElementBuilder):
             if _ctrl_slot is not None:
                 comm_path = _comm_path_prefix + str(_ctrl_slot)
 
-        return Controller(
+        controller = Controller(
             controller_name,
             "Target",
             controller_name,
@@ -935,6 +987,8 @@ class ControllerBuilder(L5xElementBuilder):
             controller_description,
             data_types_map,
         )
+        controller._msg_config_tags = _msg_config_tag_names(self._cur)
+        return controller
 
 @dataclass
 class ProjectBuilder:

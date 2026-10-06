@@ -1646,6 +1646,12 @@ class Controller(L5xElement):
     # update this map (it's a different collection), so a tag whose value-rendering needs
     # to resolve the new type silently got a wrong-shaped fallback instead of a real error.
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    # MESSAGE tag -> names of the tags its message configuration reads/writes
+    # (Source/Destination), keyed by (program name or "" for controller scope,
+    # MESSAGE tag name). Read from XRefs.Dat (see _msg_config_tag_names()), since
+    # those tags never appear in rung text -- Studio's own Export Routine still
+    # includes them as context. Reflects the project as last saved in Studio.
+    _msg_config_tags: Dict[Tuple[str, str], List[str]] = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()

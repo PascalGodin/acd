@@ -3418,6 +3418,7 @@ not speculative, but genuinely out of scope for this pass):
   in a `<Modules Use="Context">` container the way a real hardware Module reference is) that this
   wrapper's dependency resolution has no concept of at all — only `.parameters`/`.local_tags` data
   types are walked, never a routine's own instruction text for system-object references.
+  **UPDATE — fixed, see "GSV/SSV objects and MESSAGE-configured tags as export context" below.**
 
 Covered by `test_new_aoi_dates_use_real_iso8601_format`,
 `test_export_aoi_wrapper_includes_target_revision_and_last_edited`,
@@ -5990,8 +5991,9 @@ through the generic `DbExtract`/Kaitai `Dat` reader — records have no `FAFA`/`
 so `acd/record/xrefs.py` (`parse_xrefs()`) reads it directly, and `ExportL5x` loads every live record
 into an `xrefs` table (`from_id, to_id, access, kind, instruction, bit_offset, bit_width, scope_id,
 routine_id, count`, indexed on `from_id`/`to_id`). A missing/unrecognized file degrades to an empty
-table with a warning (`_read_xrefs()`), same policy as `_parse_records()`. Nothing consumes the table
-yet — it's there for future features.
+table with a warning (`_read_xrefs()`), same policy as `_parse_records()`. Used for `MainRoutineName`
+(below) and MESSAGE-configured context tags (see "GSV/SSV objects and MESSAGE-configured tags as export
+context").
 
 **Layout** (little-endian; full field docs in `acd/record/xrefs.py`'s module docstring): the generic
 `.Dat` header is the same as every other file (u32@0 = file length − 1, u32@4 = head of the free-slot
@@ -6065,6 +6067,58 @@ next rebuild rather than failing to load. Covered by `test_program_builder_main_
 Covered by `test/test_xrefs.py`: synthetic records (live + free slot), header rejection, missing/bad file
 degradation, and against `CuteLogix.ACD` — row count vs the header's own count, every `to_id` resolving,
 program main routines, tag DataTypes, UDT member-type counts, and rung references appearing in rung text.
+
+## GSV/SSV objects and MESSAGE-configured tags as export context
+
+The export dependency scan (`export_routine()`/`export_program()`/`export_aoi()`) only found what the
+rung-text tag scan, the I/O-address module scan and the JSR scan see. A purpose-built test project
+(`Bethel_Planer\source\Xref_test\`: `XrefTest_Project.ACD` plus real Studio Export Routine / Export
+Program / Export Add-On Instruction / full-project L5X, Studio V38.03) with one rung per case showed what
+Studio's own export adds, all of it now matched:
+
+| Rung text | Studio's export adds |
+|---|---|
+| `GSV(Module,Generic_Module,...)` | `Generic_Module` in `<Modules Use="Context">` |
+| `GSV(Task,XrefTest_Task,...)` | `<Tasks Use="Context"><Task Use="Reference" Name="XrefTest_Task">` after `</Programs>` |
+| `GSV(ControllerDevice,,...)` / `GSV(WallClockTime,,...)` | bare `<ControllerDevice Use="Reference">` then `<WallClockTime Use="Reference">`, after the Tasks section |
+| `GSV(Program,<own program>,...)` | nothing |
+| `MSG(TestMsg)` | `TestMsgData` — the message's configured destination tag, named nowhere in the routine — as a context tag |
+
+The AOI export puts `<WallClockTime Use="Reference">` right after `</AddOnInstructionDefinitions>`. The
+same placement appears in a real production export (`source\R01_Clock_Routine_RLL.L5X`).
+
+**How it's resolved**:
+- The GSV/SSV cases come from the instruction's own operands in the text (`_referenced_gsv_objects()`,
+  case-insensitive — real rung text has both `WallClockTime` and `WALLCLOCKTIME`). XRefs records them too
+  (kind 13 module, 12 task, 11 program, 17 controller object), but those records only describe the project
+  as last saved, so text is the source that also works for rungs added through `db_*`.
+- The MSG case has no text to scan: XRefs links a MESSAGE tag to its configuration object (kind 6) and the
+  configuration to each tag it uses (kind 7). Neither hop involves a rung, so the link stays valid after any
+  rung edit. `ControllerBuilder` reads it into `Controller._msg_config_tags`
+  (`_msg_config_tag_names()`, keyed by (program name or `""`, MESSAGE tag name)), and
+  `_tag_context_dependencies()` pulls those tags in alongside an alias's target. A MESSAGE tag created
+  through `db_new_tag()` has no configuration and contributes nothing.
+
+**Deliberately not handled**, for lack of real evidence:
+- GSV classes other than Module/Task/ControllerDevice/WallClockTime.
+- `GSV(Program,X)` on a *different* program than the routine's own.
+- Whether an AOI used as context contributes its own `WallClockTime` reference to a routine export. In both
+  real samples the target routine also used WallClockTime directly, so the samples can't tell.
+- Module/Task references from an AOI's own logic in `export_aoi()`.
+
+The same comparison showed differences left as-is:
+- Studio sorts context tags alphabetically.
+- V38.03 adds `OpcUaAccess="None"` to every tag.
+- A MESSAGE tag gets `<Data Format="Message"><MessageParameters .../>`; we still emit no `<Data>`, per the
+  `_SKIP_DECORATED` fix.
+- `TargetRevision` on an AOI export has a trailing space (`"1.0 "`).
+- AOI parameter `DefaultData` is still parked.
+
+Covered by `test/test_export_references.py`:
+- Against `CuteLogix.ACD`: `MSG(WebPage)` pulls in `DisableWeb`, `SSV(Task,MainTask,...)` adds the Task
+  reference, and the AOI export gets `WallClockTime`.
+- Unit tests of the classifier and of the scope keying.
+- The four export tests fail without the fix.
 
 ## Testing gotchas
 

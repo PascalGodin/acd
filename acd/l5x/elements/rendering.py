@@ -170,7 +170,10 @@ def _decorated_real_literal(value: float, in_array: bool) -> str:
     rather than one specific to Infinity.
     """
     if math.isnan(value) or math.isinf(value):
-        if in_array:
+        # Infinity is "1.$" everywhere (a real scalar REAL tag, CN2_Real_Reject,
+        # is Value="1.$" in Studio's own export -- the scalar "1.#INF" below
+        # was only ever an inference). Scalar NaN stays the bare "1.#QNAN".
+        if in_array or math.isinf(value):
             return "-1.$" if math.copysign(1.0, value) < 0 else "1.$"
         label = "#QNAN" if math.isnan(value) else "#INF"
         sign = "-" if math.copysign(1.0, value) < 0 else ""
@@ -674,6 +677,15 @@ def _decorated_binary_literal(value: int, bit_width: int) -> str:
     groups = [bits[i:i + 4] for i in range(0, len(bits), 4)]
     return "2#" + "_".join(groups)
 
+def _decorated_hex_literal(value: int, bit_width: int) -> str:
+    """Radix="Hex" literal: "16#" + the two's-complement value at the type's
+    full width in 4-digit groups separated by underscores. Verified against
+    one real sample only (a DINT member, value 0 -> "16#0000_0000"); non-zero
+    digit case is assumed uppercase by symmetry with Rockwell's other literals."""
+    digits = format(value & ((1 << bit_width) - 1), f"0{bit_width // 4}X")
+    return "16#" + "_".join(digits[i:i + 4] for i in range(0, len(digits), 4))
+
+
 def _xml_attr_special_escape(ch: str) -> Union[str, None]:
     """Standard XML entity escape for a character that would otherwise break
     a double-quoted attribute value (& < > "), or None if `ch` needs none.
@@ -873,6 +885,9 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
             if radix == "Binary" and isinstance(val, int):
                 elem_size = _PRIM.get(mdt_upper, (None, 4))[1]
                 member_val = _decorated_binary_literal(val, elem_size * 8)
+            elif radix == "Hex" and isinstance(val, int) and not isinstance(val, bool):
+                elem_size = _PRIM.get(mdt_upper, (None, 4))[1]
+                member_val = _decorated_hex_literal(val, elem_size * 8)
             elif isinstance(val, float):
                 # A scalar UDT/AOI member's own non-finite (NaN/Infinity)
                 # value uses the SAME truncated "1.$" form as a literal array

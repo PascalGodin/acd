@@ -6379,6 +6379,33 @@ never been looked at in this codebase at all. If picking this up: `BPM_TrimmerSo
 `Continuous` program, tags `Axis01_StartAxis`/`Axis02_AbsMov`/`LugSyncLL`, is the real, confirmed
 repro.
 
+**UPDATE (fourth round) — FIXED, along with two smaller Decorated-format gaps found by the same sweep.**
+- **Root cause of the BIT-status gap**: a BIT-overlay member's own raw `0x60` is the offset of the NEXT
+  real member, not its backing field's (MOTION_INSTRUCTION's `EN`/`DN`/... all read `0x60=4`, which is
+  `ERR`; PID's read `4`, which is `SP`; TIMER's read 12, the slot after `ACC`). TIMER/COUNTER only worked
+  because their backing `Control` is *hidden*, so the declaration-order hidden-member rule caught it.
+  MOTION_INSTRUCTION (`FLAGS`), PID (`CTL`) and many more built-ins back their bits with a plain,
+  non-hidden DINT, so the offset lookup returned the next sibling and the status bits were read out of
+  `ERR`/`SP` (always 0). The L5K value was always right, only the Decorated BIT members were wrong.
+- **Fix**: `DataTypeBuilder` also tracks the most recent preceding plain scalar integer member
+  (`_INT_BACKING_SIZES`) and passes it to `_resolve_bit_target(..., plain_backing)`, used only when no
+  hidden member precedes and only if it is wide enough for the bit number. Hidden-backing resolution is
+  unchanged (still first), so user UDTs are unaffected.
+- **Blast radius, checked, not assumed**: diffed every BIT member's Target before/after across three real
+  projects: 392 changed, all in Rockwell built-ins (PID, MOTION_INSTRUCTION, PHASE, SEQUENCE, SFC_*,
+  RAC_ITF_DVC_*, DATALOG_INSTRUCTION, ...), none in user UDTs. Every old value was visibly wrong
+  (`PHASE.Running -> PauseControl`, `SFC_STEP.X -> PRE`) and 14 had no Target at all. Only the
+  MOTION_INSTRUCTION/PID cases are verified against Studio values; the rest are by the same mechanism.
+- **Verified**: a Decorated sweep of every tag in `Continuous` against Studio's own export, 1,765 common
+  tags, 0 differences (it was 6, including `Axis01_StartAxis`, `Axis02_AbsMov`, `LugSyncLL`).
+- **Two more found by that sweep**: scalar REAL `+Infinity` tags are `Value="1.$"` in Studio, not
+  `1.#INF` (the earlier "inferred by symmetry" guess was wrong; scalar NaN is still `1.#QNAN`), and a
+  `Radix="Hex"` member renders `16#0000_0000` (`_decorated_hex_literal()`, verified for value 0 only;
+  Octal still has no sample).
+- Covered by `test_datatype_builder_bit_overlay_*`, `test_resolve_bit_target_plain_backing_*`,
+  `test_decorated_real_literal_scalar_infinity_*`, `test_decorated_hex_literal_*`
+  (`test/test_elements_helpers.py`); four of the five fail without the fix.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

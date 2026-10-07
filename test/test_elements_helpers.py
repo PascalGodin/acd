@@ -1666,3 +1666,100 @@ def test_string_escapes_use_r_and_l_for_cr_lf():
     from acd.l5x.elements.rendering import _l5k_string_padded, _string_literal_cdata
     assert _l5k_string_padded("\r\n\x1bS", capacity=5) == "'$r$l$1BS$00'"
     assert _string_literal_cdata("^01060000000004\r") == "<![CDATA['^01060000000004$r']]>"
+
+
+def _bit_member_ext_record_value(name: str, bool_id: int, byte_offset: int, bit: int) -> bytes:
+    # A BIT-overlay member: 0x68 != 0x800 marks it as not a plain BOOL, 0x64 is
+    # the bit number, and 0x60 is -- exactly as on the real MOTION_INSTRUCTION/PID
+    # built-ins -- the offset of the NEXT real member, not the backing field's.
+    blob = bytearray(_member_ext_record_value(name, bool_id, 0, byte_offset))
+    struct.pack_into("<I", blob, 0x64, bit)
+    struct.pack_into("<I", blob, 0x68, 0)
+    return bytes(blob)
+
+
+def _build_flags_datatype(with_hidden_backing: bool):
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
+        "seq_number int, record_type int, record BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    cur = db.cursor()
+    DINT_ID, INT_ID, BOOL_ID, TYPE_ID, COLL_ID = 100, 101, 102, 200, 300
+    for oid, nm in ((DINT_ID, "DINT"), (INT_ID, "INT"), (BOOL_ID, "BOOL")):
+        cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (oid, 0, nm, 0, 256, b""))
+
+    members = []
+    if with_hidden_backing:
+        hidden = bytearray(_member_ext_record_value("Backing", DINT_ID, 0, 0))
+        struct.pack_into("<I", hidden, 0x70, 1)
+        members.append(bytes(hidden))
+        members.append(_member_ext_record_value("Plain", DINT_ID, 0, 4))
+        members.append(_bit_member_ext_record_value("EN", BOOL_ID, 8, 31))
+    else:
+        members.append(_member_ext_record_value("FLAGS", DINT_ID, 0, 0))
+        members.append(_bit_member_ext_record_value("EN", BOOL_ID, 4, 31))
+        members.append(_bit_member_ext_record_value("DN", BOOL_ID, 4, 29))
+        members.append(_member_ext_record_value("ERR", INT_ID, 0, 4))
+    ext = (
+        struct.pack("<II", 0x6C, 4) + struct.pack("<I", 0)
+        + struct.pack("<II", 0x67, 4) + struct.pack("<I", 0)
+        + struct.pack("<II", 0x69, 4) + struct.pack("<I", 0)
+        + struct.pack("<II", 0x64, 4) + struct.pack("<I", len(members))
+    )
+    for i, m in enumerate(members):
+        ext += struct.pack("<II", 0x6E + i, len(m)) + m
+    type_record = _rx_generic_header() + struct.pack("<II", 0, 4 + len(members) + 1) + ext
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (TYPE_ID, 0, "T", 0, 256, type_record))
+    cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (COLL_ID, TYPE_ID, "RxTypeMemberCollection", 0, 0, b""))
+    names = ["Backing", "Plain", "EN"] if with_hidden_backing else ["FLAGS", "EN", "DN", "ERR"]
+    for i, nm in enumerate(names):
+        cur.execute("INSERT INTO comps VALUES (?,?,?,?,?,?)", (400 + i, COLL_ID, nm, i, 256, _child_record()))
+    db.commit()
+    return DataTypeBuilder(cur, TYPE_ID).build()
+
+
+def test_datatype_builder_bit_overlay_targets_preceding_plain_dint_when_no_hidden_backing():
+    # Real bug (MOTION_INSTRUCTION, PID): the backing field is the plain DINT
+    # (FLAGS/CTL) declared just before the BIT members, not hidden. A BIT's
+    # own 0x60 is the NEXT member's offset (ERR), so the offset lookup used to
+    # return ERR and EN/DN decoded 0 where Studio gives 1.
+    dt = _build_flags_datatype(with_hidden_backing=False)
+    bits = {m.name: m for m in dt.members if m.data_type == "BIT"}
+    assert set(bits) == {"EN", "DN"}
+    assert bits["EN"].target == "FLAGS" and bits["EN"].bit_number == 31
+    assert bits["DN"].target == "FLAGS" and bits["DN"].bit_number == 29
+
+
+def test_datatype_builder_bit_overlay_still_prefers_hidden_backing_over_plain_dint():
+    # Non-regression: with a hidden backing field before the BIT member, the
+    # existing declaration-order rule wins even though a plain DINT sits
+    # between them.
+    dt = _build_flags_datatype(with_hidden_backing=True)
+    en = next(m for m in dt.members if m.name == "EN")
+    assert en.target == "Backing"
+
+
+def test_resolve_bit_target_plain_backing_beats_offset_lookup_but_not_hidden():
+    from acd.l5x.elements.builders_common import _resolve_bit_target
+    offsets = {4: "ERR"}
+    assert _resolve_bit_target(0xFFFFFFFF, 4, offsets, None, "FLAGS") == "FLAGS"
+    assert _resolve_bit_target(0xFFFFFFFF, 4, offsets, "Hidden", "FLAGS") == "Hidden"
+    assert _resolve_bit_target(0xFFFFFFFF, 4, offsets, None, None) == "ERR"
+
+
+def test_decorated_real_literal_scalar_infinity_is_truncated_form():
+    # Real: a scalar REAL tag holding +Infinity is Value="1.$" in Studio's own
+    # export (not "1.#INF"); scalar NaN stays "1.#QNAN".
+    from acd.l5x.elements.rendering import _decorated_real_literal
+    assert _decorated_real_literal(float("inf"), in_array=False) == "1.$"
+    assert _decorated_real_literal(float("-inf"), in_array=False) == "-1.$"
+    assert _decorated_real_literal(float("nan"), in_array=False) == "1.#QNAN"
+
+
+def test_decorated_hex_literal_and_member_render():
+    from acd.l5x.elements.rendering import _decorated_hex_literal
+    assert _decorated_hex_literal(0, 32) == "16#0000_0000"
+    assert _decorated_hex_literal(0xABCD, 16) == "16#ABCD"
+    assert _decorated_hex_literal(-1, 32) == "16#FFFF_FFFF"

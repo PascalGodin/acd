@@ -49,6 +49,7 @@ def _resolve_bit_target(
     val_60: int,
     offset60_to_name: Dict[int, str],
     fallback_target: Union[str, None],
+    plain_backing: Union[str, None] = None,
 ) -> Union[str, None]:
     """Resolve a BIT-overlay member's backing-field Target name.
 
@@ -69,9 +70,18 @@ def _resolve_bit_target(
     Mechanisms 2/3 are kept only as a fallback for when fallback_target is
     None (no hidden member precedes this one in declaration order at all);
     no real case has been found where they're needed AND correct otherwise.
+
+    plain_backing (new) is tried between 1 and 2: the most recent preceding
+    plain scalar integer member wide enough to hold this bit (the caller
+    checks the width). It exists for Rockwell built-ins whose backing field
+    is NOT hidden -- MOTION_INSTRUCTION (FLAGS), PID (CTL) -- where a BIT
+    member's own 0x60 is the offset of the NEXT real member (ERR / SP), so
+    the offset lookups below return a wrong-but-plausible sibling.
     """
     if fallback_target is not None:
         return fallback_target
+    if plain_backing is not None:
+        return plain_backing
     if target_key != 0xFFFFFFFF:
         name = offset60_to_name.get(target_key)
         if name is not None:

@@ -13,6 +13,9 @@ from .builders_common import _resolve_bit_target, external_access_enum, radix_en
 from .model import DataType, Member
 
 
+_INT_BACKING_SIZES = {"SINT": 1, "INT": 2, "DINT": 4, "LINT": 8}
+
+
 @dataclass
 class MemberBuilder(L5xElementBuilder):
     record: bytes = field(default_factory=bytes)
@@ -22,6 +25,9 @@ class MemberBuilder(L5xElementBuilder):
     # Fallback target name for Pattern-2 BIT members (0x68==0, 0x6c==0xFFFFFFFF).
     # Set by DataTypeBuilder to the most recent preceding hidden SINT/INT in member order.
     _fallback_target: Union[str, None] = field(default=None)
+    # (name, size_in_bytes) of the most recent preceding plain scalar integer member,
+    # for built-ins (MOTION_INSTRUCTION/PID) whose BIT backing field isn't hidden.
+    _plain_backing: Union[tuple, None] = field(default=None)
 
     def build(self) -> Member:
         self._cur.execute(
@@ -101,8 +107,11 @@ class MemberBuilder(L5xElementBuilder):
                 dimension = 0
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                 val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
+                plain = None
+                if self._plain_backing and bit_number < self._plain_backing[1] * 8:
+                    plain = self._plain_backing[0]
                 target = _resolve_bit_target(
-                    target_key, val_60, self._offset60_to_name, self._fallback_target
+                    target_key, val_60, self._offset60_to_name, self._fallback_target, plain
                 )
 
         # --- Description ---
@@ -288,6 +297,7 @@ class DataTypeBuilder(L5xElementBuilder):
             # Track the most recent preceding hidden SINT (fallback target for
             # Pattern-2 BIT members).
             last_hidden_backing: Union[str, None] = None
+            last_plain_int: Union[tuple, None] = None
             for key in member_keys:
                 rec = extended_records[key]
                 member_name = DataTypeBuilder._decode_member_name(rec)
@@ -300,13 +310,21 @@ class DataTypeBuilder(L5xElementBuilder):
                     if is_hidden:
                         last_hidden_backing = child[0]
                 try:
-                    children.append(
-                        MemberBuilder(
-                            self._cur, child[1], rec,
-                            offset60_to_name,
-                            last_hidden_backing,
-                        ).build()
-                    )
+                    built_member = MemberBuilder(
+                        self._cur, child[1], rec,
+                        offset60_to_name,
+                        last_hidden_backing,
+                        last_plain_int,
+                    ).build()
+                    children.append(built_member)
+                    if (
+                        built_member.data_type in _INT_BACKING_SIZES
+                        and not built_member.dimension
+                    ):
+                        last_plain_int = (
+                            built_member.name,
+                            _INT_BACKING_SIZES[built_member.data_type],
+                        )
                     del name_to_child[member_name]
                 except Exception:
                     pass

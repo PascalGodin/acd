@@ -957,7 +957,9 @@ def test_export_aoi_wrapper_includes_target_revision_and_last_edited(tmp_path):
     export_aoi(project, aoi, str(output_path))
     content = output_path.read_text(encoding="utf-8")
 
-    assert f'TargetRevision="{aoi.revision}"' in content
+    # Studio writes Revision + " " + RevisionExtension (175 of 181 real AOI exports),
+    # so a plain "1.0" AOI gets "1.0 " with a trailing space.
+    assert f'TargetRevision="{aoi.revision} {aoi.revision_extension or ""}"' in content
     assert f'TargetLastEdited="{aoi.edited_date}"' in content
 
 

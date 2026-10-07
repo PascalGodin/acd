@@ -1763,3 +1763,18 @@ def test_decorated_hex_literal_and_member_render():
     assert _decorated_hex_literal(0, 32) == "16#0000_0000"
     assert _decorated_hex_literal(0xABCD, 16) == "16#ABCD"
     assert _decorated_hex_literal(-1, 32) == "16#FFFF_FFFF"
+
+
+def test_string_literal_cdata_apostrophe_is_dollar_quote_not_doubled():
+    # Real: Studio's Data Format="String" writes an embedded ' as $' (9 real
+    # samples, 0 doubled). Doubling made Studio reject a real STRING_1440 tag
+    # on import ("Too much character information provided").
+    from acd.l5x.elements.rendering import _string_literal_cdata
+    assert _string_literal_cdata("a'b") == "<![CDATA['a$'b']]>"
+
+
+def test_tab_is_dollar_t_in_every_string_format():
+    # Real: tab is $t (13 samples in L5K and Format="String"), never $09.
+    from acd.l5x.elements.rendering import _l5k_string_padded, _string_literal_cdata
+    assert _l5k_string_padded("a\tb", 5) == "'a$tb$00$00'"
+    assert _string_literal_cdata("a\tb") == "<![CDATA['a$tb']]>"

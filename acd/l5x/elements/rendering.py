@@ -992,14 +992,15 @@ def _escape_string_char(ch: str) -> str:
     (L5K, <Data Format="String">, Decorated DATA, ASCII radix). Carriage
     return and line feed are the named escapes $r and $l -- Studio never
     writes $0D/$0A (619 vs 0 real samples for CR). Every other control or
-    non-ASCII byte is $XX, uppercase hex (tab has never been observed, so it
-    stays $09). $ and ' are left to the caller, whose quote escaping differs
-    by format."""
+    non-ASCII byte is $XX, uppercase hex. Tab is $t (13 real samples in L5K and
+    Format="String", 0 as $09). $ and ' are left to the caller."""
     code = ord(ch)
     if code == 0x0D:
         return "$r"
     if code == 0x0A:
         return "$l"
+    if code == 0x09:
+        return "$t"
     if code < 0x20 or code == 0x7F or code > 0x7E:
         return f"${code:02X}"
     return ch
@@ -1012,7 +1013,10 @@ def _string_literal_cdata(text: str, empty_quoted: bool = False) -> str:
     Studio 5000 renders a non-empty STRING/string-family DATA member's text
     as ``<![CDATA['the text']]>`` -- wrapped in a CDATA section AND in
     literal single quotes (matching its L5K string-literal convention), with
-    any embedded single quote doubled (Pascal/Ada-style escaping).
+    any embedded single quote written $' -- never doubled: 9 real
+    Format="String" samples are all $' and none is '' (the doubling used to
+    be assumed, and made Studio reject a real STRING_1440 tag on import with
+    "Too much character information provided").
 
     Empty: a Decorated ``DATA`` member renders as bare ``<![CDATA[]]>``, but
     a tag's ``<Data Format="String">`` block renders ``<![CDATA['']]>``
@@ -1030,7 +1034,7 @@ def _string_literal_cdata(text: str, empty_quoted: bool = False) -> str:
     """
     if not text:
         return "<![CDATA['']]>" if empty_quoted else "<![CDATA[]]>"
-    escaped = "".join(_escape_string_char(ch) for ch in text.replace("$", "$$").replace("'", "''"))
+    escaped = "".join(_escape_string_char(ch) for ch in text.replace("$", "$$").replace("'", "$'"))
     return f"<![CDATA['{escaped}']]>"
 
 def _l5k_string_padded(text: str, capacity: int) -> str:

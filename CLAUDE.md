@@ -6406,6 +6406,21 @@ repro.
   `test_decorated_real_literal_scalar_infinity_*`, `test_decorated_hex_literal_*`
   (`test/test_elements_helpers.py`); four of the five fail without the fix.
 
+**Fifth round (same sweep, VAB_SQL with real Studio imports) — a string-escaping regression, found by Studio rejecting an import.**
+- `VAB_SQL_ReadMessage` (a `STRING_1440` holding binary TDS bytes) failed `partial_import` with "Too much
+  character information provided". Cause: `_string_literal_cdata()` wrote an embedded apostrophe as `''`
+  (an unverified "Pascal-style doubling" claim in its own docstring). Counted over every real Studio export
+  we hold: `Format="String"` writes `$'` (9 samples, 0 doubled). Also tab is `$t` (13 samples across L5K and
+  `Format="String"`, 0 as `$09`; the old "tab never observed" note was out of date). Fixed in
+  `_string_literal_cdata()` / `_escape_string_char()`; Decorated `DATA` has no apostrophe sample, so it
+  follows the same serializer by assumption.
+- `export_aoi()`'s wrapper `TargetRevision` is `Revision + " " + RevisionExtension` (a trailing space when
+  there is no extension): 175 of 181 real AOI exports. The six misses are one Rockwell sample AOI
+  (`AOI_SNTP_QUERY`, extension "Example", `TargetRevision="1.0 "`), cause unknown.
+- Result: VAB_SQL 24 objects, 0 failures, 0 import messages; BPM remaining differences are all cosmetic
+  (`<Dependencies>`, `<AdditionalHelpText>`, routine order, empty `<Tags Use="Context">`, `Data[Axis]`/
+  `Data[MotionGroup]` we omit, and the stale bytes past a string's LEN, which L5K keeps and we zero).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

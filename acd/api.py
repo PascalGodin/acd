@@ -2375,7 +2375,7 @@ def export_aoi(project: RSLogix5000Content, aoi: AOI, output_path,
         f'SoftwareRevision="{project.software_revision}" '
         f'TargetName="{_escape_xml_attr(aoi.name)}" '
         f'TargetType="AddOnInstructionDefinition" '
-        f'TargetRevision="{_escape_xml_attr(aoi.revision)}" '
+        f'TargetRevision="{_escape_xml_attr(aoi.revision)} {_escape_xml_attr(aoi.revision_extension or "")}" '
         f'TargetLastEdited="{_escape_xml_attr(aoi.edited_date)}"'
         f'{owner_attr} ContainsContext="true" ExportDate="{export_date}" '
         f'ExportOptions="{export_options}">\n'

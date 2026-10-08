@@ -6421,6 +6421,27 @@ repro.
   (`<Dependencies>`, `<AdditionalHelpText>`, routine order, empty `<Tags Use="Context">`, `Data[Axis]`/
   `Data[MotionGroup]` we omit, and the stale bytes past a string's LEN, which L5K keeps and we zero).
 
+**Sixth round: a re-saved AOI vanished from routine exports — Comps.Dat dedup kept a DEAD copy because it was larger.**
+A downstream project removed 5 local tags from an AOI (`VAB_SKT_AOI_TCP_CLIENT`), imported it through Studio and
+re-saved. Afterwards the instance tag decoded to `None`, `db_export_routine()` wrote the AOI as a `<DataType>` (not an
+`<AddOnInstructionDefinition>`), and Studio refused the import ("Unable to fix-up references to discarded User-Defined
+Data Type ... collides with an Add-On Instruction").
+- **Cause**: `Comps.Dat` held two records for the AOI's implicit DataType under the same (object_id, parent_id): a freed
+  `FDFD` (65021) slot, 4,358 bytes, and the live `FAFA` (64250) record, 4,347 bytes. Studio frees the old slot and
+  writes the new version elsewhere when it rewrites an object. `_dedupe_comps_records()` kept the larger one, i.e. the
+  dead copy; its layout is shifted (155-byte header vs 144), so it failed `RxGeneric` and `DataTypeBuilder` fell back to
+  an empty `User` stub that shadowed the AOI's real instance shape in `_data_types_map`.
+- **Fix**: `_parse_comps_with_liveness()` tags each record with `identifier == 65021`; `_dedupe_comps_records()` lets a
+  live record beat a dead one and uses size only between two of the same kind (a dead record that is the only copy is
+  still used, as before). Also settles the old "is 65021 dead?" question for this case: here the 65021 record is a
+  superseded copy of an object whose current version is a 64250 record.
+- **Verified** on a copy of the real project: the AOI type is back to the 18-member `ProductDefined` shape, no stray user
+  UDT, the instance tag decodes, and `sdk_compare` over all 24 objects gives 0 failures and 0 import messages (11
+  identical to Studio). Tests: `test_dedupe_comps_records_prefers_live_over_larger_dead_copy` (+2 neighbours).
+- **Downstream gotcha**: the persistent `acd.db` was already materialized with the stub, and it only rebuilds when the
+  `.ACD` mtime changes, so an existing sidecar stays wrong until `open_project_db(path, rebuild=True)` (check `dirty`
+  first, a rebuild discards unexported edits).
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

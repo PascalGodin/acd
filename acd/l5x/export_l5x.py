@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
@@ -106,9 +106,35 @@ def _dedupe_comps_records(tuples: List[tuple]) -> Dict[tuple, tuple]:
     comps_by_id: Dict[tuple, tuple] = {}
     for t in tuples:
         key = (t[0], t[1])
-        if key not in comps_by_id or len(t[5]) > len(comps_by_id[key][5]):
+        if key not in comps_by_id:
             comps_by_id[key] = t
-    return comps_by_id
+            continue
+        cur = comps_by_id[key]
+        # An optional 7th element marks a record from a dead (FDFD / 65021)
+        # slot. When Studio rewrites an object it frees the old slot and writes
+        # the new version elsewhere, so the SAME (object_id, parent_id) can
+        # appear once live and once dead -- and the dead copy can be the larger
+        # one (4,358 vs 4,347 bytes for a real AOI's implicit DataType), so a
+        # size-only rule kept the dead copy, which then failed to parse and
+        # shadowed the AOI. A live record always beats a dead one; size only
+        # decides between two of the same kind.
+        t_dead = len(t) > 6 and t[6]
+        cur_dead = len(cur) > 6 and cur[6]
+        if t_dead != cur_dead:
+            if not t_dead:
+                comps_by_id[key] = t
+        elif len(t[5]) > len(cur[5]):
+            comps_by_id[key] = t
+    return {k: v[:6] for k, v in comps_by_id.items()}
+
+
+def _parse_comps_with_liveness(dat_record) -> Optional[tuple]:
+    """CompsRecord.parse() plus a trailing is-dead flag (identifier 65021 = a
+    freed 'fd fd' slot), used only by _dedupe_comps_records()."""
+    t = CompsRecord.parse(dat_record)
+    if t is None:
+        return None
+    return t + (dat_record.identifier == 65021,)
 
 
 _WARNED_ONCE_MESSAGES: set = set()
@@ -397,7 +423,7 @@ class ExportL5x:
         log.info("Getting records from ACD Comps file and storing in sqllite database")
         comps_by_id = _dedupe_comps_records(
             _parse_records(
-                os.path.join(self._temp_dir, "Comps.Dat"), CompsRecord.parse, "Comps"
+                os.path.join(self._temp_dir, "Comps.Dat"), _parse_comps_with_liveness, "Comps"
             )
         )
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())

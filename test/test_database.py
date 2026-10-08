@@ -1004,3 +1004,31 @@ def test_dedupe_comments_still_keeps_longest_of_real_duplicates():
     assert _dedupe_comments([short, longer]) == [longer]
     other_scope = _comment(1, "Other", scope_id=999)
     assert sorted(_dedupe_comments([short, other_scope]), key=lambda t: t[9]) == [short, other_scope]
+
+
+def test_dedupe_comps_records_prefers_live_over_larger_dead_copy():
+    # Real bug: after Studio re-saved a modified AOI, Comps.Dat held the AOI's
+    # implicit DataType twice under the same (object_id, parent_id): a freed
+    # FDFD (65021) slot, 4358 bytes, and the live FAFA (64250) record, 4347
+    # bytes. Size-only dedup kept the dead one, which parsed as garbage, became
+    # an empty User DataType and shadowed the AOI in every routine export.
+    from acd.l5x.export_l5x import _dedupe_comps_records
+    dead = (7, 1, "AOI", 0, 256, b"d" * 4358, True)
+    live = (7, 1, "AOI", 0, 256, b"l" * 4347, False)
+    for order in ([dead, live], [live, dead]):
+        out = _dedupe_comps_records(order)
+        assert out[(7, 1)][5] == b"l" * 4347
+        assert len(out[(7, 1)]) == 6  # the dead flag never reaches the table
+
+
+def test_dedupe_comps_records_keeps_a_dead_record_when_it_is_the_only_one():
+    from acd.l5x.export_l5x import _dedupe_comps_records
+    only = (9, 1, "X", 0, 256, b"z" * 10, True)
+    assert _dedupe_comps_records([only])[(9, 1)][5] == b"z" * 10
+
+
+def test_dedupe_comps_records_still_prefers_larger_between_same_kind():
+    from acd.l5x.export_l5x import _dedupe_comps_records
+    a = (5, 1, "R", 0, 271, b"a" * 5, False)
+    b = (5, 1, "R", 0, 259, b"b" * 9, False)
+    assert _dedupe_comps_records([a, b])[(5, 1)][5] == b"b" * 9

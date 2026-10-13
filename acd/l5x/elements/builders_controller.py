@@ -14,6 +14,11 @@ from typing import Dict, List, Tuple, Union
 from loguru import logger as log
 
 from acd.generated.comps.rx_generic import RxGeneric
+from acd.l5x.message_config import (
+    decode_message_params,
+    read_attributes,
+    resolve_element_placeholders,
+)
 from acd.record.xrefs import (
     AXIS_TAG, IO_TAG_MODULE, MOTION_GROUP_AXIS, MOTION_GROUP_TAG, MSG_CONFIG_TAG, MSG_TAG_CONFIG,
 )
@@ -40,6 +45,95 @@ from .model import (
 )
 
 
+def _tag_scope_map(cur) -> Dict[int, Tuple[str, str]]:
+    """Tag object id -> (program name, or "" for controller scope; tag name).
+    A tag is a child of an RxTagCollection, whose parent is either the
+    controller (controller scope) or a program."""
+    cur.execute("SELECT object_id FROM comps WHERE comp_name = 'RxProgramCollection'")
+    program_collections = {row[0] for row in cur.fetchall()}
+    cur.execute(
+        "SELECT t.object_id, t.comp_name, g.comp_name, g.parent_id "
+        "FROM comps t JOIN comps p ON p.object_id = t.parent_id "
+        "JOIN comps g ON g.object_id = p.parent_id "
+        "WHERE p.comp_name = 'RxTagCollection'"
+    )
+    tags: Dict[int, Tuple[str, str]] = {}
+    for oid, name, owner_name, owner_parent in cur.fetchall():
+        scope = owner_name if owner_parent in program_collections else ""
+        tags.setdefault(oid, (scope, name))
+    return tags
+
+
+def _message_config_params(cur, modules, hex_oid_map) -> Dict[Tuple[str, str], Dict[str, str]]:
+    """MESSAGE tag (program name or "", tag name) -> its MessageParameters,
+    decoded from the tag's configuration object (see acd.l5x.message_config).
+    A tag whose configuration isn't one the decoder verifiably covers is simply
+    absent, never guessed. {} for a project DB built before xrefs existed."""
+    try:
+        cur.execute("SELECT from_id, to_id FROM xrefs WHERE kind = ?", (MSG_TAG_CONFIG,))
+        links = cur.fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    if not links:
+        return {}
+    tags = _tag_scope_map(cur)
+    tag_names = {oid: name for oid, (_, name) in tags.items()}
+    # A "@x@" after a "." in a configured element is the UDT member's own comps
+    # object id (not the hex-OID key the comment code uses).
+    cur.execute("SELECT object_id, comp_name FROM comps")
+    comp_names: Dict[int, str] = {}
+    for oid, name in cur.fetchall():
+        comp_names.setdefault(oid, name)
+
+    # Path text -> the module name Studio prints when the path points at a
+    # project module: an Ethernet device by address ("2, <ip>", or through the
+    # backplane slot of its bridge, "1, <slot>, 2, <ip>"), or the module in slot
+    # n of the local chassis ("1, <n>"). The controller itself is a module named
+    # like its parent (Local), so it is excluded and "1, 0" stays as written, as
+    # in Studio's exports.
+    by_name = {m.name: m for m in modules}
+    by_path: Dict[str, str] = {}
+    for m in modules:
+        if (m.parent_module or "") == m.name:
+            continue
+        if m._ip_address:
+            by_path.setdefault(f"2, {m._ip_address}", m.name)
+            bridge = by_name.get(m.parent_module)
+            if (
+                bridge is not None
+                and (bridge.parent_module or "").upper() == "LOCAL"
+                and bridge.parent_mod_port_id == 1
+            ):
+                by_path.setdefault(f"1, {bridge._slot}, 2, {m._ip_address}", m.name)
+        # parent_mod_port_id 1 is the backplane; a module's _slot is only
+        # meaningful there (an Ethernet child of Local also reads slot 0).
+        if (m.parent_module or "").upper() == "LOCAL" and m.parent_mod_port_id == 1:
+            by_path.setdefault(f"1, {m._slot}", m.name)
+
+    result: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for tag_oid, cfg_oid in links:
+        key = tags.get(tag_oid)
+        if key is None:
+            continue
+        cur.execute("SELECT record FROM comps WHERE object_id = ?", (cfg_oid,))
+        row = cur.fetchone()
+        if row is None:
+            continue
+        try:
+            params = decode_message_params(
+                read_attributes(bytes(row[0])),
+                resolve_element=lambda text: resolve_element_placeholders(
+                    text, tag_names.get, comp_names.get
+                ),
+                resolve_path=lambda path: by_path.get(path, path),
+            )
+        except Exception:
+            params = None
+        if params:
+            result[key] = params
+    return result
+
+
 def _msg_config_tag_names(cur) -> Dict[Tuple[str, str], List[str]]:
     """MESSAGE tag -> names of the tags its message configuration uses, keyed
     by (program name, or "" for controller scope; MESSAGE tag name).
@@ -64,20 +158,7 @@ def _msg_config_tag_names(cur) -> Dict[Tuple[str, str], List[str]]:
     if not links:
         return {}
 
-    # A tag is a child of an RxTagCollection, whose parent is either the
-    # controller (controller scope) or a program.
-    cur.execute("SELECT object_id FROM comps WHERE comp_name = 'RxProgramCollection'")
-    program_collections = {row[0] for row in cur.fetchall()}
-    cur.execute(
-        "SELECT t.object_id, t.comp_name, g.comp_name, g.parent_id "
-        "FROM comps t JOIN comps p ON p.object_id = t.parent_id "
-        "JOIN comps g ON g.object_id = p.parent_id "
-        "WHERE p.comp_name = 'RxTagCollection'"
-    )
-    tags: Dict[int, Tuple[str, str]] = {}
-    for oid, name, owner_name, owner_parent in cur.fetchall():
-        scope = owner_name if owner_parent in program_collections else ""
-        tags.setdefault(oid, (scope, name))
+    tags = _tag_scope_map(cur)
 
     result: Dict[Tuple[str, str], List[str]] = {}
     for msg_oid, target_oid in links:
@@ -1066,6 +1147,8 @@ class ControllerBuilder(L5xElementBuilder):
         controller._msg_config_tags = _msg_config_tag_names(self._cur)
         controller._io_tag_modules = _io_tag_owner_modules(self._cur)
         controller._axis_motion_groups = _axis_motion_group_tags(self._cur)
+        controller._message_params = _message_config_params(self._cur, modules, hex_oid_map)
+        controller._attach_message_params()
         return controller
 
 @dataclass

@@ -6442,6 +6442,46 @@ Data Type ... collides with an Add-On Instruction").
   `.ACD` mtime changes, so an existing sidecar stays wrong until `open_project_db(path, rebuild=True)` (check `dirty`
   first, a rebuild discards unexported edits).
 
+## MESSAGE tag configuration (`acd/l5x/message_config.py`) — decoded, verified against Studio
+
+A routine/program export used to write a MESSAGE tag with no `<Data>` ("Studio keeps the existing tag"). A downstream
+project then hit Studio's `MSG configuration incomplete because no tag is specified` importing a routine that carried
+MESSAGE tags (first only with a Description set, then also without one; the two failing tags were exactly the two
+messages with no Source/Destination tag). The configuration IS readable, so exports now carry Studio's real
+`<Data Format="Message"><MessageParameters .../></Data>`.
+
+- **Where it lives**: a `$hex$` object under `RxMsgCollection`, linked to the tag by XRefs kind 6. Attribute records:
+  `0x01` a 428-byte numeric blob, `0x65` LocalElement, `0x66` service code / SLC read-write code, `0x67` RemoteElement,
+  `0x68` message kind (2 CIP Generic, 3 SLC typed), `0x70` DestinationTag. Offsets are in the module docstring.
+  Element references are `@tagobjectid@.@memberobjectid@[n]` placeholders; the member id is a **comps object id**
+  (not the hex-OID key the comment code uses — that mix-up made 5 of 14 BPM messages fail to decode at first).
+- **`ConnectionPath` is stored as encoded CIP path bytes**, never the module name: `1 3` = backplane slot 3, `0x12 len
+  "ip"` = Ethernet, `1f 00` = `THIS`, hops chain. Studio prints a module name when the path points at a project
+  module, so `_message_config_params()` reverse-maps `2, <ip>`, `1, <ip's bridge slot>, 2, <ip>` and `1, <slot>`
+  (backplane port 1 children of `Local`). A module's `_slot` is only meaningful on the backplane (an Ethernet child
+  of Local also reads slot 0), and the controller (a module named like its parent) must not match `1, 0`.
+- **How it was verified**: besides the 22 real tags in three projects, a controlled experiment drove the Logix
+  Designer SDK as an oracle: export a MESSAGE tag, vary one parameter at a time (43 variants: paths, flags, ranges,
+  element addressing, SLC/DH+), import each into a scratch copy, save, read the config object back, and have Studio
+  re-export every tag. `test/data/message_config_cases.json` holds all 65 (raw attributes + Studio's expected text);
+  `test_decodes_exactly_what_studio_exports` requires an exact, order-preserving match for every one.
+- **Facts the experiment settled**: `ConnectedFlag` is not stored (1 round-trips to 2); `CacheConnections` is blob
+  byte 1 (2 TRUE, 0 FALSE), not offset 315; large-packet CIP is transport code `0x0fa2` at offset 280; `ObjectType`
+  `0xffff`, `TargetObject` > 65535 and `ConnectedFlag=0` are rejected by Studio on import.
+- **Not covered, deliberately returns None (no `<Data>`, never a guess)**: message types other than CIP Generic and
+  SLC Typed Read/Write, comm type codes other than 0/1, unknown transport codes, unresolvable element references.
+  A message with no configuration object at all (CuteLogix's `Message`) also gets no `<Data>`.
+- **Guards**: `db_new_tag(..., "MESSAGE")` raises (a new message has no configuration and Studio rejects it);
+  `export_routine/export_program(validate=True)` raise for a MESSAGE tag that has a Description but no decodable
+  configuration (`_validate_message_tags`).
+- **Not reproduced**: with the SDK, the OLD exporter's bare-`<Tag>` file also imports cleanly into a scratch copy of
+  the failing project, with or without descriptions. The error appears in Studio's GUI Import Routine, which compares
+  elements differently. The new file is what Studio itself exports for these tags (`sdk_compare` on the current project:
+  0 MESSAGE-data differences, 0 import messages), but whether it clears the GUI error needs a retest by the reporter.
+- `scripts/sdk_compare.py` no longer ignores MESSAGE `<Data>`, so regressions here show up in its report.
+- `Tag._message_params` (per tag) and `Controller._message_params` (by (scope, name)); the persistent DB re-attaches
+  them in `to_controller()` because it rebuilds the Tag objects from SQL.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

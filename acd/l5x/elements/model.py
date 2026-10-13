@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
 
+from acd.l5x.message_config import message_parameters_xml
 from acd.l5x.port_structures import PORT_STRUCTURES
 
 from .base import (
@@ -409,6 +410,11 @@ class Tag(L5xElement):
     _comments: List[Tuple[str, str]] = field(default_factory=list)
     _initial_value: Union[List, int, float, None] = None
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    # A MESSAGE tag's decoded MSG configuration (MessageParameters attributes, in
+    # Studio's order), from acd.l5x.message_config. None when the tag isn't a
+    # MESSAGE, was created in Python, or its configuration isn't one the decoder
+    # covers -- then no <Data> is written and Studio keeps the tag's own.
+    _message_params: Union[Dict[str, str], None] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -533,6 +539,9 @@ class Tag(L5xElement):
         # the same precedent already established for a not-yet-real AOI
         # instance tag just above.
         is_skip_decorated_type = dt_key_check in _SKIP_DECORATED
+
+        if dt_key_check == "MESSAGE" and self._message_params and not is_alias:
+            data_xml = message_parameters_xml(self._message_params)
 
         if (
             not is_alias and not is_synthetic_aoi_instance
@@ -1667,6 +1676,20 @@ class Controller(L5xElement):
     # Axis tag name -> its MOTION_GROUP tag name(s), from XRefs.Dat (see
     # _axis_motion_group_tags()). Studio exports the group with the axis.
     _axis_motion_groups: Dict[str, List[str]] = field(default_factory=dict)
+    # MESSAGE tag (program name or "", tag name) -> decoded MessageParameters, from
+    # the tag's configuration object (see message_config._message_config_params()).
+    _message_params: Dict[Tuple[str, str], Dict[str, str]] = field(default_factory=dict)
+
+    def _attach_message_params(self) -> None:
+        """Set each MESSAGE tag's ``_message_params`` from the decoded map. Called
+        after the tags are (re)built -- by ControllerBuilder, and again by
+        ProjectDB.to_controller(), which replaces the Tag objects from SQL."""
+        for scope, tags in [("", self.tags)] + [(p.name, p.tags) for p in self.programs]:
+            for t in tags:
+                params = self._message_params.get((scope, t.name))
+                t._message_params = (
+                    dict(params) if params and (t.data_type or "").upper() == "MESSAGE" else None
+                )
 
     def __post_init__(self):
         super().__post_init__()

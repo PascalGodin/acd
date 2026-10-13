@@ -6474,7 +6474,11 @@ messages with no Source/Destination tag). The configuration IS readable, so expo
 - **Guards**: `db_new_tag(..., "MESSAGE")` raises (a new message has no configuration and Studio rejects it);
   `export_routine/export_program(validate=True)` raise for a MESSAGE tag that has a Description but no decodable
   configuration (`_validate_message_tags`).
-- **Not reproduced**: with the SDK, the OLD exporter's bare-`<Tag>` file also imports cleanly into a scratch copy of
+- **CONFIRMED FIXED in Studio's GUI** (downstream retest on `628c160`): a program export with descriptions set on all
+  seven `SKT_MSG_*` tags, each carrying its `<Data Format="Message">` body, imported through Import Routine with every
+  MESSAGE tag set to Overwrite, including `Client_Delete` and `Delete_All`, with no errors. The note below was written
+  before that retest and is kept for the record.
+- **Not reproduced** (before the retest above): with the SDK, the OLD exporter's bare-`<Tag>` file also imports cleanly into a scratch copy of
   the failing project, with or without descriptions. The error appears in Studio's GUI Import Routine, which compares
   elements differently. The new file is what Studio itself exports for these tags (`sdk_compare` on the current project:
   0 MESSAGE-data differences, 0 import messages), but whether it clears the GUI error needs a retest by the reporter.

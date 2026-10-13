@@ -6486,6 +6486,14 @@ messages with no Source/Destination tag). The configuration IS readable, so expo
 - `Tag._message_params` (per tag) and `Controller._message_params` (by (scope, name)); the persistent DB re-attaches
   them in `to_controller()` because it rebuilds the Tag objects from SQL.
 
+**MESSAGE runtime members are not in the file.** `db_get_tag_value` on a MESSAGE tag returned zeros for ERR, EXERR,
+REQ_LEN, DN_LEN, Flags/EN/DN/ER while Studio's live Monitor Tags showed real values. A MESSAGE tag's stored value blob
+(591 bytes) is a descriptor: it starts with the tag's own name (length byte, ASCII), then compiled path bytes. The
+runtime struct is not there (no REQ_LEN 12/8 anywhere in it, checked on a project saved online), so the generic UDT
+decode read the wrong layout and produced zeros. `get_tag_value()` now returns `value: None`, `message_parameters`
+(the offline configuration) and a `note` for MESSAGE tags. The runtime state exists only in the controller. Test:
+`test_get_tag_value_for_a_message_tag_returns_configuration_not_fake_zeros`.
+
 ## Testing gotchas
 
 - `test/conftest.py` chdir's into `test/` for the whole session — needed because many tests

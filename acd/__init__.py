@@ -69,7 +69,9 @@ step, so a call never returns more than actually asked for:
     DEFAULT 50 IS NOT A CAP ON WHAT EXISTS: an array longer than 50 returns
     only its first 50 elements, with `total_elements`, `truncated: True` and
     `next_offset` telling you so. Pass `limit=None` for every element, or
-    page with `offset=`.
+    page with `offset=`. A MESSAGE tag has NO readable runtime value (ERR,
+    REQ_LEN, DN, EN... are not stored in the file): `value` is None and
+    `message_parameters` is its offline MSG configuration instead.
   - `db_list_datatypes(acd_path)` -- name/family/cls/description/
     member_count for EVERY UDT, WITHOUT each one's own member list -- then
     `db_get_datatype(acd_path, name)` for one type's actual members

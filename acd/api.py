@@ -774,12 +774,33 @@ def get_tag_value(project: RSLogix5000Content, tag_name: str, program_name: str 
     also has "truncated": True and "next_offset" (pass it as offset= for the
     next page); pass limit=None for every element at once.
 
+    A MESSAGE tag has no readable runtime value: the file stores a descriptor,
+    not the runtime struct (ERR, EXERR, REQ_LEN, DN_LEN, Flags/EN/DN/ER are not
+    saved, even from a project saved online). "value" is None and
+    "message_parameters" holds the offline MSG configuration instead.
+
     Raises KeyError if no tag by that name exists in the given scope.
     """
     tag = _all_tags(project).get((program_name or "", tag_name))
     if tag is None:
         raise KeyError(f"No tag {tag_name!r} in scope {program_name or 'controller'!r}")
     base = {"name": tag.name, "data_type": tag.data_type, "dimensions": tag.dimensions}
+    if (tag.data_type or "").upper() == "MESSAGE":
+        # A MESSAGE tag's stored value is a descriptor (it starts with the tag's own
+        # name, then compiled path bytes), not the runtime MESSAGE struct, so ERR,
+        # EXERR, REQ_LEN, DN_LEN, Flags/EN/DN/ER... are NOT in the file and decoding
+        # the descriptor with the struct layout only produced zeros (a real report:
+        # all zeros while the live Monitor Tags showed REQ_LEN 12, DN 1). Return the
+        # offline configuration instead and say so, rather than numbers nobody
+        # should trust.
+        base["value"] = None
+        base["message_parameters"] = dict(tag._message_params) if tag._message_params else None
+        base["note"] = (
+            "MESSAGE runtime members (ERR, EXERR, REQ_LEN, DN_LEN, Flags, EN, DN, ER, ST, TO) "
+            "are not stored in the project file, so there is no value to read. "
+            "message_parameters is the offline MSG configuration (None if unreadable)."
+        )
+        return base
     value = tag._initial_value
     if isinstance(value, list):
         total = len(value)

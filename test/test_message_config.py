@@ -144,3 +144,17 @@ def test_validate_rejects_a_described_message_tag_without_a_readable_config():
         _validate_message_tags([bare])
     web._comments = [("", "MSG: web page")]
     _validate_message_tags([web])  # a readable config is exported, so a description is safe
+
+
+def test_get_tag_value_for_a_message_tag_returns_configuration_not_fake_zeros():
+    # Real report: db_get_tag_value on MESSAGE tags returned zeros for ERR/REQ_LEN/DN
+    # while Studio's live Monitor Tags showed REQ_LEN 12, DN 1. The file stores a
+    # descriptor, not the runtime struct, so there is no such value to return.
+    from acd.api import get_tag_value
+    project = _cutelogix()
+    web = get_tag_value(project, "WebPage")
+    assert web["value"] is None
+    assert web["message_parameters"]["MessageType"] == "CIP Generic"
+    assert "not stored" in web["note"]
+    bare = get_tag_value(project, "Message")  # no readable configuration either
+    assert bare["value"] is None and bare["message_parameters"] is None

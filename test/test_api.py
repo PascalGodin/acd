@@ -1684,6 +1684,27 @@ def test_get_tag_value_large_array_paginates_by_default():
     assert second_page["value"] == full[50:100]
 
 
+def test_get_tag_value_flags_truncation_and_limit_none_returns_everything():
+    # Real report: a 64/62/100-element array "only had 50 entries" -- the
+    # default limit=50 is pagination, not a decoder cap, but nothing in the
+    # result said the page was incomplete.
+    project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
+    full = next(t for t in project.controller.tags if t.name == "Branching")._initial_value
+
+    page = get_tag_value(project, "Branching")
+    assert page["truncated"] is True and page["next_offset"] == 50
+
+    last = get_tag_value(project, "Branching", offset=950, limit=50)
+    assert "truncated" not in last and "next_offset" not in last
+
+    everything = get_tag_value(project, "Branching", limit=None)
+    assert everything["returned"] == 1000 and everything["value"] == full
+    assert "truncated" not in everything
+
+    small = get_tag_value(project, "AdvancedMath")  # DINT[10], fits in one page
+    assert "truncated" not in small
+
+
 def test_get_tag_value_missing_tag_raises_keyerror():
     project = load_acd(os.path.join("..", "resources", "CuteLogix.ACD"), verbose=False)
     with pytest.raises(KeyError):

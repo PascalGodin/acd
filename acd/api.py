@@ -730,7 +730,7 @@ def _all_tags(project: RSLogix5000Content) -> dict:
 
 
 def get_tag_value(project: RSLogix5000Content, tag_name: str, program_name: str = None,
-                   offset: int = 0, limit: int = 50) -> dict:
+                   offset: int = 0, limit: Union[int, None] = 50) -> dict:
     """Fetch one tag's current decoded value, paginating it if it's a large
     array instead of returning it in full -- a single UDT array tag (e.g. a
     real project's 200-element struct array) can be large enough on its own
@@ -751,6 +751,12 @@ def get_tag_value(project: RSLogix5000Content, tag_name: str, program_name: str 
     "offset"/"returned" alongside "value" for an array so a caller knows
     whether there's more to fetch with a larger offset.
 
+    THE DEFAULT limit=50 IS NOT A DECODER CAP: an array longer than 50 comes
+    back as its first 50 elements only (a real report read this as "elements
+    past index 49 are unreadable"). When the page is incomplete the result
+    also has "truncated": True and "next_offset" (pass it as offset= for the
+    next page); pass limit=None for every element at once.
+
     Raises KeyError if no tag by that name exists in the given scope.
     """
     tag = _all_tags(project).get((program_name or "", tag_name))
@@ -762,9 +768,12 @@ def get_tag_value(project: RSLogix5000Content, tag_name: str, program_name: str 
         total = len(value)
         base["total_elements"] = total
         base["offset"] = offset
-        page = value[offset:offset + limit]
+        page = value[offset:] if limit is None else value[offset:offset + limit]
         base["returned"] = len(page)
         base["value"] = page
+        if offset + len(page) < total:
+            base["truncated"] = True
+            base["next_offset"] = offset + len(page)
     else:
         base["value"] = value
     return base

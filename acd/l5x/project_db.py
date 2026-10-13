@@ -3123,7 +3123,7 @@ class ProjectDB:
         }
 
     def get_tag_value(self, tag_name: str, program_name: Union[str, None] = None,
-                       offset: int = 0, limit: int = 50) -> dict:
+                       offset: int = 0, limit: Union[int, None] = 50) -> dict:
         return _get_tag_value(self.to_controller(), tag_name, program_name, offset, limit)
 
     def find_tag_references(self, name: str, regex: bool = False,
@@ -3567,7 +3567,7 @@ def db_get_routine(acd_path, routine_name: str, program_name: Union[str, None] =
 
 
 def db_get_tag_value(acd_path, tag_name: str, program_name: Union[str, None] = None,
-                      offset: int = 0, limit: int = 50, project_dir=None,
+                      offset: int = 0, limit: Union[int, None] = 50, project_dir=None,
                       verbose: bool = False) -> dict:
     """Stateless equivalent of `ProjectDB.get_tag_value()` -- see its docstring."""
     return _run(acd_path, project_dir, verbose,

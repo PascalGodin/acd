@@ -1037,6 +1037,14 @@ class ProjectDB:
         Raises `sqlite3.IntegrityError` if the name already exists in this
         scope, `KeyError` if `program_name` doesn't match any program.
         """
+        if data_type.split("[")[0].strip().upper() == "MESSAGE":
+            raise ValueError(
+                f"Cannot create MESSAGE tag {name!r}: a new MESSAGE tag has no MSG "
+                f"configuration (message type, path, source/destination), and Studio rejects "
+                f"importing one without it (\"MSG configuration incomplete because no tag is "
+                f"specified\"). Create it in Studio and configure it there; acd-tools can then "
+                f"read its configuration and round-trip it."
+            )
         program_id = self._program_id(program_name)
         tag = _new_tag(name, data_type, dimensions=dimensions, description=description,
                         value=value, external_access=external_access)
@@ -2704,6 +2712,7 @@ class ProjectDB:
         controller.programs = programs
         controller.tags = self._load_tags(_CONTROLLER_SCOPE, data_types_map)
         controller.__post_init__()  # recompute io_tags/alias_tags from the new .tags
+        controller._attach_message_params()  # the Tag objects above are new
 
         # AOIs are now FULLY REPLACED from proj_aois, the same way
         # .programs/.tags/.data_types already are -- proj_aois holds every

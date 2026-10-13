@@ -719,6 +719,23 @@ def _summarize_value_diff(old, new) -> dict:
     return {"summary": f"value too large to display ({len(old_repr)} / {len(new_repr)} chars)"}
 
 
+def _validate_message_tags(tags) -> None:
+    """Raise if an exported MESSAGE tag would be rejected by Studio: one whose
+    MSG configuration couldn't be decoded (so no <Data Format="Message"> is
+    written) but that carries a Description. Studio keeps the project's own
+    configuration for a bare MESSAGE <Tag>, but a differing Description makes
+    it treat the element as an edit and demands a complete configuration
+    ("MSG configuration incomplete because no tag is specified")."""
+    for t in tags:
+        if (t.data_type or "").upper() == "MESSAGE" and t.description and not t._message_params:
+            raise ValueError(
+                f"MESSAGE tag {t.name!r} has a description but its MSG configuration could not be "
+                f"read from the project (an unsupported message type, comm type or element "
+                f"reference), so the export has no <Data Format=\"Message\"> and Studio would "
+                f"reject the import. Remove the description, or edit this tag in Studio."
+            )
+
+
 def _all_tags(project: RSLogix5000Content) -> dict:
     result = {}
     for tag in project.controller.tags:
@@ -1832,6 +1849,7 @@ def export_routine(project: RSLogix5000Content, routine: Routine, output_path, o
 
     if validate:
         _validate_tag_types_resolve(controller_tags + program_tags, project.controller._data_types_map)
+        _validate_message_tags(controller_tags + program_tags)
         if routine.type == "RLL":
             for i, rung_text in enumerate(routine.rungs):
                 try:
@@ -2053,6 +2071,7 @@ def export_program(project: RSLogix5000Content, program: Program, output_path,
 
     if validate:
         _validate_tag_types_resolve(controller_tags + list(program.tags), project.controller._data_types_map)
+        _validate_message_tags(controller_tags + list(program.tags))
         for routine in program.routines:
             if routine.type == "RLL":
                 for i, rung_text in enumerate(routine.rungs):

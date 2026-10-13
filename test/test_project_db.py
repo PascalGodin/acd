@@ -3298,3 +3298,17 @@ def test_db_export_datatype_validate_false_skips_the_check(acd_copy, tmp_path):
     # Should NOT raise -- validate explicitly disabled.
     db_export_datatype(str(acd_copy), dt_name, str(tmp_path / "out2.L5X"), validate=False)
     assert (tmp_path / "out2.L5X").exists()
+
+
+def test_new_tag_refuses_message_type(acd_copy):
+    # A MESSAGE tag needs an MSG configuration that can't be created here, and
+    # Studio rejects importing one without it.
+    with pytest.raises(ValueError, match="MESSAGE"):
+        db_new_tag(acd_copy, "NewMsg", "MESSAGE")
+
+
+def test_to_controller_reattaches_message_configuration_to_rehydrated_tags(acd_copy):
+    ctrl = db_to_controller(acd_copy).controller
+    web = next(t for t in ctrl.tags if t.name == "WebPage")
+    assert web._message_params and web._message_params["MessageType"] == "CIP Generic"
+    assert '<Data Format="Message">' in web.to_xml()

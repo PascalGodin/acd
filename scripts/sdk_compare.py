@@ -106,8 +106,6 @@ def _normalize(elem):
             elem.remove(child)  # I/O tags: the SDK export adds them (IOTags); the GUI export doesn't
         elif child.tag == "DefaultData":
             elem.remove(child)  # AOI DefaultData: parked, see CLAUDE.md
-        elif elem.tag == "Tag" and elem.get("DataType") == "MESSAGE" and child.tag == "Data":
-            elem.remove(child)  # MESSAGE <Data Format="Message">: not rendered
         else:
             _normalize(child)
     if elem.tag in ("Data", "DefaultData") and elem.get("Format") == "L5K" and elem.text:
